@@ -20,15 +20,15 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     private var smartFramingEnabled: Bool = false
     private var dampingFactor: Double = 0.15
     private var currentOffsetX: CGFloat = 0
-    private var smoothedTargetOffsetX: CGFloat = 0  // ターゲット自体もスムージング
-    private var rawTargetOffsetX: CGFloat = 0       // Vision検出生値
     private var frameCount: Int = 0
     private let detectionInterval: Int = 8          // 何フレームごとに検出するか
     private var lastDetectedNormalizedX: CGFloat? = nil
     private var consecutiveMissCount: Int = 0
     private let missThreshold: Int = 5              // 何回連続で未検出なら「いない」と判断するか（8フレーム×5=約40フレーム≒1.3秒）
     private var isFirstSmartFrame: Bool = true      // 初回フレーム判定
-    
+    // カットベース: 人物がフレーム中央からこの割合以上ずれたらカット（例: 0.25 = 25%）
+    private let cutThreshold: CGFloat = 0.25    /// 事前解析済みオフセット（nil = リアルタイムフォールバック）
+    private var currentPrecomputedOffsets: [CGFloat]? = nil    
     override init() {
         ciContext = CIContext(options: [
             .workingColorSpace: CGColorSpaceCreateDeviceRGB(),
@@ -89,6 +89,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             // スマートフレーミング設定を取得
             self.smartFramingEnabled = instruction.smartFramingEnabled
             self.dampingFactor = instruction.dampingFactor
+            self.currentPrecomputedOffsets = instruction.precomputedOffsets
 
             guard let sourcePixelBuffer = asyncVideoCompositionRequest.sourceFrame(byTrackID: layerInstruction.trackID) else {
                 asyncVideoCompositionRequest.finish(with: NSError(
@@ -193,40 +194,42 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         // 縦いっぱいにズームするスケール
         let scale = renderSize.height / sourceSize.height
         let scaledWidth = sourceSize.width * scale
+        let minOffsetX = -(scaledWidth - renderSize.width)
 
-        // 一定フレーム間隔でのみVision検出を実行（重い処理を間引く）
         frameCount += 1
+
+        // ── 事前解析済みオフセットがあれば使う（2パスモード）──
+        if let offsets = currentPrecomputedOffsets, !offsets.isEmpty {
+            let idx = min(frameCount - 1, offsets.count - 1)
+            let offsetX = offsets[max(0, idx)]
+            return sourceImage
+                .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+                .transformed(by: CGAffineTransform(translationX: offsetX, y: 0))
+                .cropped(to: outputRect)
+        }
+
+        // ── フォールバック: リアルタイム Vision（1パスモード）──
         if frameCount % detectionInterval == 0 || frameCount == 1 {
             detectPersonNormalizedX(in: sourcePixelBuffer)
         }
 
-        // 検出値からrawTargetを計算
-        let minOffsetX = -(scaledWidth - renderSize.width)
-
-        // 初回フレーム: 全オフセットを中央に初期化（左端スタートを防ぐ）
+        // 初回フレーム: 中央に初期化
         if isFirstSmartFrame {
             isFirstSmartFrame = false
-            let centerOffset = minOffsetX / 2
-            rawTargetOffsetX = centerOffset
-            smoothedTargetOffsetX = centerOffset
-            currentOffsetX = centerOffset
+            currentOffsetX = minOffsetX / 2
         }
+
+        // カットベース: 人物がコンフォートゾーンを外れたときだけスナップ
         if let normalizedX = lastDetectedNormalizedX {
             let personX = normalizedX * scaledWidth
-            let desired = renderSize.width / 2 - personX
-            rawTargetOffsetX = max(minOffsetX, min(0, desired))
-        } else {
-            // 人物が長時間いない場合のみ中央へ（非常にゆっくり）
-            rawTargetOffsetX = rawTargetOffsetX + (minOffsetX / 2 - rawTargetOffsetX) * 0.002
+            let personInFrame = personX + currentOffsetX
+            let centerDelta = personInFrame - renderSize.width / 2
+            if abs(centerDelta) > renderSize.width * cutThreshold {
+                let desired = renderSize.width / 2 - personX
+                currentOffsetX = max(minOffsetX, min(0, desired))
+            }
         }
 
-        // ターゲット自体をゆっくり動かす（検出間隔のジャンプを滑らかに）
-        smoothedTargetOffsetX += (rawTargetOffsetX - smoothedTargetOffsetX) * 0.04
-
-        // currentをsmoothTargetに追従（ダンピング適用）
-        currentOffsetX += (smoothedTargetOffsetX - currentOffsetX) * dampingFactor
-
-        // 動画をズームして左右クロップ
         return sourceImage
             .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             .transformed(by: CGAffineTransform(translationX: currentOffsetX, y: 0))

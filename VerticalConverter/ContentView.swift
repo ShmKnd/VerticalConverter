@@ -91,16 +91,16 @@ struct ContentView: View {
             VStack(spacing: 10) {
                 Toggle("スマートフレーミング（人物追従）", isOn: $viewModel.smartFramingEnabled)
                     .toggleStyle(.switch)
-                
+
                 if viewModel.smartFramingEnabled {
                     HStack(spacing: 10) {
-                        Text("追従速度:")
+                        Text("パン速度:")
                             .font(.caption)
                             .foregroundColor(.secondary)
-                        
+
                         Picker("", selection: $viewModel.smartFramingSmoothness) {
-                            ForEach(SmartFramingSettings.Smoothness.allCases, id: \.self) { smoothness in
-                                Text(smoothness.rawValue).tag(smoothness)
+                            ForEach(SmartFramingSettings.Smoothness.allCases, id: \.self) { s in
+                                Text(s.rawValue).tag(s)
                             }
                         }
                         .pickerStyle(.segmented)
@@ -186,6 +186,7 @@ class ContentViewModel: ObservableObject {
     @Published var smartFramingSmoothness: SmartFramingSettings.Smoothness = .normal
     @Published var isProcessing: Bool = false
     @Published var progress: Double = 0.0
+    @Published var phaseLabel: String = "変換中..."
     @Published var statusMessage: String = ""
     @Published var hasError: Bool = false
     
@@ -257,9 +258,10 @@ class ContentViewModel: ObservableObject {
                     outputURL: outputURL,
                     bitrate: selectedBitrate,
                     smartFramingSettings: settings,
-                    progressHandler: { progress in
+                    progressHandler: { progress, label in
                         Task { @MainActor in
                             self.progress = progress
+                            self.phaseLabel = label
                             DockProgress.update(progress)
                         }
                     }

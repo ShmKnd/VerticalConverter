@@ -18,7 +18,10 @@ class CustomVideoCompositionInstruction: NSObject, AVVideoCompositionInstruction
     var smartFramingEnabled: Bool
     var dampingFactor: Double
     var inputSize: CGSize
-    
+
+    /// 事前解析済みオフセット配列（nil = リアルタイムフォールバック）
+    var precomputedOffsets: [CGFloat]?
+
     // レイヤーインストラクション
     var layerInstructions: [AVVideoCompositionLayerInstruction]
     
@@ -27,13 +30,15 @@ class CustomVideoCompositionInstruction: NSObject, AVVideoCompositionInstruction
         layerInstructions: [AVVideoCompositionLayerInstruction],
         smartFramingEnabled: Bool,
         dampingFactor: Double,
-        inputSize: CGSize
+        inputSize: CGSize,
+        precomputedOffsets: [CGFloat]? = nil
     ) {
         self.timeRange = timeRange
         self.layerInstructions = layerInstructions
         self.smartFramingEnabled = smartFramingEnabled
         self.dampingFactor = dampingFactor
         self.inputSize = inputSize
+        self.precomputedOffsets = precomputedOffsets
         
         // requiredSourceTrackIDsを設定
         if let trackID = layerInstructions.first?.trackID {

@@ -40,7 +40,7 @@ actor VideoProcessor {
         outputURL: URL,
         bitrate: Int,
         smartFramingSettings: SmartFramingSettings,
-        progressHandler: @escaping (Double) -> Void
+        progressHandler: @escaping (Double, String) -> Void  // (progress, phaseLabel)
     ) async throws {
         // 既存の出力ファイルを削除
         if FileManager.default.fileExists(atPath: outputURL.path) {
@@ -63,16 +63,34 @@ actor VideoProcessor {
         let height = abs(videoSize.height)
         
         // 出力サイズを計算（9:16の縦型）
-        let outputWidth: CGFloat = 1080
+        let outputWidth: CGFloat  = 1080
         let outputHeight: CGFloat = 1920
         
-        // コンポジションを作成
+        // ── スマートフレーミング ONなら事前解析（第1パス）──
+        var precomputedOffsets: [CGFloat]? = nil
+        if smartFramingSettings.enabled {
+            let analyzer = SmartFramingAnalyzer()
+            precomputedOffsets = try await analyzer.analyze(
+                asset: asset,
+                videoTrack: videoTrack,
+                inputSize: CGSize(width: width, height: height),
+                outputSize: CGSize(width: outputWidth, height: outputHeight),
+                followFactor: CGFloat(smartFramingSettings.smoothness.followFactor),
+                progressHandler: { p in progressHandler(p * 0.4, "解析中...") }
+            )
+        }
+        
+        // ── コンポジション作成 + エクスポート（第2パス）──
+        let progressOffset = smartFramingSettings.enabled ? 0.4 : 0.0
+        let progressScale  = smartFramingSettings.enabled ? 0.6 : 1.0
+        
         let (composition, videoComposition) = try await createComposition(
             asset: asset,
             videoTrack: videoTrack,
             inputSize: CGSize(width: width, height: height),
             outputSize: CGSize(width: outputWidth, height: outputHeight),
-            smartFramingSettings: smartFramingSettings
+            smartFramingSettings: smartFramingSettings,
+            precomputedOffsets: precomputedOffsets
         )
         
         // エクスポート
@@ -81,7 +99,9 @@ actor VideoProcessor {
             videoComposition: videoComposition,
             outputURL: outputURL,
             bitrate: bitrate,
-            progressHandler: progressHandler
+            progressHandler: { p in
+                progressHandler(progressOffset + p * progressScale, "変換中...")
+            }
         )
     }
 
@@ -90,7 +110,8 @@ actor VideoProcessor {
         videoTrack: AVAssetTrack,
         inputSize: CGSize,
         outputSize: CGSize,
-        smartFramingSettings: SmartFramingSettings
+        smartFramingSettings: SmartFramingSettings,
+        precomputedOffsets: [CGFloat]? = nil
     ) async throws -> (AVMutableComposition, AVMutableVideoComposition) {
         let composition = AVMutableComposition()
         
@@ -142,7 +163,8 @@ actor VideoProcessor {
             layerInstructions: [layerInstruction],
             smartFramingEnabled: smartFramingSettings.enabled,
             dampingFactor: smartFramingSettings.smoothness.dampingFactor,
-            inputSize: inputSize
+            inputSize: inputSize,
+            precomputedOffsets: precomputedOffsets
         )
         
         videoComposition.instructions = [instruction]
