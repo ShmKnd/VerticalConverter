@@ -16,6 +16,7 @@ enum VideoProcessorError: LocalizedError {
     case compositionFailed
     case exportFailed
     case unsupportedFormat
+    case cancelled
     
     var errorDescription: String? {
         switch self {
@@ -27,6 +28,8 @@ enum VideoProcessorError: LocalizedError {
             return "動画の書き出しに失敗しました"
         case .unsupportedFormat:
             return "サポートされていない動画形式です"
+        case .cancelled:
+            return "変換がキャンセルされました"
         }
     }
 }
@@ -81,7 +84,7 @@ actor VideoProcessor {
             progressHandler: progressHandler
         )
     }
-    
+
     private func createComposition(
         asset: AVAsset,
         videoTrack: AVAssetTrack,
@@ -173,48 +176,160 @@ actor VideoProcessor {
         bitrate: Int,
         progressHandler: @escaping (Double) -> Void
     ) async throws {
-        guard let export = AVAssetExportSession(
-            asset: composition,
-            presetName: AVAssetExportPresetHEVCHighestQuality
-        ) else {
+
+        // AVAssetReader セットアップ
+        let reader: AVAssetReader
+        do {
+            reader = try AVAssetReader(asset: composition)
+        } catch {
             throw VideoProcessorError.exportFailed
         }
-        
-        export.outputURL = outputURL
-        export.outputFileType = AVFileType.mp4
-        export.videoComposition = videoComposition
-        export.shouldOptimizeForNetworkUse = true
-        
-        // 注: AVAssetExportSessionではプリセット名でビットレートが決定されます
-        // カスタムビットレートを設定する場合は、AVAssetWriterを使用する必要があります
-        
-        // プログレス監視用タスク
-        let progressTask = Task {
-            while !Task.isCancelled {
-                let progress = Double(export.progress)
-                await MainActor.run {
-                    progressHandler(progress)
-                }
-                try? await Task.sleep(nanoseconds: 100_000_000) // 0.1秒
+
+        let renderSize = videoComposition.renderSize
+
+        // ビデオ読み込み: カスタムVideoCompositionを適用して読む
+        let videoOutput = AVAssetReaderVideoCompositionOutput(
+            videoTracks: composition.tracks(withMediaType: .video),
+            videoSettings: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            ]
+        )
+        videoOutput.videoComposition = videoComposition
+        videoOutput.alwaysCopiesSampleData = false
+        guard reader.canAdd(videoOutput) else { throw VideoProcessorError.exportFailed }
+        reader.add(videoOutput)
+
+        // オーディオ読み込み
+        var audioOutput: AVAssetReaderTrackOutput? = nil
+        if let audioTrack = composition.tracks(withMediaType: .audio).first {
+            let aOut = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: [
+                AVFormatIDKey: kAudioFormatLinearPCM
+            ])
+            aOut.alwaysCopiesSampleData = false
+            if reader.canAdd(aOut) {
+                reader.add(aOut)
+                audioOutput = aOut
             }
         }
-        
-        await export.export()
-        progressTask.cancel()
-        
-        await MainActor.run {
-            progressHandler(1.0)
-        }
-        
-        switch export.status {
-        case .completed:
-            return
-        case .failed:
-            throw export.error ?? VideoProcessorError.exportFailed
-        case .cancelled:
-            throw VideoProcessorError.exportFailed
-        default:
+
+        // AVAssetWriter セットアップ
+        let writer: AVAssetWriter
+        do {
+            writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+        } catch {
             throw VideoProcessorError.exportFailed
         }
+        writer.shouldOptimizeForNetworkUse = true
+
+        // ビデオ出力設定（指定ビットレートのHEVC）
+        let videoBitrate = bitrate * 1_000_000
+        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.hevc,
+            AVVideoWidthKey: Int(renderSize.width),
+            AVVideoHeightKey: Int(renderSize.height),
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: videoBitrate,
+                AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main_AutoLevel
+            ]
+        ])
+        videoInput.expectsMediaDataInRealTime = false
+        guard writer.canAdd(videoInput) else { throw VideoProcessorError.exportFailed }
+        writer.add(videoInput)
+
+        // オーディオ出力設定（AAC 192kbps）
+        var audioInput: AVAssetWriterInput? = nil
+        if audioOutput != nil {
+            let aIn = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: 44100,
+                AVNumberOfChannelsKey: 2,
+                AVEncoderBitRateKey: 192_000
+            ])
+            aIn.expectsMediaDataInRealTime = false
+            if writer.canAdd(aIn) {
+                writer.add(aIn)
+                audioInput = aIn
+            }
+        }
+
+        // 総再生時間（プログレス計算用）
+        let durationSeconds = composition.duration.seconds
+
+        reader.startReading()
+        writer.startWriting()
+        writer.startSession(atSourceTime: .zero)
+
+        // キャンセル時に reader を即座に止める
+        // → copyNextSampleBuffer() が nil を返してコールバックが自然終了する
+        try await withTaskCancellationHandler {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+
+                // ビデオトラック
+                group.addTask {
+                    try await withCheckedThrowingContinuation { continuation in
+                        videoInput.requestMediaDataWhenReady(on: DispatchQueue(label: "video.write")) {
+                            while videoInput.isReadyForMoreMediaData {
+                                guard let sample = videoOutput.copyNextSampleBuffer() else {
+                                    // reader がキャンセルされると nil が返る → 正常終了扱い
+                                    videoInput.markAsFinished()
+                                    continuation.resume()
+                                    return
+                                }
+                                videoInput.append(sample)
+
+                                // プログレス更新
+                                let pts = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+                                if durationSeconds > 0 {
+                                    let p = min(pts / durationSeconds, 0.99)
+                                    Task { @MainActor in progressHandler(p) }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // オーディオトラック
+                if let aOut = audioOutput, let aIn = audioInput {
+                    group.addTask {
+                        try await withCheckedThrowingContinuation { continuation in
+                            aIn.requestMediaDataWhenReady(on: DispatchQueue(label: "audio.write")) {
+                                while aIn.isReadyForMoreMediaData {
+                                    guard let sample = aOut.copyNextSampleBuffer() else {
+                                        aIn.markAsFinished()
+                                        continuation.resume()
+                                        return
+                                    }
+                                    aIn.append(sample)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                try await group.waitForAll()
+            }
+        } onCancel: {
+            // ← ここが即時実行される（メインスレッド待ち不要）
+            reader.cancelReading()
+            videoInput.markAsFinished()
+            audioInput?.markAsFinished()
+            writer.cancelWriting()
+        }
+
+        // キャンセルチェック
+        if Task.isCancelled || reader.status == .cancelled || writer.status == .cancelled {
+            // 未完了ファイルを削除
+            try? FileManager.default.removeItem(at: outputURL)
+            throw VideoProcessorError.cancelled
+        }
+
+        // 書き出し完了
+        await writer.finishWriting()
+
+        if writer.status == .failed {
+            throw writer.error ?? VideoProcessorError.exportFailed
+        }
+
+        await MainActor.run { progressHandler(1.0) }
     }
 }

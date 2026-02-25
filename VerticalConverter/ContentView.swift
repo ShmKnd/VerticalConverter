@@ -7,6 +7,7 @@
 
 import SwiftUI
 import UniformTypeIdentifiers
+import AppKit
 
 struct ContentView: View {
     @StateObject private var viewModel = ContentViewModel()
@@ -110,49 +111,69 @@ struct ContentView: View {
             }
             .padding(.horizontal)
             
-            // 変換ボタン
-            Button(action: {
-                viewModel.convertVideo()
-            }) {
-                HStack {
-                    if viewModel.isProcessing {
-                        ProgressView()
-                            .scaleEffect(0.7)
-                            .frame(width: 16, height: 16)
-                    } else {
-                        Image(systemName: "arrow.triangle.2.circlepath")
+            // 変換ボタン / 中止ボタン + プログレスバー + ステータス（固定高さで安定させる）
+            VStack(spacing: 8) {
+                // ボタン行（常に同じ高さを確保）
+                if viewModel.isProcessing {
+                    Button(action: {
+                        viewModel.cancelConversion()
+                    }) {
+                        HStack {
+                            Image(systemName: "xmark.circle.fill")
+                            Text("変換を中止")
+                        }
+                        .frame(width: 200)
                     }
-                    Text(viewModel.isProcessing ? "変換中..." : "変換開始")
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
+                } else {
+                    Button(action: {
+                        viewModel.convertVideo()
+                    }) {
+                        HStack {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                            Text("変換開始")
+                        }
+                        .frame(width: 200)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(viewModel.selectedVideoURL == nil)
                 }
-                .frame(width: 200)
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(viewModel.selectedVideoURL == nil || viewModel.isProcessing)
-            .padding(.vertical, 10)
-            
-            // プログレスバー
-            if viewModel.isProcessing {
-                VStack(spacing: 5) {
-                    ProgressView(value: viewModel.progress)
-                        .frame(width: 300)
-                    Text(String(format: "%.0f%%", viewModel.progress * 100))
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+
+                // プログレスエリア（常に固定高さ）
+                VStack(spacing: 4) {
+                    if viewModel.isProcessing {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .scaleEffect(0.7)
+                                .frame(width: 14, height: 14)
+                            Text("変換中...")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        ProgressView(value: viewModel.progress)
+                            .frame(width: 300)
+                        Text(String(format: "%.0f%%", viewModel.progress * 100))
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
                 }
-            }
-            
-            // ステータスメッセージ
-            if !viewModel.statusMessage.isEmpty {
-                Text(viewModel.statusMessage)
+                .frame(height: 52) // 常にこの高さをキープ
+
+                // ステータスメッセージエリア（常に固定高さ）
+                Text(viewModel.statusMessage.isEmpty ? " " : viewModel.statusMessage)
                     .font(.caption)
                     .foregroundColor(viewModel.hasError ? .red : .green)
                     .padding(.horizontal)
                     .multilineTextAlignment(.center)
+                    .frame(height: 36)
+                    .lineLimit(2)
             }
-            
-            Spacer()
+            .padding(.vertical, 4)
+
+            Spacer(minLength: 0)
         }
-        .frame(width: 500, height: 500)
+        .frame(width: 500, height: 560)
         .padding()
     }
 }
@@ -169,6 +190,7 @@ class ContentViewModel: ObservableObject {
     @Published var hasError: Bool = false
     
     private let videoProcessor = VideoProcessor()
+    private var conversionTask: Task<Void, Never>?
     
     func selectFile() {
         let panel = NSOpenPanel()
@@ -195,6 +217,11 @@ class ContentViewModel: ObservableObject {
         }
     }
     
+    func cancelConversion() {
+        conversionTask?.cancel()
+        conversionTask = nil
+    }
+
     func convertVideo() {
         guard let inputURL = selectedVideoURL else { return }
         
@@ -202,13 +229,14 @@ class ContentViewModel: ObservableObject {
         hasError = false
         statusMessage = "変換を開始しています..."
         progress = 0.0
-        
+        DockProgress.start()
+
         // 出力ファイル名を生成
         let inputFilename = inputURL.deletingPathExtension().lastPathComponent
         let outputURL = inputURL.deletingLastPathComponent()
             .appendingPathComponent("\(inputFilename)_vertical.mp4")
         
-        Task {
+        conversionTask = Task {
             do {
                 // セキュリティスコープ付きリソースへのアクセスを開始
                 let isAccessingSecurityScope = inputURL.startAccessingSecurityScopedResource()
@@ -232,6 +260,7 @@ class ContentViewModel: ObservableObject {
                     progressHandler: { progress in
                         Task { @MainActor in
                             self.progress = progress
+                            DockProgress.update(progress)
                         }
                     }
                 )
@@ -241,12 +270,16 @@ class ContentViewModel: ObservableObject {
                 
                 // 保存先をFinderで表示
                 NSWorkspace.shared.activateFileViewerSelecting([outputURL])
+            } catch VideoProcessorError.cancelled {
+                self.statusMessage = "変換を中止しました"
+                self.hasError = false
             } catch {
                 self.statusMessage = "エラー: \(error.localizedDescription)"
                 self.hasError = true
             }
             
             self.isProcessing = false
+            DockProgress.stop()
         }
     }
 }

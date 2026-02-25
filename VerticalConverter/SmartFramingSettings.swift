@@ -18,9 +18,9 @@ struct SmartFramingSettings {
         
         var dampingFactor: Double {
             switch self {
-            case .fast: return 0.3
-            case .normal: return 0.15
-            case .slow: return 0.08
+            case .fast: return 0.12
+            case .normal: return 0.06
+            case .slow: return 0.03
             }
         }
     }

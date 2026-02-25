@@ -13,6 +13,7 @@
 		DE08328251F84B72A44F0B9F63D895AC /* VerticalVideoCompositor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D5730ED405F414AA6ABA96AC2BEAD44 /* VerticalVideoCompositor.swift */; };
 		62C15C98B1294DEFA5E48F83A3B18273 /* SmartFramingSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = D9C0F43211F74D91B1882EC1E7FD59EF /* SmartFramingSettings.swift */; };
 		4A8F3C1B92E34F56A7D8E92F44B62A11 /* CustomVideoCompositionInstruction.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F2D8E3A43C94A67B9E1F4C36D2A7E89 /* CustomVideoCompositionInstruction.swift */; };
+		B3D92F1A4C5E4A78B6E2D8F3A71C4B55 /* DockProgress.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7E41F2B83D94B56AE3F17D2B94A6C33 /* DockProgress.swift */; };
 		2B277AFF2D18448C8D05EA1AE683A82E /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 69D7A89B4FCE49AF849BE45027E5DF2F /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
@@ -24,6 +25,7 @@
 		8D5730ED405F414AA6ABA96AC2BEAD44 /* VerticalVideoCompositor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VerticalVideoCompositor.swift; sourceTree = "<group>"; };
 		D9C0F43211F74D91B1882EC1E7FD59EF /* SmartFramingSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SmartFramingSettings.swift; sourceTree = "<group>"; };
 		5F2D8E3A43C94A67B9E1F4C36D2A7E89 /* CustomVideoCompositionInstruction.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomVideoCompositionInstruction.swift; sourceTree = "<group>"; };
+		C7E41F2B83D94B56AE3F17D2B94A6C33 /* DockProgress.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DockProgress.swift; sourceTree = "<group>"; };
 		69D7A89B4FCE49AF849BE45027E5DF2F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		9E7AAF932FBA4CA2856A59AC40BA4F4B /* VerticalConverter.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = VerticalConverter.entitlements; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -56,6 +58,7 @@
 				8D5730ED405F414AA6ABA96AC2BEAD44 /* VerticalVideoCompositor.swift */,
 				D9C0F43211F74D91B1882EC1E7FD59EF /* SmartFramingSettings.swift */,
 				5F2D8E3A43C94A67B9E1F4C36D2A7E89 /* CustomVideoCompositionInstruction.swift */,
+				C7E41F2B83D94B56AE3F17D2B94A6C33 /* DockProgress.swift */,
 				69D7A89B4FCE49AF849BE45027E5DF2F /* Assets.xcassets */,
 				9E7AAF932FBA4CA2856A59AC40BA4F4B /* VerticalConverter.entitlements */,
 			);
@@ -144,6 +147,7 @@
 				3C6B5B52570244DF85CF3C2B0022A189 /* VideoProcessor.swift in Sources */,
 				62C15C98B1294DEFA5E48F83A3B18273 /* SmartFramingSettings.swift in Sources */,
 				4A8F3C1B92E34F56A7D8E92F44B62A11 /* CustomVideoCompositionInstruction.swift in Sources */,
+				B3D92F1A4C5E4A78B6E2D8F3A71C4B55 /* DockProgress.swift in Sources */,
 				E7BA2EE0A9AF43FFAE5675BBF5249666 /* VerticalConverterApp.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

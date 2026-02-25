@@ -20,7 +20,11 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     private var smartFramingEnabled: Bool = false
     private var dampingFactor: Double = 0.15
     private var currentOffsetX: CGFloat = 0
-    private var targetOffsetX: CGFloat = 0
+    private var smoothedTargetOffsetX: CGFloat = 0  // ターゲット自体もスムージング
+    private var rawTargetOffsetX: CGFloat = 0       // Vision検出生値
+    private var frameCount: Int = 0
+    private let detectionInterval: Int = 8          // 何フレームごとに検出するか
+    private var lastDetectedNormalizedX: CGFloat? = nil
     
     override init() {
         ciContext = CIContext(options: [
@@ -187,16 +191,27 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         let scale = renderSize.height / sourceSize.height
         let scaledWidth = sourceSize.width * scale
 
-        // 人物検出でX方向ターゲットオフセットを更新
-        detectPersonAndUpdateTargetOffsetX(
-            in: sourcePixelBuffer,
-            sourceSize: sourceSize,
-            scaledWidth: scaledWidth,
-            renderWidth: renderSize.width
-        )
+        // 一定フレーム間隔でのみVision検出を実行（重い処理を間引く）
+        frameCount += 1
+        if frameCount % detectionInterval == 0 {
+            detectPersonNormalizedX(in: sourcePixelBuffer)
+        }
 
-        // ダンピングでスムーズに追従
-        currentOffsetX += (targetOffsetX - currentOffsetX) * dampingFactor
+        // 検出値からrawTargetを計算
+        let minOffsetX = -(scaledWidth - renderSize.width)
+        if let normalizedX = lastDetectedNormalizedX {
+            let personX = normalizedX * scaledWidth
+            let desired = renderSize.width / 2 - personX
+            rawTargetOffsetX = max(minOffsetX, min(0, desired))
+        } else {
+            rawTargetOffsetX = minOffsetX / 2
+        }
+
+        // ターゲット自体をゆっくり動かす（検出間隔のジャンプを滑らかに）
+        smoothedTargetOffsetX += (rawTargetOffsetX - smoothedTargetOffsetX) * 0.04
+
+        // currentをsmoothTargetに追従（ダンピング適用）
+        currentOffsetX += (smoothedTargetOffsetX - currentOffsetX) * dampingFactor
 
         // 動画をズームして左右クロップ
         return sourceImage
@@ -205,25 +220,18 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             .cropped(to: outputRect)
     }
     
-    // MARK: - 人物検出（X位置追跡）
+    // MARK: - 人物検出（Visionは間引いて実行）
 
-    private func detectPersonAndUpdateTargetOffsetX(
-        in pixelBuffer: CVPixelBuffer,
-        sourceSize: CGSize,
-        scaledWidth: CGFloat,
-        renderWidth: CGFloat
-    ) {
+    private func detectPersonNormalizedX(in pixelBuffer: CVPixelBuffer) {
         let bodyRequest = VNDetectHumanBodyPoseRequest()
         let faceRequest = VNDetectFaceRectanglesRequest()
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
         do { try handler.perform([bodyRequest, faceRequest]) } catch { return }
 
-        var detectedNormalizedX: CGFloat? = nil
+        var allPersonsX: [CGFloat] = []
 
         // 人体ポーズ検出（優先）
         if let bodyResults = bodyRequest.results, !bodyResults.isEmpty {
-            var totalX: CGFloat = 0
-            var count: CGFloat = 0
             for observation in bodyResults {
                 if let points = try? observation.recognizedPoints(.all) {
                     let upperPoints = [
@@ -231,34 +239,30 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
                         points[.rightShoulder], points[.nose]
                     ].compactMap { $0 }.filter { $0.confidence > 0.3 }
                     if !upperPoints.isEmpty {
-                        // Vision X座標: 左=0、右=1
                         let avgX = upperPoints.reduce(0.0) { $0 + $1.location.x } / CGFloat(upperPoints.count)
-                        totalX += avgX
-                        count += 1
+                        allPersonsX.append(avgX)
                     }
                 }
             }
-            if count > 0 { detectedNormalizedX = totalX / count }
         }
 
         // 顔検出（フォールバック）
-        if detectedNormalizedX == nil, let faceResults = faceRequest.results, !faceResults.isEmpty {
-            var totalX: CGFloat = 0
-            for face in faceResults { totalX += face.boundingBox.midX }
-            detectedNormalizedX = totalX / CGFloat(faceResults.count)
+        if allPersonsX.isEmpty, let faceResults = faceRequest.results, !faceResults.isEmpty {
+            for face in faceResults {
+                allPersonsX.append(face.boundingBox.midX)
+            }
         }
 
-        // offsetX の範囲: 動画が左右にはみ出さないように制限
-        let minOffsetX = -(scaledWidth - renderWidth)  // 右端を画面右端に合わせた場合
-        let maxOffsetX: CGFloat = 0                    // 左端を画面左端に合わせた場合
+        guard !allPersonsX.isEmpty else { return }
 
-        if let normalizedX = detectedNormalizedX {
-            let personXInScaledVideo = normalizedX * scaledWidth
-            let desiredOffsetX = renderWidth / 2 - personXInScaledVideo
-            targetOffsetX = max(minOffsetX, min(maxOffsetX, desiredOffsetX))
+        if allPersonsX.count == 1 {
+            // 1人: そのままの位置
+            lastDetectedNormalizedX = allPersonsX[0]
         } else {
-            // 未検出時は中央
-            targetOffsetX = minOffsetX / 2
+            // 複数人: 全員を包むバウンディングボックスの中心を使用
+            let minX = allPersonsX.min()!
+            let maxX = allPersonsX.max()!
+            lastDetectedNormalizedX = (minX + maxX) / 2
         }
     }
 
