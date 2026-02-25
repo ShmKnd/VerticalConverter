@@ -55,10 +55,13 @@ private final class PersonTracker {
     func update(with rawPersons: [RawPerson]) -> CGPoint? {
         if rawPersons.isEmpty {
             // 全員未検出: missedFrames を増加させてタイムアウト削除
-            for i in tracked.indices {
-                tracked[i].missedFrames += 1
-            }
+            for i in tracked.indices { tracked[i].missedFrames += 1 }
             tracked.removeAll { $0.missedFrames > maxMissed }
+            // ただし maxMissed 以内のトラックが残っている間は
+            // 最後に既知だった加重中心を返してホールド挙動にする
+            if !tracked.isEmpty {
+                return weightedCenterAllowingMissed()
+            }
             return nil
         }
 
@@ -138,6 +141,22 @@ private final class PersonTracker {
         return CGPoint(x: wx / totalW, y: wy / totalW)
     }
 
+    /// missedFrames が 0 でないトラックも許容して加重中心を返す（ホールド用）
+    private func weightedCenterAllowingMissed() -> CGPoint? {
+        guard !tracked.isEmpty else { return nil }
+        var totalW: CGFloat = 0
+        var wx: CGFloat = 0
+        var wy: CGFloat = 0
+        for tp in tracked {
+            let w = subjectScore(tp)
+            wx += tp.x * w
+            wy += tp.y * w
+            totalW += w
+        }
+        guard totalW > 0 else { return nil }
+        return CGPoint(x: wx / totalW, y: wy / totalW)
+    }
+
     /// 人物ごとの「主役らしさ」スコア
     ///   = confidence × centrality × lifespanWeight × motionWeight
     private func subjectScore(_ tp: TrackedPerson) -> CGFloat {
@@ -189,8 +208,8 @@ struct SmartFramingAnalyzer {
         let fps         = try await videoTrack.load(.nominalFrameRate)
         let totalFrames = max(1, Int(ceil(duration.seconds * Double(fps))))
 
-        // ① fps依存のガウシアン sigma（≈ 0.4秒分の平滑化半径）
-        let sigma = Double(fps) * 0.4
+        // ① fps依存のガウシアン sigma（弱め: ≈ 0.2秒分の平滑化半径）
+        let sigma = Double(fps) * 0.2
 
         // スケール（Y方向ズーム込み）
         let zoomFactor   = SmartFramingAnalyzer.yZoomFactor
@@ -204,7 +223,7 @@ struct SmartFramingAnalyzer {
         let centerOffsetY = minOffsetY / 2
 
         // Step 1: 全フレームをスキャン（IOUトラッキング + 主役推定）
-        let rawPositions = try await detectAllPositions(
+        let (rawPositions, finalDetectionInterval) = try await detectAllPositions(
             asset: asset,
             videoTrack: videoTrack,
             totalFrames: totalFrames,
@@ -215,8 +234,10 @@ struct SmartFramingAnalyzer {
         // Step 2: X・Y を別々に補間
         let rawX = rawPositions.map { $0.map { $0.x } }
         let rawY = rawPositions.map { $0.map { $0.y } }
-        let interpX = interpolate(rawX, fallback: 0.5)
-        let interpY = interpolate(rawY, fallback: 0.72)
+        // shortGapFrames を検出間隔に依存させる（安定化のため）
+        let shortGap = max(1, finalDetectionInterval * 2)
+        let interpX = interpolate(rawX, fallback: 0.5, shortGapFrames: shortGap)
+        let interpY = interpolate(rawY, fallback: 0.72, shortGapFrames: shortGap)
 
         // Step 3: 双方向ガウシアンスムージング（fps依存 sigma）
         let smoothedX = gaussianSmooth(interpX, sigma: sigma)
@@ -261,7 +282,7 @@ struct SmartFramingAnalyzer {
         totalFrames: Int,
         fps: Double,
         progressHandler: @escaping (Double) -> Void
-    ) async throws -> [CGPoint?] {
+    ) async throws -> ([CGPoint?], Int) {
         var result = [CGPoint?](repeating: nil, count: totalFrames)
 
         let tracker = PersonTracker()
@@ -270,13 +291,14 @@ struct SmartFramingAnalyzer {
         // ③ 適応的検出間隔: 動き大 → 4フレーム毎、安定 → 8フレーム毎
         var detectionInterval = 8
         var lastWeightedCenter: CGPoint? = nil
+        var lastFilledIndex: Int = -1
 
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ])
         output.alwaysCopiesSampleData = false
-        guard reader.canAdd(output) else { return result }
+        guard reader.canAdd(output) else { return (result, detectionInterval) }
         reader.add(output)
         reader.startReading()
 
@@ -293,6 +315,16 @@ struct SmartFramingAnalyzer {
 
                 let rawPersons = detectRawPersons(in: pixelBuffer)
                 let center = tracker.update(with: rawPersons)
+
+                // Fill any frames between lastFilledIndex and this sample with the
+                // last known weighted center (hold behavior). This avoids creating
+                // long linear interpolations across absent detections.
+                if lastFilledIndex + 1 <= frameIndex - 1 {
+                    for fi in (lastFilledIndex + 1)..<frameIndex {
+                        result[fi] = lastWeightedCenter
+                    }
+                }
+
                 result[frameIndex] = center
 
                 // 適応的間隔: 前回中心との差が大きければ短縮
@@ -300,7 +332,9 @@ struct SmartFramingAnalyzer {
                     let deviation = hypot(c.x - lc.x, c.y - lc.y)
                     detectionInterval = deviation > 0.10 ? 4 : 8
                 }
-                lastWeightedCenter = center
+
+                if let c = center { lastWeightedCenter = c }
+                lastFilledIndex = frameIndex
             }
 
             frameIndex += 1
@@ -309,7 +343,14 @@ struct SmartFramingAnalyzer {
             }
         }
 
-        return result
+        // Trailing frames after lastFilledIndex: hold lastWeightedCenter
+        if lastFilledIndex + 1 <= totalFrames - 1 {
+            for fi in (lastFilledIndex + 1)..<totalFrames {
+                result[fi] = lastWeightedCenter
+            }
+        }
+
+        return (result, detectionInterval)
     }
 
     /// 1フレームから全ての人物を検出して返す（トラッカーに渡す生データ）
@@ -358,7 +399,7 @@ struct SmartFramingAnalyzer {
 
     // MARK: - Step 2: 線形補間
 
-    private func interpolate(_ positions: [CGFloat?], fallback: CGFloat) -> [CGFloat] {
+    private func interpolate(_ positions: [CGFloat?], fallback: CGFloat, shortGapFrames: Int = 8) -> [CGFloat] {
         let n = positions.count
         var result = [CGFloat](repeating: fallback, count: n)
 
@@ -367,26 +408,57 @@ struct SmartFramingAnalyzer {
             return result
         }
 
-        for i in 0..<firstKnown { result[i] = positions[firstKnown]! }
+        // Leading: set to fallback (camera-centered) until first detection
+        for i in 0..<firstKnown { result[i] = fallback }
 
+        // Fill known value
         var prevIdx = firstKnown
         var prevVal = positions[firstKnown]!
-        result[firstKnown] = prevVal
+        result[prevIdx] = prevVal
 
-        for i in (firstKnown + 1)...lastKnown {
-            if let val = positions[i] {
-                let span = i - prevIdx
-                for j in prevIdx..<i {
-                    let t = CGFloat(j - prevIdx) / CGFloat(span)
-                    result[j] = prevVal + (val - prevVal) * t
+        var idx = firstKnown + 1
+        while idx <= lastKnown {
+            if let val = positions[idx] {
+                let nextIdx = idx
+                let nextVal = val
+                let gap = nextIdx - prevIdx - 1
+
+                if gap <= 0 {
+                    // adjacent knowns
+                } else if gap <= shortGapFrames {
+                    // short gap -> linear interpolate between prevVal and nextVal
+                    for j in 1...gap {
+                        let t = CGFloat(j) / CGFloat(gap + 1)
+                        result[prevIdx + j] = prevVal + (nextVal - prevVal) * t
+                    }
+                } else {
+                    // long gap -> treat as disappearance: slowly return toward fallback
+                    for j in 1...gap {
+                        let t = CGFloat(j) / CGFloat(gap + 1)
+                        result[prevIdx + j] = prevVal + (fallback - prevVal) * t
+                    }
                 }
-                result[i] = val
-                prevIdx = i
-                prevVal = val
+
+                // set next known
+                result[nextIdx] = nextVal
+                prevIdx = nextIdx
+                prevVal = nextVal
+                idx = nextIdx + 1
+            } else {
+                idx += 1
             }
         }
 
-        for i in (lastKnown + 1)..<n { result[i] = positions[lastKnown]! }
+        // Trailing: ease-out from lastKnown -> fallback so camera exits smoothly
+        let trailing = n - 1 - lastKnown
+        if trailing > 0 {
+            for j in 1...trailing {
+                let t = CGFloat(j) / CGFloat(trailing + 1)
+                let eased = 1.0 - (1.0 - t) * (1.0 - t)   // ease-out
+                result[lastKnown + j] = prevVal + (fallback - prevVal) * eased
+            }
+        }
+
         return result
     }
 
@@ -439,6 +511,9 @@ struct SmartFramingAnalyzer {
         let deadZone     = renderDimension * deadZoneRatio
         var settledFrame = -minHoldFrames
         var isFollowing  = false
+        var initialized  = false
+        var followStartFrame = 0
+        let warmupFrames = 15
 
         for i in 0..<positions.count {
             let personPos    = positions[i] * scaledDimension
@@ -446,17 +521,33 @@ struct SmartFramingAnalyzer {
             let deviation    = abs(targetOffset - cameraOffset)
             let holdElapsed  = i - settledFrame
 
+            // 初期化: 最初のフレームではカメラを即座にターゲットへスナップし、
+            // 以降は通常ホールド＆フォロー挙動とする（開幕のガクつき防止）
+            if !initialized {
+                cameraOffset = targetOffset
+                initialized = true
+                settledFrame = i
+                offsets[i] = cameraOffset
+                continue
+            }
+
             if isFollowing {
-                cameraOffset += (targetOffset - cameraOffset) * followFactor
-                if abs(targetOffset - cameraOffset) < 2.0 {
+                // Warmup ramp: on follow start the effective factor ramps from 0..followFactor
+                // over `warmupFrames` frames to avoid a large immediate jump.
+                let ramp = min(1.0, CGFloat(i - followStartFrame) / CGFloat(warmupFrames))
+                let effectiveFactor = followFactor * ramp
+                cameraOffset += (targetOffset - cameraOffset) * effectiveFactor
+                if abs(targetOffset - cameraOffset) < 1.0 {
                     cameraOffset = targetOffset
                     isFollowing  = false
+                    // Reset settledFrame on follow completion to start hold timer.
                     settledFrame = i
                 }
             } else {
                 if deviation > deadZone && holdElapsed >= minHoldFrames {
-                    isFollowing  = true
-                    cameraOffset += (targetOffset - cameraOffset) * followFactor
+                    isFollowing = true
+                    followStartFrame = i
+                    // Do NOT move camera on the first follow frame; warmup will start next frame.
                 }
             }
 
