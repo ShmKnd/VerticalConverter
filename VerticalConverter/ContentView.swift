@@ -86,6 +86,30 @@ struct ContentView: View {
                 .frame(width: 250)
             }
             
+            // スマートフレーミング設定
+            VStack(spacing: 10) {
+                Toggle("スマートフレーミング（人物追従）", isOn: $viewModel.smartFramingEnabled)
+                    .toggleStyle(.switch)
+                
+                if viewModel.smartFramingEnabled {
+                    HStack(spacing: 10) {
+                        Text("追従速度:")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        
+                        Picker("", selection: $viewModel.smartFramingSmoothness) {
+                            ForEach(SmartFramingSettings.Smoothness.allCases, id: \.self) { smoothness in
+                                Text(smoothness.rawValue).tag(smoothness)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: 200)
+                    }
+                    .transition(.opacity)
+                }
+            }
+            .padding(.horizontal)
+            
             // 変換ボタン
             Button(action: {
                 viewModel.convertVideo()
@@ -137,6 +161,8 @@ struct ContentView: View {
 class ContentViewModel: ObservableObject {
     @Published var selectedVideoURL: URL?
     @Published var selectedBitrate: Int = 10
+    @Published var smartFramingEnabled: Bool = false
+    @Published var smartFramingSmoothness: SmartFramingSettings.Smoothness = .normal
     @Published var isProcessing: Bool = false
     @Published var progress: Double = 0.0
     @Published var statusMessage: String = ""
@@ -192,10 +218,17 @@ class ContentViewModel: ObservableObject {
                     }
                 }
                 
+                // スマートフレーミング設定を作成
+                let settings = SmartFramingSettings(
+                    enabled: smartFramingEnabled,
+                    smoothness: smartFramingSmoothness
+                )
+                
                 try await videoProcessor.convertToVertical(
                     inputURL: inputURL,
                     outputURL: outputURL,
                     bitrate: selectedBitrate,
+                    smartFramingSettings: settings,
                     progressHandler: { progress in
                         Task { @MainActor in
                             self.progress = progress

@@ -36,6 +36,7 @@ actor VideoProcessor {
         inputURL: URL,
         outputURL: URL,
         bitrate: Int,
+        smartFramingSettings: SmartFramingSettings,
         progressHandler: @escaping (Double) -> Void
     ) async throws {
         // 既存の出力ファイルを削除
@@ -67,7 +68,8 @@ actor VideoProcessor {
             asset: asset,
             videoTrack: videoTrack,
             inputSize: CGSize(width: width, height: height),
-            outputSize: CGSize(width: outputWidth, height: outputHeight)
+            outputSize: CGSize(width: outputWidth, height: outputHeight),
+            smartFramingSettings: smartFramingSettings
         )
         
         // エクスポート
@@ -84,7 +86,8 @@ actor VideoProcessor {
         asset: AVAsset,
         videoTrack: AVAssetTrack,
         inputSize: CGSize,
-        outputSize: CGSize
+        outputSize: CGSize,
+        smartFramingSettings: SmartFramingSettings
     ) async throws -> (AVMutableComposition, AVMutableVideoComposition) {
         let composition = AVMutableComposition()
         
@@ -121,10 +124,6 @@ actor VideoProcessor {
         // カスタムコンポジターを使用
         videoComposition.customVideoCompositorClass = VerticalVideoCompositor.self
         
-        // インストラクションを作成
-        let instruction = AVMutableVideoCompositionInstruction()
-        instruction.timeRange = timeRange
-        
         let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: compositionVideoTrack)
         
         // トランスフォームを計算
@@ -134,7 +133,15 @@ actor VideoProcessor {
         )
         layerInstruction.setTransform(transform, at: .zero)
         
-        instruction.layerInstructions = [layerInstruction]
+        // カスタムインストラクションを作成
+        let instruction = CustomVideoCompositionInstruction(
+            timeRange: timeRange,
+            layerInstructions: [layerInstruction],
+            smartFramingEnabled: smartFramingSettings.enabled,
+            dampingFactor: smartFramingSettings.smoothness.dampingFactor,
+            inputSize: inputSize
+        )
+        
         videoComposition.instructions = [instruction]
         
         return (composition, videoComposition)
@@ -144,10 +151,8 @@ actor VideoProcessor {
         inputSize: CGSize,
         outputSize: CGSize
     ) -> CGAffineTransform {
-        // 16:9の動画を9:16の中央に配置するためのスケールを計算
-        let scaleX = outputSize.width / inputSize.width
-        let scaleY = outputSize.height / inputSize.height
-        let scale = min(scaleX, scaleY)
+        // 16:9の動画を9:16に配置する際のスケール（横幅を基準に）
+        let scale = outputSize.width / inputSize.width
         
         // スケール後のサイズ
         let scaledWidth = inputSize.width * scale
