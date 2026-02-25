@@ -28,7 +28,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     private var isFirstSmartFrame: Bool = true      // 初回フレーム判定
     // カットベース: 人物がフレーム中央からこの割合以上ずれたらカット（例: 0.25 = 25%）
     private let cutThreshold: CGFloat = 0.25    /// 事前解析済みオフセット（nil = リアルタイムフォールバック）
-    private var currentPrecomputedOffsets: [CGFloat]? = nil    
+    private var currentPrecomputedOffsets: [CGPoint]? = nil    
     override init() {
         ciContext = CIContext(options: [
             .workingColorSpace: CGColorSpaceCreateDeviceRGB(),
@@ -191,20 +191,23 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         renderSize: CGSize,
         outputRect: CGRect
     ) -> CIImage {
-        // 縦いっぱいにズームするスケール
-        let scale = renderSize.height / sourceSize.height
+        // 縦いっぱいにズームするスケール（Yパン余白確保のため yZoomFactor 倉でズームイン）
+        let zoomFactor = SmartFramingAnalyzer.yZoomFactor
+        let scale = renderSize.height / sourceSize.height * zoomFactor
         let scaledWidth = sourceSize.width * scale
+        let scaledHeight = sourceSize.height * scale
         let minOffsetX = -(scaledWidth - renderSize.width)
+        let centerOffsetY = (renderSize.height - scaledHeight) / 2   // Y方向の中央初期値
 
         frameCount += 1
 
         // ── 事前解析済みオフセットがあれば使う（2パスモード）──
         if let offsets = currentPrecomputedOffsets, !offsets.isEmpty {
             let idx = min(frameCount - 1, offsets.count - 1)
-            let offsetX = offsets[max(0, idx)]
+            let offset = offsets[max(0, idx)]
             return sourceImage
                 .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-                .transformed(by: CGAffineTransform(translationX: offsetX, y: 0))
+                .transformed(by: CGAffineTransform(translationX: offset.x, y: offset.y))
                 .cropped(to: outputRect)
         }
 
@@ -232,7 +235,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
 
         return sourceImage
             .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-            .transformed(by: CGAffineTransform(translationX: currentOffsetX, y: 0))
+            .transformed(by: CGAffineTransform(translationX: currentOffsetX, y: centerOffsetY))
             .cropped(to: outputRect)
     }
     

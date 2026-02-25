@@ -10,12 +10,14 @@ import Vision
 
 struct SmartFramingAnalyzer {
 
-    private let detectionInterval: Int = 8  // 何フレームごとに Vision を実行するか
+    /// Y方向パン余白確保のための均一ズーム倍率（10%ズームイン）
+    static let yZoomFactor: CGFloat = 1.1
 
     // MARK: - Public
 
-    /// 動画全体を解析し、フレームごとの offsetX（スケール済みピクセル）を配列で返す。
-    /// - precomputedOffsets[i] = フレームiでのカメラ左端オフセット（負値または0）
+    /// 動画全体を解析し、フレームごとの (offsetX, offsetY) を CGPoint 配列で返す。
+    /// - .x = カメラ左端オフセット（ピクセル、負値または0）
+    /// - .y = カメラ下端オフセット（ピクセル、負値または0）
     func analyze(
         asset: AVAsset,
         videoTrack: AVAssetTrack,
@@ -23,18 +25,27 @@ struct SmartFramingAnalyzer {
         outputSize: CGSize,
         followFactor: CGFloat = 0.06,
         progressHandler: @escaping (Double) -> Void
-    ) async throws -> [CGFloat] {
+    ) async throws -> [CGPoint] {
         let duration    = try await asset.load(.duration)
         let fps         = try await videoTrack.load(.nominalFrameRate)
         let totalFrames = max(1, Int(ceil(duration.seconds * Double(fps))))
 
-        // 出力座標系でのスケール
-        let scale        = outputSize.height / inputSize.height
-        let scaledWidth  = inputSize.width  * scale
-        let minOffsetX   = -(scaledWidth - outputSize.width)
-        let centerOffset = minOffsetX / 2
+        // ① fps依存のガウシアン sigma（≈ 0.4秒分の平滑化半径）
+        //   30fps → sigma=12, 60fps → sigma=24, 24fps → sigma=9.6
+        let sigma = Double(fps) * 0.4
 
-        // Step 1: 全フレームをスキャンして人物 X 座標を取得（N フレームごと）
+        // スケール（Y方向ズーム込み）
+        let zoomFactor   = SmartFramingAnalyzer.yZoomFactor
+        let scale        = outputSize.height / inputSize.height * zoomFactor
+        let scaledWidth  = inputSize.width  * scale
+        let scaledHeight = inputSize.height * scale
+
+        let minOffsetX    = -(scaledWidth  - outputSize.width)
+        let minOffsetY    = -(scaledHeight - outputSize.height)   // 負値（上シフト上限）
+        let centerOffsetX = minOffsetX / 2
+        let centerOffsetY = minOffsetY / 2                         // 上下中央を初期位置
+
+        // Step 1: 全フレームをスキャンして人物 XY 座標を取得（③ 適応的間隔）
         let rawPositions = try await detectAllPositions(
             asset: asset,
             videoTrack: videoTrack,
@@ -42,42 +53,59 @@ struct SmartFramingAnalyzer {
             progressHandler: { progressHandler($0 * 0.85) }
         )
 
-        // Step 2: nil を線形補間で埋める
-        let interpolated = interpolate(rawPositions, fallback: 0.5)
+        // Step 2: X・Y を別々に補間
+        let rawX = rawPositions.map { $0.map { $0.x } }
+        let rawY = rawPositions.map { $0.map { $0.y } }
+        let interpX = interpolate(rawX, fallback: 0.5)
+        let interpY = interpolate(rawY, fallback: 0.72)   // 未検出時は上から28%付近
 
-        // Step 3: 双方向ガウシアンスムージング
-        //   未来フレームも含めて平滑化できるのが2パスの利点
-        //   sigma=20 フレーム ≈ 30fps で約 0.7 秒の平滑化半径
-        let smoothed = gaussianSmooth(interpolated, sigma: 20.0)
+        // Step 3: 双方向ガウシアンスムージング（fps依存 sigma）
+        let smoothedX = gaussianSmooth(interpX, sigma: sigma)
+        let smoothedY = gaussianSmooth(interpY, sigma: sigma)
 
-        // Step 4: ホールド＆フォロー（デッドゾーン）
-        //   3秒ホールド後、人物がデッドゾーン外にずれていたらスムーズパンで追従
-        //   2パス処理のため未来フレームのガウシアン平滑化済み座標を使用しジャンプなし
+        // Step 4X: X方向 ホールド＆フォロー（3秒ホールド、25%デッドゾーン）
         let minHoldFrames = Int(3.0 * Double(fps))
-        let offsets = holdAndFollow(
-            smoothed,
-            scaledWidth: scaledWidth,
-            renderWidth: outputSize.width,
-            minOffsetX: minOffsetX,
-            centerOffsetX: centerOffset,
+        let offsetsX = holdAndFollow(
+            smoothedX,
+            scaledDimension: scaledWidth,
+            renderDimension: outputSize.width,
+            minOffset: minOffsetX,
+            centerOffset: centerOffsetX,
+            targetRatio: 0.5,          // X: 画面中央に被写体
             deadZoneRatio: 0.25,
             minHoldFrames: minHoldFrames,
             followFactor: followFactor
         )
 
+        // Step 4Y: Y方向 ホールド＆フォロー（0.5秒ホールド、ヘッドルーム優先）
+        //   headroomTarget=0.80 → 上から20%のヘッドルームを確保して上半身を配置
+        let offsetsY = holdAndFollow(
+            smoothedY,
+            scaledDimension: scaledHeight,
+            renderDimension: outputSize.height,
+            minOffset: minOffsetY,
+            centerOffset: centerOffsetY,
+            targetRatio: 0.80,         // Y: 上から20%ヘッドルーム
+            deadZoneRatio: 0.08,       // 狭いデッドゾーン（Yは細かく追従）
+            minHoldFrames: max(1, Int(0.5 * Double(fps))),
+            followFactor: followFactor * 1.5
+        )
+
         progressHandler(1.0)
-        return offsets
+        return zip(offsetsX, offsetsY).map { CGPoint(x: $0, y: $1) }
     }
 
-    // MARK: - Step 1: Vision 検出
+    // MARK: - Step 1: Vision 検出（③ 適応的間隔）
 
     private func detectAllPositions(
         asset: AVAsset,
         videoTrack: AVAssetTrack,
         totalFrames: Int,
         progressHandler: @escaping (Double) -> Void
-    ) async throws -> [CGFloat?] {
-        var result = [CGFloat?](repeating: nil, count: totalFrames)
+    ) async throws -> [CGPoint?] {
+        var result = [CGPoint?](repeating: nil, count: totalFrames)
+        var detectionInterval = 8      // ③ 適応的間隔: 初期8、激しい動きで4に短縮
+        var lastDetectedPos: CGPoint? = nil
 
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: [
@@ -98,7 +126,15 @@ struct SmartFramingAnalyzer {
             if frameIndex % detectionInterval == 0,
                frameIndex < totalFrames,
                let pixelBuffer = CMSampleBufferGetImageBuffer(sample) {
-                result[frameIndex] = detectPersonX(in: pixelBuffer)
+                if let detected = detectPersonXY(in: pixelBuffer) {
+                    // ③ 動き量が大きい場合は間隔を短縮（0.12以上の偏差で激しい動きと判定）
+                    if let last = lastDetectedPos {
+                        let deviation = hypot(detected.x - last.x, detected.y - last.y)
+                        detectionInterval = deviation > 0.12 ? 4 : 8
+                    }
+                    result[frameIndex] = detected
+                    lastDetectedPos = detected
+                }
             }
 
             frameIndex += 1
@@ -110,37 +146,53 @@ struct SmartFramingAnalyzer {
         return result
     }
 
-    private func detectPersonX(in pixelBuffer: CVPixelBuffer) -> CGFloat? {
+    /// ② 複数人物を信頼度・画面中央近傍・面積で重み付き平均して代表 XY を返す。
+    /// Vision 座標系: x=0左/1右, y=0下/1上
+    private func detectPersonXY(in pixelBuffer: CVPixelBuffer) -> CGPoint? {
         let bodyRequest = VNDetectHumanBodyPoseRequest()
         let faceRequest = VNDetectFaceRectanglesRequest()
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
         do { try handler.perform([bodyRequest, faceRequest]) } catch { return nil }
 
-        var allX: [CGFloat] = []
+        struct Candidate { var x, y, weight: CGFloat }
+        var candidates: [Candidate] = []
 
-        // 人体ポーズ優先
+        // ① 人体ポーズ優先: 上半身キーポイントの加重平均 ×（信頼度 × 中央近傍度）
         if let bodyResults = bodyRequest.results, !bodyResults.isEmpty {
             for obs in bodyResults {
-                if let points = try? obs.recognizedPoints(.all) {
-                    let upper = [points[.neck], points[.leftShoulder],
-                                 points[.rightShoulder], points[.nose]]
-                        .compactMap { $0 }.filter { $0.confidence > 0.3 }
-                    if !upper.isEmpty {
-                        let avgX = upper.map { $0.location.x }.reduce(0, +) / CGFloat(upper.count)
-                        allX.append(avgX)
-                    }
-                }
+                guard let points = try? obs.recognizedPoints(.all) else { continue }
+                let upper = [points[.neck], points[.leftShoulder],
+                             points[.rightShoulder], points[.nose],
+                             points[.leftEar], points[.rightEar]]
+                    .compactMap { $0 }.filter { $0.confidence > 0.3 }
+                guard !upper.isEmpty else { continue }
+                let avgConf = upper.map { CGFloat($0.confidence) }.reduce(0, +) / CGFloat(upper.count)
+                let avgX = upper.map { $0.location.x }.reduce(0, +) / CGFloat(upper.count)
+                let avgY = upper.map { $0.location.y }.reduce(0, +) / CGFloat(upper.count)
+                // 中央近傍ほど高重み（中央から遠いほど減衰）
+                let centerWeight = max(0.2, 1.0 - abs(avgX - 0.5) * 1.6)
+                candidates.append(Candidate(x: avgX, y: avgY, weight: avgConf * centerWeight))
             }
         }
 
-        // 顔検出フォールバック
-        if allX.isEmpty, let faces = faceRequest.results, !faces.isEmpty {
-            allX = faces.map { $0.boundingBox.midX }
+        // ② 顔検出フォールバック: 面積 × 中央近傍度で重み付け
+        if candidates.isEmpty, let faces = faceRequest.results, !faces.isEmpty {
+            for face in faces {
+                let bb = face.boundingBox
+                let area = bb.width * bb.height
+                let centerWeight = max(0.2, 1.0 - abs(bb.midX - 0.5) * 1.6)
+                candidates.append(Candidate(x: bb.midX, y: bb.midY, weight: area * centerWeight))
+            }
         }
 
-        guard !allX.isEmpty else { return nil }
-        // 複数人: バウンディングボックス中心
-        return (allX.min()! + allX.max()!) / 2
+        guard !candidates.isEmpty else { return nil }
+
+        // 重み付き平均
+        let totalW = candidates.map(\.weight).reduce(0, +)
+        guard totalW > 0 else { return nil }
+        let wx = candidates.map { $0.x * $0.weight }.reduce(0, +) / totalW
+        let wy = candidates.map { $0.y * $0.weight }.reduce(0, +) / totalW
+        return CGPoint(x: wx, y: wy)
     }
 
     // MARK: - Step 2: 線形補間
@@ -151,13 +203,11 @@ struct SmartFramingAnalyzer {
 
         guard let firstKnown = positions.firstIndex(where: { $0 != nil }),
               let lastKnown  = positions.lastIndex(where:  { $0 != nil }) else {
-            return result  // 全フレーム未検出 → 中央 (fallback=0.5)
+            return result
         }
 
-        // 先頭部分を最初の既知値で埋める
         for i in 0..<firstKnown { result[i] = positions[firstKnown]! }
 
-        // 既知値間を線形補間
         var prevIdx = firstKnown
         var prevVal = positions[firstKnown]!
         result[firstKnown] = prevVal
@@ -175,7 +225,6 @@ struct SmartFramingAnalyzer {
             }
         }
 
-        // 末尾部分を最後の既知値で埋める
         for i in (lastKnown + 1)..<n { result[i] = positions[lastKnown]! }
         return result
     }
@@ -210,48 +259,47 @@ struct SmartFramingAnalyzer {
         return result
     }
 
-    // MARK: - Step 4: ホールド＆フォロー
+    // MARK: - Step 4: 汎用 ホールド＆フォロー
 
-    /// 3秒ホールド後、人物がデッドゾーン外にいれば lerp でスムーズパン追従する。
-    /// followFactor: 1フレームあたりの追従割合（0.06 ≈ 30fpsで約1秒でほぼ到達）
+    /// - targetRatio: 被写体をレンダーフレーム内のどの位置（下から何割）に置くか
+    ///   X軸 = 0.5（中央）, Y軸 = 0.80（上から20%のヘッドルーム）
     private func holdAndFollow(
         _ positions: [CGFloat],
-        scaledWidth: CGFloat,
-        renderWidth: CGFloat,
-        minOffsetX: CGFloat,
-        centerOffsetX: CGFloat,
+        scaledDimension: CGFloat,
+        renderDimension: CGFloat,
+        minOffset: CGFloat,
+        centerOffset: CGFloat,
+        targetRatio: CGFloat,
         deadZoneRatio: CGFloat,
         minHoldFrames: Int,
-        followFactor: CGFloat = 0.06
+        followFactor: CGFloat
     ) -> [CGFloat] {
-        var offsets      = [CGFloat](repeating: centerOffsetX, count: positions.count)
-        var cameraOffset = centerOffsetX
-        let deadZone     = renderWidth * deadZoneRatio
-        var settledFrame = -minHoldFrames   // 最初のフレームは即フォロー可能
+        var offsets      = [CGFloat](repeating: centerOffset, count: positions.count)
+        var cameraOffset = centerOffset
+        let deadZone     = renderDimension * deadZoneRatio
+        var settledFrame = -minHoldFrames
         var isFollowing  = false
 
         for i in 0..<positions.count {
-            let personX      = positions[i] * scaledWidth
-            let targetOffset = max(minOffsetX, min(0, renderWidth / 2 - personX))
+            // Vision 正規化座標 → スケール済みピクセル座標（CIImage: 0=下）
+            let personPos    = positions[i] * scaledDimension
+            // 被写体を targetRatio の位置に置くオフセット
+            let targetOffset = max(minOffset, min(0, renderDimension * targetRatio - personPos))
             let deviation    = abs(targetOffset - cameraOffset)
             let holdElapsed  = i - settledFrame
 
             if isFollowing {
-                // パン中: ターゲットへ向けて lerp
                 cameraOffset += (targetOffset - cameraOffset) * followFactor
-                // 2px 以内に収まったら完了 → ホールド開始
                 if abs(targetOffset - cameraOffset) < 2.0 {
                     cameraOffset = targetOffset
                     isFollowing  = false
                     settledFrame = i
                 }
             } else {
-                // ホールド中: デッドゾーン外かつホールド期間を過ぎたらフォロー開始
                 if deviation > deadZone && holdElapsed >= minHoldFrames {
                     isFollowing  = true
                     cameraOffset += (targetOffset - cameraOffset) * followFactor
                 }
-                // デッドゾーン内 or ホールド中は静止
             }
 
             offsets[i] = cameraOffset

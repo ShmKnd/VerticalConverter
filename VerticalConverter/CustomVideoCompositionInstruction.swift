@@ -20,7 +20,8 @@ class CustomVideoCompositionInstruction: NSObject, AVVideoCompositionInstruction
     var inputSize: CGSize
 
     /// 事前解析済みオフセット配列（nil = リアルタイムフォールバック）
-    var precomputedOffsets: [CGFloat]?
+    /// 各要素: .x = 横オフセット（ピクセル）, .y = 縦オフセット（ピクセル）
+    var precomputedOffsets: [CGPoint]?
 
     // レイヤーインストラクション
     var layerInstructions: [AVVideoCompositionLayerInstruction]
@@ -31,7 +32,7 @@ class CustomVideoCompositionInstruction: NSObject, AVVideoCompositionInstruction
         smartFramingEnabled: Bool,
         dampingFactor: Double,
         inputSize: CGSize,
-        precomputedOffsets: [CGFloat]? = nil
+        precomputedOffsets: [CGPoint]? = nil
     ) {
         self.timeRange = timeRange
         self.layerInstructions = layerInstructions

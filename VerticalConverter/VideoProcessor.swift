@@ -68,7 +68,7 @@ actor VideoProcessor {
         let outputHeight: CGFloat = CGFloat(resH)
         
         // ── スマートフレーミング ONなら事前解析（第1パス）──
-        var precomputedOffsets: [CGFloat]? = nil
+        var precomputedOffsets: [CGPoint]? = nil
         if smartFramingSettings.enabled {
             let analyzer = SmartFramingAnalyzer()
             precomputedOffsets = try await analyzer.analyze(
@@ -115,7 +115,7 @@ actor VideoProcessor {
         outputSize: CGSize,
         frameDuration: CMTime,
         smartFramingSettings: SmartFramingSettings,
-        precomputedOffsets: [CGFloat]? = nil
+        precomputedOffsets: [CGPoint]? = nil
     ) async throws -> (AVMutableComposition, AVMutableVideoComposition) {
         let composition = AVMutableComposition()
         
