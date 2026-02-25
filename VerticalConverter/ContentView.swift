@@ -16,14 +16,7 @@ struct ContentView: View {
     var body: some View {
         ZStack {
             // Liquid Glass が映える鮮やかなグラデーション背景
-            LinearGradient(
-                colors: [
-                    Color(hue: 0.62, saturation: 0.80, brightness: 0.60),
-                    Color(hue: 0.78, saturation: 0.90, brightness: 0.42)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
+            Color(nsColor: NSColor.windowBackgroundColor)
             .ignoresSafeArea()
 
             VStack(spacing: 12) {
@@ -31,10 +24,10 @@ struct ContentView: View {
                 VStack(spacing: 4) {
                     Text("Vertical Converter")
                         .font(.title.bold())
-                        .foregroundStyle(.white)
+                        .foregroundStyle(.primary)
                     Text("16:9 → 9:16 変換")
                         .font(.subheadline)
-                        .foregroundStyle(.white.opacity(0.75))
+                        .foregroundStyle(Color.primary.opacity(0.75))
                 }
                 .padding(.top, 22)
 
@@ -65,17 +58,17 @@ struct ContentView: View {
                 VStack(spacing: 12) {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.system(size: 44))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(.primary)
                     Text(videoURL.lastPathComponent)
                         .font(.headline)
-                        .foregroundStyle(.white)
+                        .foregroundStyle(.primary)
                         .lineLimit(2)
                         .multilineTextAlignment(.center)
                     Button("別のファイルを選択") {
                         viewModel.selectedVideoURL = nil
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(.white.opacity(0.8))
+                    .foregroundStyle(Color.primary.opacity(0.8))
                     .underline()
                 }
                 .padding()
@@ -83,19 +76,19 @@ struct ContentView: View {
                 VStack(spacing: 12) {
                     Image(systemName: "video.badge.plus")
                         .font(.system(size: 52))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(.primary)
                         .symbolEffect(.pulse, isActive: isTargeted)
                     Text("ドラッグ＆ドロップ")
                         .font(.headline)
-                        .foregroundStyle(.white)
+                        .foregroundStyle(.primary)
                     Text("または")
                         .font(.caption)
-                        .foregroundStyle(.white.opacity(0.6))
+                        .foregroundStyle(Color.primary.opacity(0.6))
                     Button("ファイルを選択") {
                         viewModel.selectFile()
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(.white.opacity(0.2))
+                    .tint(Color.primary.opacity(0.2))
                 }
                 .padding()
             }
@@ -108,7 +101,7 @@ struct ContentView: View {
         .overlay(
             RoundedRectangle(cornerRadius: 20)
                 .strokeBorder(
-                    isTargeted ? Color.white.opacity(0.9) : Color.white.opacity(0.25),
+                    isTargeted ? Color.primary.opacity(0.9) : Color.primary.opacity(0.25),
                     style: StrokeStyle(
                         lineWidth: 1.5,
                         dash: viewModel.selectedVideoURL == nil ? [8, 4] : []
@@ -180,7 +173,7 @@ struct ContentView: View {
             HStack {
                 Label("スマートフレーミング", systemImage: "person.crop.rectangle.badge.plus")
                     .font(.subheadline.weight(.medium))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(.primary)
                 Spacer()
                 Toggle("", isOn: $viewModel.smartFramingEnabled)
                     .toggleStyle(.switch)
@@ -212,7 +205,7 @@ struct ContentView: View {
             HStack {
                 Label("HDR→SDR 変換", systemImage: "sun.max.trianglebadge.exclamation")
                     .font(.subheadline.weight(.medium))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(.primary)
                 Spacer()
                 Toggle("", isOn: $viewModel.hdrConversionEnabled)
                     .toggleStyle(.switch)
@@ -284,23 +277,23 @@ struct ContentView: View {
 
                     Text(viewModel.phaseLabel)
                         .font(.caption)
-                        .foregroundStyle(.white.opacity(viewModel.isProcessing ? 0.85 : 0.35))
+                        .foregroundStyle(Color.primary.opacity(viewModel.isProcessing ? 0.85 : 0.35))
 
                     Spacer()
 
                     Text(String(format: "%.0f%%", viewModel.progress * 100))
                         .font(.caption.monospacedDigit())
-                        .foregroundStyle(.white.opacity(viewModel.isProcessing ? 0.85 : 0.35))
+                        .foregroundStyle(Color.primary.opacity(viewModel.isProcessing ? 0.85 : 0.35))
                 }
 
                 ProgressView(value: viewModel.progress)
-                    .tint(viewModel.isProcessing ? .white : Color.white.opacity(0.25))
+                    .tint(viewModel.isProcessing ? Color.primary : Color.primary.opacity(0.25))
             }
             .frame(height: 32)
 
             Text(viewModel.statusMessage.isEmpty ? " " : viewModel.statusMessage)
                 .font(.caption)
-                .foregroundStyle(viewModel.hasError ? Color.red : Color.white.opacity(0.85))
+                .foregroundStyle(viewModel.hasError ? Color.red : Color.primary.opacity(0.85))
                 .multilineTextAlignment(.center)
                 .lineLimit(2)
                 .frame(height: 36) // 固定高さを確保して UI のジャンプを防止
@@ -316,7 +309,7 @@ struct ContentView: View {
 
     private var panelDivider: some View {
         Divider()
-            .overlay(Color.white.opacity(0.18))
+            .overlay(Color.primary.opacity(0.18))
             .padding(.vertical, 6)
     }
 
@@ -325,9 +318,9 @@ struct ContentView: View {
         @ViewBuilder picker: () -> Content
     ) -> some View {
         HStack(spacing: 10) {
-            Label(label, systemImage: icon)
+                Label(label, systemImage: icon)
                 .font(.subheadline.weight(.medium))
-                .foregroundStyle(.white)
+                .foregroundStyle(.primary)
                 .frame(width: 115, alignment: .leading)
             picker()
         }
@@ -361,18 +354,18 @@ private struct SlidingPicker<T: Hashable>: View {
                         .animation(nil, value: isSelected)
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(isSelected ? Color.white : Color.white.opacity(0.55))
+                .foregroundStyle(isSelected ? Color.primary : Color.primary.opacity(0.55))
                 .background {
                     if isSelected {
                         RoundedRectangle(cornerRadius: 7)
-                            .fill(Color.white.opacity(0.28))
+                            .fill(Color.primary.opacity(0.28))
                             .matchedGeometryEffect(id: "pill", in: ns)
                     }
                 }
             }
         }
         .padding(3)
-        .background(Color.black.opacity(0.18))
+        .background(Color.primary.opacity(0.08))
         .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }
