@@ -10,6 +10,7 @@ struct VideoExportSettings {
     var encodingMode: EncodingMode = .vbr
     var resolution: Resolution     = .fullHD
     var frameRate: FrameRate       = .fps30
+    var codec: Codec = .h264
 
     // MARK: - Encoding Mode
 
@@ -58,5 +59,15 @@ struct VideoExportSettings {
             case .fps60:   return CMTime(value: 1,    timescale: 60)
             }
         }
+    }
+
+    // MARK: - Codec
+
+    enum Codec: String, CaseIterable, Hashable {
+        case h264 = "H.264"
+        case h265 = "H.265"
+        case h264VT = "H.264 (VT)"
+        case h265VT = "H.265 (VT)"
+        case prores422VT = "ProRes422 (VT)"
     }
 }

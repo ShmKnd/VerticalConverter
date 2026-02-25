@@ -47,31 +47,73 @@ struct ContentView: View {
             .padding(.horizontal, 20)
             .padding(.bottom, 20)
         }
-        .frame(width: 500, height: 850)
+        .frame(width: 560, height: 900)
     }
 
     // MARK: - ドロップゾーン
 
     private var dropZone: some View {
         ZStack {
-            if let videoURL = viewModel.selectedVideoURL {
+            // UX: When dragging over the drop zone, always show the drop prompt
+            // so users get clear feedback even if a file was previously loaded.
+            if isTargeted {
                 VStack(spacing: 12) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 44))
+                    Image(systemName: "video.badge.plus")
+                        .font(.system(size: 52))
                         .foregroundStyle(.primary)
-                    Text(videoURL.lastPathComponent)
+                        .symbolEffect(.pulse, isActive: isTargeted)
+                    Text("ドラッグ＆ドロップ")
                         .font(.headline)
                         .foregroundStyle(.primary)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.center)
-                    Button("別のファイルを選択") {
-                        viewModel.selectedVideoURL = nil
+                    Text("または")
+                        .font(.caption)
+                        .foregroundStyle(Color.primary.opacity(0.6))
+                    Button("ファイルを選択") {
+                        viewModel.selectFile()
                     }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(Color.primary.opacity(0.8))
-                    .underline()
+                    .buttonStyle(.borderedProminent)
+                    .tint(Color.primary.opacity(0.2))
                 }
                 .padding()
+            } else if let videoURL = viewModel.selectedVideoURL {
+                // If file is selected but not yet converted, show a neutral file view.
+                if viewModel.hasConverted {
+                    VStack(spacing: 12) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 44))
+                            .foregroundStyle(.primary)
+                        Text(videoURL.lastPathComponent)
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.center)
+                        Button("別のファイルを選択") {
+                            viewModel.selectedVideoURL = nil
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.primary.opacity(0.8))
+                        .underline()
+                    }
+                    .padding()
+                } else {
+                    VStack(spacing: 12) {
+                        Image(systemName: "video")
+                            .font(.system(size: 44))
+                            .foregroundStyle(.primary)
+                        Text(videoURL.lastPathComponent)
+                            .font(.headline)
+                            .foregroundStyle(Color.primary.opacity(0.9))
+                            .lineLimit(2)
+                            .multilineTextAlignment(.center)
+                        Button("別のファイルを選択") {
+                            viewModel.selectedVideoURL = nil
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.primary.opacity(0.8))
+                        .underline()
+                    }
+                    .padding()
+                }
             } else {
                 VStack(spacing: 12) {
                     Image(systemName: "video.badge.plus")
@@ -135,11 +177,32 @@ struct ContentView: View {
                 )
             }
             panelDivider
+            settingRow(label: "エンコード形式", icon: "cpu") {
+                SlidingPicker(
+                    labels: VideoExportSettings.Codec.allCases.map { $0.rawValue },
+                    values: VideoExportSettings.Codec.allCases,
+                    selection: $viewModel.exportSettings.codec,
+                    isEnabled: { codec in
+                        // VT バリアントはハードウェアが無ければグレーアウト
+                        switch codec {
+                        case .h264VT, .h265VT, .prores422VT:
+                            return VideoProcessor.isHardwareEncoderAvailable(for: codec)
+                        default:
+                            return true
+                        }
+                    }
+                )
+            }
+            panelDivider
             settingRow(label: "ビットレート", icon: "waveform") {
                 SlidingPicker(
                     labels: [8, 10, 12].map { "\($0) Mbps" },
                     values: [8, 10, 12],
-                    selection: $viewModel.exportSettings.bitrate
+                    selection: $viewModel.exportSettings.bitrate,
+                    isEnabled: { _ in
+                        // ビットレートは ProRes を選択したときにグレーアウト
+                        return viewModel.exportSettings.codec != .prores422VT
+                    }
                 )
             }
             panelDivider
@@ -147,7 +210,11 @@ struct ContentView: View {
                 SlidingPicker(
                     labels: VideoExportSettings.EncodingMode.allCases.map { $0.rawValue },
                     values: VideoExportSettings.EncodingMode.allCases,
-                    selection: $viewModel.exportSettings.encodingMode
+                    selection: $viewModel.exportSettings.encodingMode,
+                    isEnabled: { _ in
+                        // ProRes 選択時は品質（エンコードモード）を無効化
+                        return viewModel.exportSettings.codec != .prores422VT
+                    }
                 )
             }
             panelDivider
@@ -333,13 +400,16 @@ private struct SlidingPicker<T: Hashable>: View {
     let labels: [String]
     let values: [T]
     @Binding var selection: T
+    var isEnabled: ((T) -> Bool)? = nil
     @Namespace private var ns
 
     var body: some View {
         HStack(spacing: 2) {
             ForEach(labels.indices, id: \.self) { i in
                 let isSelected = selection == values[i]
+                let enabled = isEnabled?(values[i]) ?? true
                 Button {
+                    guard enabled else { return }
                     withAnimation(.spring(response: 0.28, dampingFraction: 0.76)) {
                         selection = values[i]
                     }
@@ -354,7 +424,7 @@ private struct SlidingPicker<T: Hashable>: View {
                         .animation(nil, value: isSelected)
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(isSelected ? Color.primary : Color.primary.opacity(0.55))
+                .foregroundStyle(isSelected ? Color.primary : Color.primary.opacity(enabled ? 0.55 : 0.28))
                 .background {
                     if isSelected {
                         RoundedRectangle(cornerRadius: 7)
@@ -362,6 +432,8 @@ private struct SlidingPicker<T: Hashable>: View {
                             .matchedGeometryEffect(id: "pill", in: ns)
                     }
                 }
+                .opacity(enabled ? 1.0 : 0.45)
+                .allowsHitTesting(enabled)
             }
         }
         .padding(3)
@@ -373,7 +445,15 @@ private struct SlidingPicker<T: Hashable>: View {
 @MainActor
 class ContentViewModel: ObservableObject {
     @Published var selectedVideoURL: URL?
+    {
+        didSet {
+            #if DEBUG
+            print("selectedVideoURL -> \(selectedVideoURL?.path ?? "nil")")
+            #endif
+        }
+    }
     @Published var exportSettings = VideoExportSettings()
+    @Published var hasConverted: Bool = false
     @Published var smartFramingEnabled: Bool = false
     @Published var smartFramingSmoothness: SmartFramingSettings.Smoothness = .normal
     @Published var letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth
@@ -397,17 +477,69 @@ class ContentViewModel: ObservableObject {
         
         if panel.runModal() == .OK {
             self.selectedVideoURL = panel.url
+            self.hasConverted = false
         }
     }
     
     func handleDrop(providers: [NSItemProvider]) {
         guard let provider = providers.first else { return }
-        
-        provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { (urlData, error) in
-            DispatchQueue.main.async {
-                if let urlData = urlData as? Data,
-                   let url = URL(dataRepresentation: urlData, relativeTo: nil) {
-                    self.selectedVideoURL = url
+        // Debug: log available type identifiers for the dropped item
+        #if DEBUG
+        print("handleDrop: provider types = \(provider.registeredTypeIdentifiers)")
+        #endif
+
+        // 1) Preferred modern API: try loading a URL/NSURL object directly
+        if provider.canLoadObject(ofClass: NSURL.self) {
+            provider.loadObject(ofClass: NSURL.self) { (obj, error) in
+                DispatchQueue.main.async {
+                    if let nsurl = obj as? NSURL {
+                        self.selectedVideoURL = nsurl as URL
+                        self.hasConverted = false
+                        return
+                    }
+                    // If that didn't work, continue to fallback attempts
+                    self.attemptFileLoadFallback(provider: provider)
+                }
+            }
+            return
+        }
+
+        // Otherwise, try fallbacks
+        attemptFileLoadFallback(provider: provider)
+    }
+
+    private func attemptFileLoadFallback(provider: NSItemProvider) {
+        // 2) Try loadFileRepresentation for a temp local URL
+        provider.loadFileRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { (tempURL, error) in
+            if let temp = tempURL {
+                DispatchQueue.main.async {
+                    self.selectedVideoURL = temp
+                    self.hasConverted = false
+                }
+                return
+            }
+
+            // 3) Last-resort: loadItem and handle multiple possible return types
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { (item, error) in
+                DispatchQueue.main.async {
+                    if let data = item as? Data,
+                       let url = URL(dataRepresentation: data, relativeTo: nil) {
+                        self.selectedVideoURL = url
+                        self.hasConverted = false
+                    } else if let url = item as? URL {
+                        self.selectedVideoURL = url
+                        self.hasConverted = false
+                    } else if let nsurl = item as? NSURL {
+                        self.selectedVideoURL = nsurl as URL
+                        self.hasConverted = false
+                    } else if let str = item as? String, let url = URL(string: str) {
+                        self.selectedVideoURL = url
+                        self.hasConverted = false
+                    } else {
+                        #if DEBUG
+                        print("handleDrop: could not determine URL from item: \(String(describing: item)) error: \(String(describing: error))")
+                        #endif
+                    }
                 }
             }
         }
@@ -421,16 +553,21 @@ class ContentViewModel: ObservableObject {
     func convertVideo() {
         guard let inputURL = selectedVideoURL else { return }
 
+        // Mark conversion as not-yet-completed at start
+        self.hasConverted = false
+
         isProcessing = true
         hasError = false
         statusMessage = "変換を開始しています..."
         progress = 0.0
         DockProgress.start()
 
-        // 出力ファイル名を生成
+        // 出力ファイル名を生成（ProRes は .mov）
         let inputFilename = inputURL.deletingPathExtension().lastPathComponent
+        let outExt = (exportSettings.codec == .prores422VT) ? "mov" : "mp4"
         let outputURL = inputURL.deletingLastPathComponent()
-            .appendingPathComponent("\(inputFilename)_vertical.mp4")
+            .appendingPathComponent("\(inputFilename)_vertical")
+            .appendingPathExtension(outExt)
 
         conversionTask = Task {
             do {
@@ -468,14 +605,19 @@ class ContentViewModel: ObservableObject {
                 self.statusMessage = "変換完了！\n保存先: \(outputURL.path)"
                 self.hasError = false
 
+                // Mark successful conversion
+                self.hasConverted = true
+
                 // 保存先をFinderで表示
                 NSWorkspace.shared.activateFileViewerSelecting([outputURL])
             } catch VideoProcessorError.cancelled {
                 self.statusMessage = "変換を中止しました"
                 self.hasError = false
+                self.hasConverted = false
             } catch {
                 self.statusMessage = "エラー: \(error.localizedDescription)"
                 self.hasError = true
+                self.hasConverted = false
             }
 
             self.isProcessing = false

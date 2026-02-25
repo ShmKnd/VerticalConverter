@@ -35,6 +35,52 @@ enum VideoProcessorError: LocalizedError {
 }
 
 actor VideoProcessor {
+    /// Check whether a hardware VT encoder is available for the requested codec variant.
+    static func isHardwareEncoderAvailable(for codec: VideoExportSettings.Codec) -> Bool {
+        switch codec {
+        case .h264VT:
+            return isHardwareEncoderAvailable(codecType: kCMVideoCodecType_H264)
+        case .h265VT:
+            return isHardwareEncoderAvailable(codecType: kCMVideoCodecType_HEVC)
+        case .prores422VT:
+            // Try to discover a ProRes-capable encoder via VTCopyVideoEncoderList
+            var cfArray: CFArray?
+            let status = VTCopyVideoEncoderList(nil, &cfArray)
+            if status == noErr, let arr = cfArray as? [[String: Any]] {
+                for dict in arr {
+                    if let name = dict[kVTVideoEncoderList_EncoderName as String] as? String {
+                        if name.lowercased().contains("prores") {
+                            // If a ProRes encoder exists, prefer it as hardware-capable
+                            return true
+                        }
+                    }
+                }
+            }
+            return false
+        default:
+            return false
+        }
+    }
+
+    private static func isHardwareEncoderAvailable(codecType: CMVideoCodecType) -> Bool {
+        var session: VTCompressionSession?
+        let spec: CFDictionary = [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String: kCFBooleanTrue] as CFDictionary
+        let status = VTCompressionSessionCreate(allocator: nil,
+                                                width: 16,
+                                                height: 16,
+                                                codecType: codecType,
+                                                encoderSpecification: spec,
+                                                imageBufferAttributes: nil,
+                                                compressedDataAllocator: nil,
+                                                outputCallback: nil,
+                                                refcon: nil,
+                                                compressionSessionOut: &session)
+        if status == noErr, let s = session {
+            VTCompressionSessionInvalidate(s)
+            return true
+        }
+        return false
+    }
     func convertToVertical(
         inputURL: URL,
         outputURL: URL,
@@ -51,12 +97,12 @@ actor VideoProcessor {
         }
         
         let asset = AVAsset(url: inputURL)
-        
+
         // 動画トラックを取得
         guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
             throw VideoProcessorError.invalidInput
         }
-        
+
         let naturalSize = try await videoTrack.load(.naturalSize)
         let preferredTransform = try await videoTrack.load(.preferredTransform)
         
@@ -108,6 +154,7 @@ actor VideoProcessor {
             outputURL: outputURL,
             bitrate: exportSettings.bitrate,
             encodingMode: exportSettings.encodingMode,
+            codec: exportSettings.codec,
             progressHandler: { p in
                 progressHandler(progressOffset + p * progressScale, "変換中...")
             }
@@ -213,6 +260,7 @@ actor VideoProcessor {
         outputURL: URL,
         bitrate: Int,
         encodingMode: VideoExportSettings.EncodingMode,
+        codec: VideoExportSettings.Codec,
         progressHandler: @escaping (Double) -> Void
     ) async throws {
 
@@ -252,20 +300,54 @@ actor VideoProcessor {
         }
 
         // AVAssetWriter セットアップ
+        let fileType: AVFileType = (codec == .prores422VT) ? .mov : .mp4
         let writer: AVAssetWriter
         do {
-            writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+            writer = try AVAssetWriter(outputURL: outputURL, fileType: fileType)
         } catch {
             throw VideoProcessorError.exportFailed
         }
         writer.shouldOptimizeForNetworkUse = true
 
-        // ビデオ出力設定（HEVC、エンコードモード適用）
+        // Safety: if ProRes was requested but no ProRes encoder is available, fail early
+        if codec == .prores422VT && !VideoProcessor.isHardwareEncoderAvailable(for: .prores422VT) {
+            throw VideoProcessorError.unsupportedFormat
+        }
+
+        // ビデオ出力設定（コーデック選択、エンコードモード適用）
         let videoBitrate = bitrate * 1_000_000
-        var compressionProps: [String: Any] = [
-            AVVideoAverageBitRateKey: videoBitrate,
-            AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main_AutoLevel
-        ]
+        var compressionProps: [String: Any] = [:]
+        var videoCodecType: AVVideoCodecType = .hevc
+        switch codec {
+        case .h264, .h264VT:
+            videoCodecType = .h264
+            compressionProps[AVVideoAverageBitRateKey] = videoBitrate
+        case .h265, .h265VT:
+            videoCodecType = .hevc
+            compressionProps[AVVideoAverageBitRateKey] = videoBitrate
+            compressionProps[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main_AutoLevel
+        case .prores422VT:
+            // ProRes: bitrate not applicable; prefer quality-oriented settings
+            // Use rawValue fallback for SDKs that don't expose a typed constant
+            videoCodecType = AVVideoCodecType(rawValue: "apcn")
+        }
+
+        // エンコードモードごとのプロパティ調整
+        switch encodingMode {
+        case .cbr:
+            compressionProps[AVVideoAllowFrameReorderingKey]  = false
+            compressionProps[AVVideoMaxKeyFrameIntervalKey]   = 1
+        case .abr:
+            compressionProps[AVVideoExpectedSourceFrameRateKey] = 30
+        case .vbr:
+            break
+        }
+
+        // Note: Some compression properties (like AVVideoEncoderSpecificationKey) are not
+        // accepted by AVAssetWriterInput for many codecs (causes ObjC exception). We no
+        // longer inject AVVideoEncoderSpecificationKey here. To request hardware encoders
+        // you must use VideoToolbox directly (VTCompressionSession) or rely on system
+        // defaults; the UI already disables VT options when unsupported.
         switch encodingMode {
         case .cbr:
             // CBR近似: フレーム並び替えなし + キーフレーム間隔1
@@ -277,12 +359,28 @@ actor VideoProcessor {
         case .vbr:
             break  // デフォルトのVBR動作
         }
-        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
-            AVVideoCodecKey: AVVideoCodecType.hevc,
+        // If non-VT h264/h265 was selected we want to force software (CPU) encoding.
+        // The safest way is to use VideoToolbox's VTCompressionSession with an
+        // encoder specification that does not require hardware acceleration,
+        // then append the compressed samples into AVAssetWriter as passthrough
+        // compressed CMSampleBuffer objects.
+        let useSoftwareVT: Bool = (codec == .h264 || codec == .h265)
+
+        var videoInput: AVAssetWriterInput
+        var usingVTCompressionSession = false
+
+        // Create video input with compression properties. Avoid injecting
+        // AVVideoEncoderSpecificationKey here because it's unsupported for some
+        // codecs (causes ObjC exceptions). Forcing a software-only path requires
+        // a separate VTCompressionSession-based implementation.
+        let videoSettings: [String: Any] = [
+            AVVideoCodecKey: videoCodecType,
             AVVideoWidthKey: Int(renderSize.width),
             AVVideoHeightKey: Int(renderSize.height),
             AVVideoCompressionPropertiesKey: compressionProps
-        ])
+        ]
+
+        videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         videoInput.expectsMediaDataInRealTime = false
         guard writer.canAdd(videoInput) else { throw VideoProcessorError.exportFailed }
         writer.add(videoInput)
