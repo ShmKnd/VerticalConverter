@@ -21,15 +21,15 @@ enum VideoProcessorError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidInput:
-            return "入力動画が無効です"
+            return "Invalid input video"
         case .compositionFailed:
-            return "動画の合成に失敗しました"
+            return "Failed to compose video"
         case .exportFailed:
-            return "動画の書き出しに失敗しました"
+            return "Failed to export video"
         case .unsupportedFormat:
-            return "サポートされていない動画形式です"
+            return "Unsupported video format"
         case .cancelled:
-            return "変換がキャンセルされました"
+            return "Conversion cancelled"
         }
     }
 }
@@ -126,7 +126,7 @@ actor VideoProcessor {
                 inputSize: CGSize(width: width, height: height),
                 outputSize: CGSize(width: outputWidth, height: outputHeight),
                 followFactor: CGFloat(smartFramingSettings.smoothness.followFactor),
-                progressHandler: { p in progressHandler(p * 0.4, "解析中...") }
+                progressHandler: { p in progressHandler(p * 0.4, "Analyzing...") }
             )
         }
         
@@ -156,7 +156,7 @@ actor VideoProcessor {
             encodingMode: exportSettings.encodingMode,
             codec: exportSettings.codec,
             progressHandler: { p in
-                progressHandler(progressOffset + p * progressScale, "変換中...")
+                progressHandler(progressOffset + p * progressScale, "Converting...")
             }
         )
     }

@@ -35,10 +35,10 @@ class CustomVideoCompositionInstruction: NSObject, AVVideoCompositionInstruction
 
         var displayName: String {
             switch self {
-            case .fitWidth: return "幅に合わせる"
-            case .centerSquare: return "中央を正方形"
-            case .centerPortrait4x3: return "中央を縦4:横3"
-            case .centerPortrait3x4: return "中央を縦3:横4"
+            case .fitWidth: return "Fit Width"
+            case .centerSquare: return "Center Square"
+            case .centerPortrait4x3: return "Portrait 4x3"
+            case .centerPortrait3x4: return "Portrait 3x4"
             }
         }
     }

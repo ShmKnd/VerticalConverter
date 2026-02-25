@@ -8,10 +8,12 @@
 import SwiftUI
 import UniformTypeIdentifiers
 import AppKit
+import AVFoundation
 
 struct ContentView: View {
     @StateObject private var viewModel = ContentViewModel()
     @State private var isTargeted = false
+    @State private var showingCropPreview: Bool = false
 
     var body: some View {
         ZStack {
@@ -25,7 +27,7 @@ struct ContentView: View {
                     Text("Vertical Converter")
                         .font(.title.bold())
                         .foregroundStyle(.primary)
-                    Text("16:9 → 9:16 変換")
+                    Text("Convert 16:9 → 9:16")
                         .font(.subheadline)
                         .foregroundStyle(Color.primary.opacity(0.75))
                 }
@@ -48,9 +50,58 @@ struct ContentView: View {
             .padding(.bottom, 20)
         }
         .frame(width: 560, height: 900)
+        .overlay {
+            if showingCropPreview {
+                GeometryReader { geo in
+                    let panelWidth = min(geo.size.width * 0.9, 720)
+                    let panelHeight = min(geo.size.height * 0.82, 780)
+                    // Remove scrolling: expand vertically so all content is visible
+                    let extraVertical: CGFloat = 160.0
+
+                    VStack {
+                        HStack {
+                            Spacer()
+                            ZStack(alignment: .topTrailing) {
+                                // Panel background + clipping
+                                RoundedRectangle(cornerRadius: 20)
+                                    .fill(.ultraThinMaterial)
+                                    .frame(width: panelWidth, height: panelHeight + extraVertical)
+                                    .shadow(radius: 24)
+
+                                // Non-scrollable content (show everything; panel is taller)
+                                VStack(spacing: 12) {
+                                    CropPreviewView(thumbnail: viewModel.thumbnail, selection: $viewModel.letterboxMode)
+                                }
+                                // reduce top padding so label and close button align tighter
+                                .padding(.horizontal, 12)
+                                .padding(.bottom, 12)
+                                .frame(width: panelWidth - 2, height: panelHeight - 2 + extraVertical)
+                                .clipShape(RoundedRectangle(cornerRadius: 20))
+
+                                Button(action: { showingCropPreview = false }) {
+                                    Image(systemName: "xmark")
+                                        .font(.system(size: 14, weight: .semibold))
+                                        .foregroundStyle(Color.primary.opacity(0.9))
+                                        .padding(8)
+                                }
+                                .buttonStyle(.plain)
+                                // move close button down to match the panel title baseline
+                                .padding(.top, 20)
+                                .padding(.trailing, 16)
+                            }
+                            Spacer()
+                        }
+                    }
+                    .frame(width: geo.size.width, height: geo.size.height)
+                }
+                .transition(.opacity.combined(with: .scale))
+                .zIndex(100)
+            }
+        }
+        .animation(.easeInOut(duration: 0.22), value: showingCropPreview)
     }
 
-    // MARK: - ドロップゾーン
+    // MARK: - Drop Zone
 
     private var dropZone: some View {
         ZStack {
@@ -62,13 +113,13 @@ struct ContentView: View {
                         .font(.system(size: 52))
                         .foregroundStyle(.primary)
                         .symbolEffect(.pulse, isActive: isTargeted)
-                    Text("ドラッグ＆ドロップ")
+                    Text("Drag & Drop")
                         .font(.headline)
                         .foregroundStyle(.primary)
-                    Text("または")
+                    Text("or")
                         .font(.caption)
                         .foregroundStyle(Color.primary.opacity(0.6))
-                    Button("ファイルを選択") {
+                    Button("Select File") {
                         viewModel.selectFile()
                     }
                     .buttonStyle(.borderedProminent)
@@ -87,7 +138,7 @@ struct ContentView: View {
                             .foregroundStyle(.primary)
                             .lineLimit(2)
                             .multilineTextAlignment(.center)
-                        Button("別のファイルを選択") {
+                        Button("Select Another File") {
                             viewModel.selectedVideoURL = nil
                         }
                         .buttonStyle(.plain)
@@ -105,7 +156,7 @@ struct ContentView: View {
                             .foregroundStyle(Color.primary.opacity(0.9))
                             .lineLimit(2)
                             .multilineTextAlignment(.center)
-                        Button("別のファイルを選択") {
+                        Button("Select Another File") {
                             viewModel.selectedVideoURL = nil
                         }
                         .buttonStyle(.plain)
@@ -120,13 +171,13 @@ struct ContentView: View {
                         .font(.system(size: 52))
                         .foregroundStyle(.primary)
                         .symbolEffect(.pulse, isActive: isTargeted)
-                    Text("ドラッグ＆ドロップ")
+                    Text("Drag & Drop")
                         .font(.headline)
                         .foregroundStyle(.primary)
-                    Text("または")
+                    Text("or")
                         .font(.caption)
                         .foregroundStyle(Color.primary.opacity(0.6))
-                    Button("ファイルを選択") {
+                    Button("Select File") {
                         viewModel.selectFile()
                     }
                     .buttonStyle(.borderedProminent)
@@ -155,13 +206,55 @@ struct ContentView: View {
             return true
         }
         .animation(Animation.easeInOut(duration: 0.2), value: isTargeted)
+            .overlay(alignment: .topTrailing) {
+            Button(action: { showingCropPreview.toggle() }) {
+                Text("Preview")
+                    .font(.system(size: 12, weight: .semibold))
+                    .padding(6)
+                    .background(Color.primary.opacity(0.06))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+            .buttonStyle(.plain)
+            .padding(8)
+            .disabled(viewModel.selectedVideoURL == nil)
+            .opacity(viewModel.selectedVideoURL == nil ? 0.45 : 1.0)
+            // Note: Popover replaced by an in-window overlay to ensure the preview stays inside the window.
+        }
     }
 
-    // MARK: - 出力設定パネル
+            // MARK: - Crop Preview Panel
+
+    private var cropPreviewPanel: some View {
+        Group {
+            if viewModel.selectedVideoURL == nil {
+                // Placeholder when no file selected
+                VStack(spacing: 8) {
+                    HStack {
+                        Label("Crop Preview", systemImage: "crop")
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.primary)
+                        Spacer()
+                    }
+                    Text("Select a file to show the preview")
+                        .font(.caption)
+                        .foregroundStyle(Color.primary.opacity(0.6))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(.thinMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: 20))
+            } else {
+                CropPreviewView(thumbnail: viewModel.thumbnail, selection: $viewModel.letterboxMode)
+            }
+        }
+    }
+
+    // MARK: - Output Settings Panel
 
     private var settingsPanel: some View {
         VStack(spacing: 0) {
-            settingRow(label: "解像度", icon: "aspectratio") {
+            settingRow(label: "Resolution", icon: "aspectratio") {
                 SlidingPicker(
                     labels: VideoExportSettings.Resolution.allCases.map { $0.rawValue },
                     values: VideoExportSettings.Resolution.allCases,
@@ -177,7 +270,7 @@ struct ContentView: View {
                 )
             }
             panelDivider
-            settingRow(label: "エンコード形式", icon: "cpu") {
+            settingRow(label: "Codec", icon: "cpu") {
                 SlidingPicker(
                     labels: VideoExportSettings.Codec.allCases.map { $0.rawValue },
                     values: VideoExportSettings.Codec.allCases,
@@ -194,7 +287,7 @@ struct ContentView: View {
                 )
             }
             panelDivider
-            settingRow(label: "ビットレート", icon: "waveform") {
+            settingRow(label: "Bitrate", icon: "waveform") {
                 SlidingPicker(
                     labels: [8, 10, 12].map { "\($0) Mbps" },
                     values: [8, 10, 12],
@@ -206,7 +299,7 @@ struct ContentView: View {
                 )
             }
             panelDivider
-            settingRow(label: "品質モード", icon: "slider.horizontal.3") {
+            settingRow(label: "Bitrate Mode", icon: "slider.horizontal.3") {
                 SlidingPicker(
                     labels: VideoExportSettings.EncodingMode.allCases.map { $0.rawValue },
                     values: VideoExportSettings.EncodingMode.allCases,
@@ -218,13 +311,18 @@ struct ContentView: View {
                 )
             }
             panelDivider
-            settingRow(label: "レターボックス", icon: "crop") {
+            settingRow(label: "Crop", icon: "crop") {
                 SlidingPicker(
                     labels: CustomVideoCompositionInstruction.LetterboxMode.allCases.map { $0.displayName },
                     values: CustomVideoCompositionInstruction.LetterboxMode.allCases,
                     selection: $viewModel.letterboxMode
                 )
             }
+
+            // When Smart Framing is enabled, the letterbox control is not applicable.
+            // Visually de-emphasize and disable interaction to make that clear.
+            .opacity(viewModel.smartFramingEnabled ? 0.35 : 1.0)
+            .allowsHitTesting(!viewModel.smartFramingEnabled)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -233,12 +331,12 @@ struct ContentView: View {
         // TODO: Xcode 26+→.glassEffect(in: RoundedRectangle(cornerRadius: 20))
     }
 
-    // MARK: - スマートフレーミングパネル（常に固定高さ）
+    // MARK: - Smart Framing Panel (fixed height)
 
     private var smartFramingPanel: some View {
         VStack(spacing: 0) {
             HStack {
-                Label("スマートフレーミング", systemImage: "person.crop.rectangle.badge.plus")
+                Label("Smart Framing", systemImage: "person.crop.rectangle.badge.plus")
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.primary)
                 Spacer()
@@ -247,8 +345,8 @@ struct ContentView: View {
                     .labelsHidden()
             }
             panelDivider
-            // パン速度: 常に表示。OFFのときはグレーアウト（高さ変化なし）
-            settingRow(label: "パン速度", icon: "arrow.left.and.right") {
+            // Follow Speed: always visible. When OFF, dim (no height change)
+            settingRow(label: "Follow Speed", icon: "arrow.left.and.right") {
                 SlidingPicker(
                     labels: SmartFramingSettings.Smoothness.allCases.map { $0.rawValue },
                     values: SmartFramingSettings.Smoothness.allCases,
@@ -265,12 +363,12 @@ struct ContentView: View {
         // TODO: Xcode 26+→.glassEffect(in: RoundedRectangle(cornerRadius: 20))
     }
 
-    // MARK: - HDR -> SDR パネル
+    // MARK: - HDR -> SDR Panel
 
     private var hdrPanel: some View {
         VStack(spacing: 0) {
             HStack {
-                Label("HDR→SDR 変換", systemImage: "sun.max.trianglebadge.exclamation")
+                Label("HDR→SDR Conversion", systemImage: "sun.max.trianglebadge.exclamation")
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.primary)
                 Spacer()
@@ -279,7 +377,7 @@ struct ContentView: View {
                     .labelsHidden()
             }
             panelDivider
-            settingRow(label: "ターゲット色空間", icon: "paintpalette") {
+            settingRow(label: "Target", icon: "paintpalette") {
                 SlidingPicker(
                     labels: ["sRGB", "Rec.709"],
                     values: [CustomVideoCompositionInstruction.HDRTarget.sRGB, CustomVideoCompositionInstruction.HDRTarget.rec709],
@@ -305,7 +403,7 @@ struct ContentView: View {
                 } label: {
                     HStack {
                         Image(systemName: "xmark.circle.fill")
-                        Text("変換を中止")
+                        Text("Cancel Conversion")
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 6)
@@ -318,7 +416,7 @@ struct ContentView: View {
                 } label: {
                     HStack {
                         Image(systemName: "arrow.triangle.2.circlepath")
-                        Text("変換開始")
+                        Text("Start Conversion")
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 6)
@@ -333,12 +431,12 @@ struct ContentView: View {
                 HStack(spacing: 8) {
                     if viewModel.isProcessing {
                         ProgressView()
-                            .scaleEffect(0.7)
-                            .frame(width: 14, height: 14)
+                            .scaleEffect(0.5)
+                            .frame(width: 10, height: 10)
                     } else {
                         ProgressView()
-                            .scaleEffect(0.7)
-                            .frame(width: 14, height: 14)
+                            .scaleEffect(0.5)
+                            .frame(width: 10, height: 10)
                             .hidden()
                     }
 
@@ -442,13 +540,140 @@ private struct SlidingPicker<T: Hashable>: View {
     }
 }
 
-@MainActor
-class ContentViewModel: ObservableObject {
-    @Published var selectedVideoURL: URL?
-    {
-        didSet {
+// MARK: - Crop Preview
+
+private struct CropPreviewView: View {
+    let thumbnail: NSImage?
+    @Binding var selection: CustomVideoCompositionInstruction.LetterboxMode
+
+    private let modes = CustomVideoCompositionInstruction.LetterboxMode.allCases
+    private let gridColumns: [GridItem] = [
+        GridItem(.flexible(), spacing: 12),
+        GridItem(.flexible(), spacing: 12)
+    ]
+
+    var body: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Label("Crop Preview", systemImage: "crop")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.primary)
+                Spacer()
+            }
+
+            LazyVGrid(columns: gridColumns, spacing: 12) {
+                ForEach(modes, id: \.self) { mode in
+                    Button(action: {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.76)) {
+                            selection = mode
+                        }
+                    }) {
+                        CropPreviewThumbnail(image: thumbnail, mode: mode, isSelected: selection == mode)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        // ensure top inset matches the close button so the title and xmark align
+        .padding(.horizontal, 12)
+        .padding(.top, 8)
+        .padding(.bottom, 6)
+    }
+}
+
+private struct CropPreviewThumbnail: View {
+    let image: NSImage?
+    let mode: CustomVideoCompositionInstruction.LetterboxMode
+    let isSelected: Bool
+
+    var body: some View {
+        ZStack {
+            if let img = image {
+                GeometryReader { geo in
+                    let canvasSize = geo.size
+
+                    ZStack {
+                        // 1) blurred background fills the 9:16 canvas
+                        Image(nsImage: img)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: canvasSize.width, height: canvasSize.height)
+                            .clipped()
+                            .blur(radius: 18)
+
+                        // 2) cropped sharp image according to selected mode
+                        croppedImage(img: img, canvasSize: canvasSize, mode: mode)
+                    }
+                    .frame(width: canvasSize.width, height: canvasSize.height)
+                }
+            } else {
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(Color.primary.opacity(0.08))
+                    .overlay(ProgressView())
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .aspectRatio(9.0/16.0, contentMode: .fit)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(isSelected ? Color.accentColor : Color.primary.opacity(0.25), lineWidth: isSelected ? 2 : 1)
+        )
+        .contentShape(Rectangle())
+    }
+    
+    private func croppedImage(img: NSImage, canvasSize: CGSize, mode: CustomVideoCompositionInstruction.LetterboxMode) -> some View {
+        // Determine desired target aspect for cropping (width / height)
+        let outputAspect: CGFloat = 9.0 / 16.0
+        let targetAspect: CGFloat = {
+            switch mode {
+            case .fitWidth: return outputAspect
+            case .centerSquare: return 1.0
+            case .centerPortrait4x3: return 3.0 / 4.0
+            case .centerPortrait3x4: return 4.0 / 3.0
+            }
+        }()
+
+        if mode == .fitWidth {
+            // Fit the source width to the canvas width (no horizontal crop).
+            let scale = canvasSize.width / img.size.width
+            let scaledHeight = img.size.height * scale
+
+            return Image(nsImage: img)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: canvasSize.width, height: scaledHeight)
+                .clipped()
+                .position(x: canvasSize.width * 0.5, y: canvasSize.height * 0.5)
+        } else {
+            // For crop modes: create an image sized to canvas width and height matching targetAspect,
+            // then center it so it appears as the sharp crop area.
+            let croppedHeight = canvasSize.width / targetAspect
+
+            return Image(nsImage: img)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: canvasSize.width, height: croppedHeight)
+                .clipped()
+                .position(x: canvasSize.width * 0.5, y: canvasSize.height * 0.5)
         }
     }
+}
+
+@MainActor
+class ContentViewModel: ObservableObject {
+    @Published var selectedVideoURL: URL? {
+        didSet {
+            if let _ = selectedVideoURL {
+                self.hasConverted = false
+                generateThumbnail()
+            } else {
+                self.thumbnail = nil
+            }
+        }
+    }
+    @Published var thumbnail: NSImage? = nil
     @Published var exportSettings = VideoExportSettings()
     @Published var hasConverted: Bool = false
     @Published var smartFramingEnabled: Bool = false
@@ -458,7 +683,7 @@ class ContentViewModel: ObservableObject {
     @Published var hdrTarget: CustomVideoCompositionInstruction.HDRTarget = .sRGB
     @Published var isProcessing: Bool = false
     @Published var progress: Double = 0.0
-    @Published var phaseLabel: String = "変換中..."
+    @Published var phaseLabel: String = ""
     @Published var statusMessage: String = ""
     @Published var hasError: Bool = false
     
@@ -535,6 +760,42 @@ class ContentViewModel: ObservableObject {
             }
         }
     }
+
+    private func generateThumbnail() {
+        thumbnail = nil
+        guard let url = selectedVideoURL else { return }
+
+        let asset = AVAsset(url: url)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        // reasonable max size for thumbnails
+        generator.maximumSize = CGSize(width: 960, height: 960)
+
+        let time = CMTime(seconds: 1.0, preferredTimescale: 600)
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                var actual = CMTime.zero
+                let cgImage = try generator.copyCGImage(at: time, actualTime: &actual)
+                let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+                DispatchQueue.main.async {
+                    self.thumbnail = nsImage
+                }
+            } catch {
+                // fallback to time zero
+                do {
+                    var actual = CMTime.zero
+                    let cgImage = try generator.copyCGImage(at: CMTime.zero, actualTime: &actual)
+                    let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+                    DispatchQueue.main.async {
+                        self.thumbnail = nsImage
+                    }
+                } catch {
+                    // could not generate thumbnail
+                }
+            }
+        }
+    }
     
     func cancelConversion() {
         conversionTask?.cancel()
@@ -549,7 +810,7 @@ class ContentViewModel: ObservableObject {
 
         isProcessing = true
         hasError = false
-        statusMessage = "変換を開始しています..."
+        statusMessage = "Starting conversion..."
         progress = 0.0
         DockProgress.start()
 
@@ -593,7 +854,7 @@ class ContentViewModel: ObservableObject {
                     }
                 )
 
-                self.statusMessage = "変換完了！\n保存先: \(outputURL.path)"
+                self.statusMessage = "Conversion complete!\nSaved to: \(outputURL.path)"
                 self.hasError = false
 
                 // Mark successful conversion
@@ -602,15 +863,17 @@ class ContentViewModel: ObservableObject {
                 // 保存先をFinderで表示
                 NSWorkspace.shared.activateFileViewerSelecting([outputURL])
             } catch VideoProcessorError.cancelled {
-                self.statusMessage = "変換を中止しました"
+                self.statusMessage = "Conversion cancelled"
                 self.hasError = false
                 self.hasConverted = false
             } catch {
-                self.statusMessage = "エラー: \(error.localizedDescription)"
+                self.statusMessage = "Error: \(error.localizedDescription)"
                 self.hasError = true
                 self.hasConverted = false
             }
 
+            // Clear the transient phase label so "Converting..." doesn't remain visible
+            self.phaseLabel = ""
             self.isProcessing = false
             DockProgress.stop()
         }
