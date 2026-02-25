@@ -26,6 +26,22 @@ class CustomVideoCompositionInstruction: NSObject, AVVideoCompositionInstruction
     // レイヤーインストラクション
     var layerInstructions: [AVVideoCompositionLayerInstruction]
     
+    // レターボックスの表示モード
+    enum LetterboxMode: Int, CaseIterable {
+        case fitWidth = 0           // 既存の幅に合わせるモード
+        case centerSquare = 1       // 中央を正方形にトリミングして表示
+        case centerPortrait4x3 = 2  // 中央を縦4:横3にトリミングして表示
+
+        var displayName: String {
+            switch self {
+            case .fitWidth: return "幅に合わせる"
+            case .centerSquare: return "中央を正方形"
+            case .centerPortrait4x3: return "中央を縦4:横3"
+            }
+        }
+    }
+    var letterboxMode: LetterboxMode = .fitWidth
+    
     init(
         timeRange: CMTimeRange,
         layerInstructions: [AVVideoCompositionLayerInstruction],
@@ -40,6 +56,7 @@ class CustomVideoCompositionInstruction: NSObject, AVVideoCompositionInstruction
         self.dampingFactor = dampingFactor
         self.inputSize = inputSize
         self.precomputedOffsets = precomputedOffsets
+        self.letterboxMode = .fitWidth
         
         // requiredSourceTrackIDsを設定
         if let trackID = layerInstructions.first?.trackID {

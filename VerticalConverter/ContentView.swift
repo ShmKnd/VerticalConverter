@@ -151,6 +151,14 @@ struct ContentView: View {
                     selection: $viewModel.exportSettings.encodingMode
                 )
             }
+            panelDivider
+            settingRow(label: "レターボックス", icon: "crop") {
+                SlidingPicker(
+                    labels: CustomVideoCompositionInstruction.LetterboxMode.allCases.map { $0.displayName },
+                    values: CustomVideoCompositionInstruction.LetterboxMode.allCases,
+                    selection: $viewModel.letterboxMode
+                )
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -329,6 +337,7 @@ class ContentViewModel: ObservableObject {
     @Published var exportSettings = VideoExportSettings()
     @Published var smartFramingEnabled: Bool = false
     @Published var smartFramingSmoothness: SmartFramingSettings.Smoothness = .normal
+    @Published var letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth
     @Published var isProcessing: Bool = false
     @Published var progress: Double = 0.0
     @Published var phaseLabel: String = "変換中..."
@@ -403,6 +412,7 @@ class ContentViewModel: ObservableObject {
                     outputURL: outputURL,
                     exportSettings: exportSettings,
                     smartFramingSettings: settings,
+                    letterboxMode: letterboxMode,
                     progressHandler: { progress, label in
                         Task { @MainActor in
                             self.progress = progress

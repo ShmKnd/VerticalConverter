@@ -40,6 +40,7 @@ actor VideoProcessor {
         outputURL: URL,
         exportSettings: VideoExportSettings = VideoExportSettings(),
         smartFramingSettings: SmartFramingSettings,
+        letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth,
         progressHandler: @escaping (Double, String) -> Void  // (progress, phaseLabel)
     ) async throws {
         // 既存の出力ファイルを削除
@@ -92,7 +93,8 @@ actor VideoProcessor {
             outputSize: CGSize(width: outputWidth, height: outputHeight),
             frameDuration: exportSettings.frameRate.frameDuration,
             smartFramingSettings: smartFramingSettings,
-            precomputedOffsets: precomputedOffsets
+            precomputedOffsets: precomputedOffsets,
+            letterboxMode: letterboxMode
         )
         
         // エクスポート
@@ -115,7 +117,8 @@ actor VideoProcessor {
         outputSize: CGSize,
         frameDuration: CMTime,
         smartFramingSettings: SmartFramingSettings,
-        precomputedOffsets: [CGPoint]? = nil
+        precomputedOffsets: [CGPoint]? = nil,
+        letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth
     ) async throws -> (AVMutableComposition, AVMutableVideoComposition) {
         let composition = AVMutableComposition()
         
@@ -170,6 +173,7 @@ actor VideoProcessor {
             inputSize: inputSize,
             precomputedOffsets: precomputedOffsets
         )
+        instruction.letterboxMode = letterboxMode
         
         videoComposition.instructions = [instruction]
         

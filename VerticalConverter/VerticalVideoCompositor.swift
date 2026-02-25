@@ -29,6 +29,8 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     // カットベース: 人物がフレーム中央からこの割合以上ずれたらカット（例: 0.25 = 25%）
     private let cutThreshold: CGFloat = 0.25    /// 事前解析済みオフセット（nil = リアルタイムフォールバック）
     private var currentPrecomputedOffsets: [CGPoint]? = nil    
+    // レターボックスモード
+    private var letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth
     override init() {
         ciContext = CIContext(options: [
             .workingColorSpace: CGColorSpaceCreateDeviceRGB(),
@@ -90,6 +92,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             self.smartFramingEnabled = instruction.smartFramingEnabled
             self.dampingFactor = instruction.dampingFactor
             self.currentPrecomputedOffsets = instruction.precomputedOffsets
+            self.letterboxMode = instruction.letterboxMode
 
             guard let sourcePixelBuffer = asyncVideoCompositionRequest.sourceFrame(byTrackID: layerInstruction.trackID) else {
                 asyncVideoCompositionRequest.finish(with: NSError(
@@ -144,7 +147,8 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             // スマートフレーミングOFF: 横幅に合わせてレターボックス + ブラー背景
             finalImage = makeLetterboxImage(
                 sourceImage: sourceImage, sourceSize: sourceSize,
-                renderSize: renderSize, outputRect: outputRect
+                renderSize: renderSize, outputRect: outputRect,
+                mode: self.letterboxMode
             )
         }
 
@@ -157,18 +161,68 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         sourceImage: CIImage,
         sourceSize: CGSize,
         renderSize: CGSize,
-        outputRect: CGRect
+        outputRect: CGRect,
+        mode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth
     ) -> CIImage {
-        let scale = renderSize.width / sourceSize.width
-        let scaledWidth = sourceSize.width * scale
-        let scaledHeight = sourceSize.height * scale
-        let mainX = (renderSize.width - scaledWidth) / 2
+        // デフォルト: 既存の幅に合わせるモード
+        if mode == .fitWidth {
+            let scale = renderSize.width / sourceSize.width
+            let scaledWidth = sourceSize.width * scale
+            let scaledHeight = sourceSize.height * scale
+            let mainX = (renderSize.width - scaledWidth) / 2
+            let mainY = (renderSize.height - scaledHeight) / 2
+
+            let mainVideo = sourceImage
+                .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+                .transformed(by: CGAffineTransform(translationX: mainX, y: mainY))
+
+            let bgScale = renderSize.height / sourceSize.height
+            let bgWidth = sourceSize.width * bgScale
+            let bgX = (renderSize.width - bgWidth) / 2
+            let blurredBg = sourceImage
+                .transformed(by: CGAffineTransform(scaleX: bgScale, y: bgScale))
+                .transformed(by: CGAffineTransform(translationX: bgX, y: 0))
+                .clampedToExtent()
+                .applyingGaussianBlur(sigma: 40)
+                .cropped(to: outputRect)
+
+            return mainVideo.composited(over: blurredBg)
+        }
+
+        // centerSquare または centerPortrait4x3: 中央を指定アスペクトでクロップして高さに合わせてフィット
+        let targetAspect: CGFloat = (mode == .centerSquare) ? 1.0 : (3.0 / 4.0)
+
+        var cropRect = CGRect(origin: .zero, size: sourceSize)
+        let sourceAspect = sourceSize.width / sourceSize.height
+        if sourceAspect > targetAspect {
+            // 元が横長 -> 横をトリミング
+            let cropW = sourceSize.height * targetAspect
+            let cropX = (sourceSize.width - cropW) / 2
+            cropRect = CGRect(x: cropX, y: 0, width: cropW, height: sourceSize.height)
+        } else {
+            // 元が縦長または同等 -> 縦をトリミング
+            let cropH = sourceSize.width / targetAspect
+            let cropY = (sourceSize.height - cropH) / 2
+            cropRect = CGRect(x: 0, y: cropY, width: sourceSize.width, height: cropH)
+        }
+
+        let cropped = sourceImage.cropped(to: cropRect)
+
+        // メイン映像は幅に合わせてスケール（左右を若干トリミングして中央を強調）
+        let scale = renderSize.width / cropRect.width
+        let scaledHeight = cropRect.height * scale
         let mainY = (renderSize.height - scaledHeight) / 2
 
-        let mainVideo = sourceImage
-            .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-            .transformed(by: CGAffineTransform(translationX: mainX, y: mainY))
+        // cropped の座標原点が cropRect.origin になるため、変換時に原点オフセットを打ち消す
+        let translateX = -cropRect.origin.x * scale + (renderSize.width - cropRect.width * scale) / 2
+        let translateY = mainY - cropRect.origin.y * scale
 
+        let mainVideo = cropped
+            .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            .transformed(by: CGAffineTransform(translationX: translateX, y: translateY))
+            .cropped(to: outputRect)
+
+        // 背景は元映像を高さに合わせて拡大してブラー
         let bgScale = renderSize.height / sourceSize.height
         let bgWidth = sourceSize.width * bgScale
         let bgX = (renderSize.width - bgWidth) / 2
