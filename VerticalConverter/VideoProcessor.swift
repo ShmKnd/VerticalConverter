@@ -283,7 +283,9 @@ actor VideoProcessor {
         )
         videoOutput.videoComposition = videoComposition
         videoOutput.alwaysCopiesSampleData = false
-        guard reader.canAdd(videoOutput) else { throw VideoProcessorError.exportFailed }
+        if !reader.canAdd(videoOutput) {
+            throw VideoProcessorError.exportFailed
+        }
         reader.add(videoOutput)
 
         // オーディオ読み込み
@@ -344,21 +346,9 @@ actor VideoProcessor {
         }
 
         // Note: Some compression properties (like AVVideoEncoderSpecificationKey) are not
-        // accepted by AVAssetWriterInput for many codecs (causes ObjC exception). We no
-        // longer inject AVVideoEncoderSpecificationKey here. To request hardware encoders
-        // you must use VideoToolbox directly (VTCompressionSession) or rely on system
-        // defaults; the UI already disables VT options when unsupported.
-        switch encodingMode {
-        case .cbr:
-            // CBR近似: フレーム並び替えなし + キーフレーム間隔1
-            compressionProps[AVVideoAllowFrameReorderingKey]  = false
-            compressionProps[AVVideoMaxKeyFrameIntervalKey]   = 1
-        case .abr:
-            // ABR: 期待フレームレートを明示してビットレートを安定化
-            compressionProps[AVVideoExpectedSourceFrameRateKey] = 30
-        case .vbr:
-            break  // デフォルトのVBR動作
-        }
+        // accepted by AVAssetWriterInput for many codecs (causes ObjC exception). To
+        // request a software-only encoder we use VTCompressionSession directly; the
+        // UI already disables VT options when unsupported.
         // If non-VT h264/h265 was selected we want to force software (CPU) encoding.
         // The safest way is to use VideoToolbox's VTCompressionSession with an
         // encoder specification that does not require hardware acceleration,
@@ -366,7 +356,9 @@ actor VideoProcessor {
         // compressed CMSampleBuffer objects.
         let useSoftwareVT: Bool = (codec == .h264 || codec == .h265)
 
-        var videoInput: AVAssetWriterInput
+        
+
+        var videoInput: AVAssetWriterInput? = nil
         var usingVTCompressionSession = false
 
         // Create video input with compression properties. Avoid injecting
@@ -380,10 +372,21 @@ actor VideoProcessor {
             AVVideoCompressionPropertiesKey: compressionProps
         ]
 
-        videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-        videoInput.expectsMediaDataInRealTime = false
-        guard writer.canAdd(videoInput) else { throw VideoProcessorError.exportFailed }
-        writer.add(videoInput)
+        if useSoftwareVT {
+            // For software VT (we'll produce compressed CMSampleBuffers),
+            // delay creating/adding the passthrough AVAssetWriterInput until
+            // we have a compressed sample to obtain its format description.
+            videoInput = nil
+        } else {
+            let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+            vIn.expectsMediaDataInRealTime = false
+            if !writer.canAdd(vIn) {
+                throw VideoProcessorError.exportFailed
+            }
+            writer.add(vIn)
+            videoInput = vIn
+        }
+        
 
         // オーディオ出力設定（AAC 192kbps）
         var audioInput: AVAssetWriterInput? = nil
@@ -395,8 +398,13 @@ actor VideoProcessor {
                 AVEncoderBitRateKey: 192_000
             ])
             aIn.expectsMediaDataInRealTime = false
-            if writer.canAdd(aIn) {
-                writer.add(aIn)
+            // For software VT path, delay adding audio input until writer is started
+            if !useSoftwareVT {
+                if writer.canAdd(aIn) {
+                    writer.add(aIn)
+                    audioInput = aIn
+                }
+            } else {
                 audioInput = aIn
             }
         }
@@ -404,9 +412,16 @@ actor VideoProcessor {
         // 総再生時間（プログレス計算用）
         let durationSeconds = composition.duration.seconds
 
+        
         reader.startReading()
-        writer.startWriting()
-        writer.startSession(atSourceTime: .zero)
+        // If not using software VT, start writer immediately. Otherwise we'll
+        // start writer after receiving first compressed sample and adding inputs.
+        if !useSoftwareVT {
+            writer.startWriting()
+            writer.startSession(atSourceTime: .zero)
+        }
+
+        var writerStarted = !useSoftwareVT
 
         // キャンセル時に reader を即座に止める
         // → copyNextSampleBuffer() が nil を返してコールバックが自然終了する
@@ -415,22 +430,243 @@ actor VideoProcessor {
 
                 // ビデオトラック
                 group.addTask {
-                    try await withCheckedThrowingContinuation { continuation in
-                        videoInput.requestMediaDataWhenReady(on: DispatchQueue(label: "video.write")) {
-                            while videoInput.isReadyForMoreMediaData {
-                                guard let sample = videoOutput.copyNextSampleBuffer() else {
-                                    // reader がキャンセルされると nil が返る → 正常終了扱い
-                                    videoInput.markAsFinished()
-                                    continuation.resume()
+                    // If software VT encoding requested, use VTCompressionSession to
+                    // produce compressed CMSampleBuffer objects and feed them to a
+                    // passthrough AVAssetWriterInput (outputSettings: nil).
+                    if codec == .h264 || codec == .h265 {
+                        try await withCheckedThrowingContinuation { continuation in
+                            let encodeQueue = DispatchQueue(label: "vt.encode")
+                            let appendQueue = DispatchQueue(label: "video.write")
+
+                            class VTEncoderContext {
+                                let bufferLock = DispatchQueue(label: "buffer.lock")
+                                var compressedBuffers: [CMSampleBuffer] = []
+                                var compressedBuffersCount: Int = 0
+                                var encodingFinished: Bool = false
+                                var readingFinished: Bool = false
+                                var didResumeContinuation: Bool = false
+                            }
+                            let context = VTEncoderContext()
+
+                            // Create passthrough writer input (expects compressed samples)
+                            // videoInput is already created as passthrough earlier when needed.
+
+                            // VTCompressionSession callback
+                            let callback: VTCompressionOutputCallback = { (outputCallbackRefCon, sourceFrameRefCon, status, infoFlags, sampleBuffer) in
+                                guard let ref = outputCallbackRefCon else { return }
+                                let ctx = Unmanaged<AnyObject>.fromOpaque(ref).takeUnretainedValue() as! VTEncoderContext
+                                guard status == noErr, let sbuf = sampleBuffer else {
+                                    ctx.bufferLock.async { ctx.encodingFinished = true }
                                     return
                                 }
-                                videoInput.append(sample)
+                                // Append sampleBuffer to buffer (Swift ARC manages retention)
+                                ctx.bufferLock.async {
+                                    ctx.compressedBuffers.append(sbuf)
+                                    ctx.compressedBuffersCount += 1
+                                    
+                                }
+                            }
 
-                                // プログレス更新
-                                let pts = CMSampleBufferGetPresentationTimeStamp(sample).seconds
-                                if durationSeconds > 0 {
-                                    let p = min(pts / durationSeconds, 0.99)
-                                    Task { @MainActor in progressHandler(p) }
+                            // Encoder specification: request software encoder when possible
+                            let encoderSpec: CFDictionary = [
+                                kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String: kCFBooleanFalse
+                            ] as CFDictionary
+
+                            var session: VTCompressionSession? = nil
+                            let codecType: CMVideoCodecType = (codec == .h264) ? kCMVideoCodecType_H264 : kCMVideoCodecType_HEVC
+                            // Retain context and pass as refcon to callback
+                            let refconPtr = Unmanaged.passRetained(context as AnyObject).toOpaque()
+                            var status = VTCompressionSessionCreate(allocator: nil,
+                                                                     width: Int32(renderSize.width),
+                                                                     height: Int32(renderSize.height),
+                                                                     codecType: codecType,
+                                                                     encoderSpecification: encoderSpec,
+                                                                     imageBufferAttributes: nil,
+                                                                     compressedDataAllocator: nil,
+                                                                     outputCallback: callback,
+                                                                     refcon: refconPtr,
+                                                                     compressionSessionOut: &session)
+                            guard status == noErr, let compSession = session else {
+                                Unmanaged<AnyObject>.fromOpaque(refconPtr).release()
+                                continuation.resume(throwing: VideoProcessorError.exportFailed)
+                                return
+                            }
+
+                            // Configure session properties
+                            var bitrateBps = Int32(bitrate * 1_000_000)
+                            if bitrateBps <= 0 { bitrateBps = 1_000_000 }
+                            if let cfNum = CFNumberCreate(nil, .sInt32Type, &bitrateBps) {
+                                status = VTSessionSetProperty(compSession, key: kVTCompressionPropertyKey_AverageBitRate, value: cfNum)
+                                _ = (status != noErr)
+                            }
+                            // set expected frame rate if ABR specified
+                            if encodingMode == .abr {
+                                var fr = Int32(30)
+                                _ = VTSessionSetProperty(compSession, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: CFNumberCreate(nil, .sInt32Type, &fr))
+                            }
+                            if encodingMode == .cbr {
+                                var maxKey = Int32(1)
+                                _ = VTSessionSetProperty(compSession, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: CFNumberCreate(nil, .sInt32Type, &maxKey))
+                                let allowReorder = kCFBooleanFalse
+                                _ = VTSessionSetProperty(compSession, key: kVTCompressionPropertyKey_AllowFrameReordering, value: allowReorder)
+                            }
+
+                            VTCompressionSessionPrepareToEncodeFrames(compSession)
+
+                            // Writer append loop will be created after the passthrough
+                            // videoInput is instantiated (after receiving first compressed sample).
+
+                            // Read frames, feed to encoder
+                            encodeQueue.async {
+                                while true {
+                                    if Task.isCancelled { break }
+                                    guard let sample = videoOutput.copyNextSampleBuffer() else {
+                                        // finished reading
+                                        context.readingFinished = true
+                                        break
+                                    }
+                                    guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { continue }
+                                    let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+                                    // Prefer using the source sample duration if available
+                                    var duration = CMSampleBufferGetDuration(sample)
+                                    if duration == CMTime.invalid || duration == CMTime.zero {
+                                        duration = videoComposition.frameDuration
+                                    }
+                                    var flags: VTEncodeInfoFlags = []
+                                    let encodeStatus = VTCompressionSessionEncodeFrame(compSession,
+                                                                                      imageBuffer: pixelBuffer,
+                                                                                      presentationTimeStamp: pts,
+                                                                                      duration: duration,
+                                                                                      frameProperties: nil,
+                                                                                      sourceFrameRefcon: nil,
+                                                                                      infoFlagsOut: &flags)
+                                    if encodeStatus != noErr {
+                                        // mark finished and resume continuation once
+                                        context.bufferLock.async {
+                                            context.encodingFinished = true
+                                            if !context.didResumeContinuation {
+                                                context.didResumeContinuation = true
+                                                continuation.resume(throwing: VideoProcessorError.exportFailed)
+                                            }
+                                        }
+                                        break
+                                    }
+
+                                    // progress update (based on input PTS)
+                                    let ptsSeconds = pts.seconds
+                                    if durationSeconds > 0 {
+                                        let p = min(ptsSeconds / durationSeconds, 0.99)
+                                        Task { @MainActor in progressHandler(p) }
+                                    }
+
+                                    // Throttle if output buffer grows too large
+                                    var shouldThrottle = false
+                                    context.bufferLock.sync {
+                                        shouldThrottle = context.compressedBuffers.count > 120
+                                    }
+                                    if shouldThrottle {
+                                        Thread.sleep(forTimeInterval: 0.01)
+                                    }
+
+                                    // If we haven't started the writer (software VT path),
+                                    // wait until we have the first compressed sample and
+                                    // then create the passthrough input with a sourceFormatHint
+                                    if !writerStarted {
+                                        var firstSbuf: CMSampleBuffer? = nil
+                                        context.bufferLock.sync {
+                                            if !context.compressedBuffers.isEmpty {
+                                                firstSbuf = context.compressedBuffers.first
+                                            }
+                                        }
+                                        if let fs = firstSbuf, let fmt = CMSampleBufferGetFormatDescription(fs) {
+                                            let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: fmt)
+                                            vIn.expectsMediaDataInRealTime = false
+                                                if writer.canAdd(vIn) {
+                                                writer.add(vIn)
+                                                videoInput = vIn
+                                                // Add audio input if it was deferred
+                                                if let aIn = audioInput {
+                                                    if writer.canAdd(aIn) {
+                                                        writer.add(aIn)
+                                                    } else {
+                                                        
+                                                    }
+                                                }
+                                                // Start writer session now
+                                                writer.startWriting()
+                                                writer.startSession(atSourceTime: .zero)
+                                                writerStarted = true
+
+                                                // Register append loop for the newly created video input
+                                                vIn.requestMediaDataWhenReady(on: appendQueue) {
+                                                    while vIn.isReadyForMoreMediaData {
+                                                        var next: CMSampleBuffer? = nil
+                                                        context.bufferLock.sync {
+                                                            if !context.compressedBuffers.isEmpty {
+                                                                next = context.compressedBuffers.removeFirst()
+                                                            }
+                                                        }
+                                                        if let sb = next {
+                                                            let appended = vIn.append(sb)
+                                                            if !appended {
+                                                                
+                                                            }
+                                                        } else if context.encodingFinished {
+                                                            vIn.markAsFinished()
+                                                            continuation.resume()
+                                                            return
+                                                        } else {
+                                                            break
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                context.bufferLock.async {
+                                                    context.encodingFinished = true
+                                                    if !context.didResumeContinuation {
+                                                        context.didResumeContinuation = true
+                                                        continuation.resume(throwing: VideoProcessorError.exportFailed)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Finish encoding
+                                VTCompressionSessionCompleteFrames(compSession, untilPresentationTimeStamp: CMTime.invalid)
+                                // Wait until buffer is drained in writer loop; mark encodingFinished
+                                context.bufferLock.async {
+                                    context.encodingFinished = true
+                                }
+                                // Invalidate session
+                                VTCompressionSessionInvalidate(compSession)
+                                // Release retained context
+                                Unmanaged<AnyObject>.fromOpaque(refconPtr).release()
+                            }
+                        }
+                    } else {
+                        try await withCheckedThrowingContinuation { continuation in
+                            guard let vIn = videoInput else {
+                                continuation.resume(throwing: VideoProcessorError.exportFailed)
+                                return
+                            }
+                            vIn.requestMediaDataWhenReady(on: DispatchQueue(label: "video.write")) {
+                                while vIn.isReadyForMoreMediaData {
+                                    guard let sample = videoOutput.copyNextSampleBuffer() else {
+                                        // reader がキャンセルされると nil が返る → 正常終了扱い
+                                        vIn.markAsFinished()
+                                        continuation.resume()
+                                        return
+                                    }
+                                    vIn.append(sample)
+
+                                    // プログレス更新
+                                    let pts = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+                                    if durationSeconds > 0 {
+                                        let p = min(pts / durationSeconds, 0.99)
+                                        Task { @MainActor in progressHandler(p) }
+                                    }
                                 }
                             }
                         }
@@ -441,6 +677,11 @@ actor VideoProcessor {
                 if let aOut = audioOutput, let aIn = audioInput {
                     group.addTask {
                         try await withCheckedThrowingContinuation { continuation in
+                            // If using software VT path, ensure writer has started and
+                            // inputs have been added before we begin appending audio.
+                            while useSoftwareVT && !writerStarted {
+                                Thread.sleep(forTimeInterval: 0.01)
+                            }
                             aIn.requestMediaDataWhenReady(on: DispatchQueue(label: "audio.write")) {
                                 while aIn.isReadyForMoreMediaData {
                                     guard let sample = aOut.copyNextSampleBuffer() else {
@@ -460,8 +701,8 @@ actor VideoProcessor {
         } onCancel: {
             // ← ここが即時実行される（メインスレッド待ち不要）
             reader.cancelReading()
-            videoInput.markAsFinished()
-            audioInput?.markAsFinished()
+              videoInput?.markAsFinished()
+              audioInput?.markAsFinished()
             writer.cancelWriting()
         }
 

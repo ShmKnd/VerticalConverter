@@ -447,9 +447,6 @@ class ContentViewModel: ObservableObject {
     @Published var selectedVideoURL: URL?
     {
         didSet {
-            #if DEBUG
-            print("selectedVideoURL -> \(selectedVideoURL?.path ?? "nil")")
-            #endif
         }
     }
     @Published var exportSettings = VideoExportSettings()
@@ -483,10 +480,7 @@ class ContentViewModel: ObservableObject {
     
     func handleDrop(providers: [NSItemProvider]) {
         guard let provider = providers.first else { return }
-        // Debug: log available type identifiers for the dropped item
-        #if DEBUG
-        print("handleDrop: provider types = \(provider.registeredTypeIdentifiers)")
-        #endif
+        
 
         // 1) Preferred modern API: try loading a URL/NSURL object directly
         if provider.canLoadObject(ofClass: NSURL.self) {
@@ -536,9 +530,6 @@ class ContentViewModel: ObservableObject {
                         self.selectedVideoURL = url
                         self.hasConverted = false
                     } else {
-                        #if DEBUG
-                        print("handleDrop: could not determine URL from item: \(String(describing: item)) error: \(String(describing: error))")
-                        #endif
                     }
                 }
             }
