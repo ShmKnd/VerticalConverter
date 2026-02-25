@@ -38,7 +38,7 @@ actor VideoProcessor {
     func convertToVertical(
         inputURL: URL,
         outputURL: URL,
-        bitrate: Int,
+        exportSettings: VideoExportSettings = VideoExportSettings(),
         smartFramingSettings: SmartFramingSettings,
         progressHandler: @escaping (Double, String) -> Void  // (progress, phaseLabel)
     ) async throws {
@@ -63,8 +63,9 @@ actor VideoProcessor {
         let height = abs(videoSize.height)
         
         // 出力サイズを計算（9:16の縦型）
-        let outputWidth: CGFloat  = 1080
-        let outputHeight: CGFloat = 1920
+        let (resW, resH) = exportSettings.resolution.outputSize
+        let outputWidth: CGFloat  = CGFloat(resW)
+        let outputHeight: CGFloat = CGFloat(resH)
         
         // ── スマートフレーミング ONなら事前解析（第1パス）──
         var precomputedOffsets: [CGFloat]? = nil
@@ -89,6 +90,7 @@ actor VideoProcessor {
             videoTrack: videoTrack,
             inputSize: CGSize(width: width, height: height),
             outputSize: CGSize(width: outputWidth, height: outputHeight),
+            frameDuration: exportSettings.frameRate.frameDuration,
             smartFramingSettings: smartFramingSettings,
             precomputedOffsets: precomputedOffsets
         )
@@ -98,7 +100,8 @@ actor VideoProcessor {
             composition: composition,
             videoComposition: videoComposition,
             outputURL: outputURL,
-            bitrate: bitrate,
+            bitrate: exportSettings.bitrate,
+            encodingMode: exportSettings.encodingMode,
             progressHandler: { p in
                 progressHandler(progressOffset + p * progressScale, "変換中...")
             }
@@ -110,6 +113,7 @@ actor VideoProcessor {
         videoTrack: AVAssetTrack,
         inputSize: CGSize,
         outputSize: CGSize,
+        frameDuration: CMTime,
         smartFramingSettings: SmartFramingSettings,
         precomputedOffsets: [CGFloat]? = nil
     ) async throws -> (AVMutableComposition, AVMutableVideoComposition) {
@@ -143,7 +147,7 @@ actor VideoProcessor {
         // ビデオコンポジションを作成
         let videoComposition = AVMutableVideoComposition()
         videoComposition.renderSize = outputSize
-        videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
+        videoComposition.frameDuration = frameDuration
         
         // カスタムコンポジターを使用
         videoComposition.customVideoCompositorClass = VerticalVideoCompositor.self
@@ -196,6 +200,7 @@ actor VideoProcessor {
         videoComposition: AVMutableVideoComposition,
         outputURL: URL,
         bitrate: Int,
+        encodingMode: VideoExportSettings.EncodingMode,
         progressHandler: @escaping (Double) -> Void
     ) async throws {
 
@@ -243,16 +248,28 @@ actor VideoProcessor {
         }
         writer.shouldOptimizeForNetworkUse = true
 
-        // ビデオ出力設定（指定ビットレートのHEVC）
+        // ビデオ出力設定（HEVC、エンコードモード適用）
         let videoBitrate = bitrate * 1_000_000
+        var compressionProps: [String: Any] = [
+            AVVideoAverageBitRateKey: videoBitrate,
+            AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main_AutoLevel
+        ]
+        switch encodingMode {
+        case .cbr:
+            // CBR近似: フレーム並び替えなし + キーフレーム間隔1
+            compressionProps[AVVideoAllowFrameReorderingKey]  = false
+            compressionProps[AVVideoMaxKeyFrameIntervalKey]   = 1
+        case .abr:
+            // ABR: 期待フレームレートを明示してビットレートを安定化
+            compressionProps[AVVideoExpectedSourceFrameRateKey] = 30
+        case .vbr:
+            break  // デフォルトのVBR動作
+        }
         let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: Int(renderSize.width),
             AVVideoHeightKey: Int(renderSize.height),
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: videoBitrate,
-                AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main_AutoLevel
-            ]
+            AVVideoCompressionPropertiesKey: compressionProps
         ])
         videoInput.expectsMediaDataInRealTime = false
         guard writer.canAdd(videoInput) else { throw VideoProcessorError.exportFailed }

@@ -11,177 +11,322 @@ import AppKit
 
 struct ContentView: View {
     @StateObject private var viewModel = ContentViewModel()
-    
+    @State private var isTargeted = false
+
     var body: some View {
-        VStack(spacing: 20) {
-            Text("Vertical Video Converter")
-                .font(.title)
-                .padding(.top, 30)
-            
-            Text("16:9の動画を縦型（9:16）に変換します")
-                .font(.subheadline)
-                .foregroundColor(.secondary)
-            
-            // ドロップゾーン
-            VStack {
-                if let videoURL = viewModel.selectedVideoURL {
-                    VStack(spacing: 10) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 50))
-                            .foregroundColor(.green)
-                        
-                        Text(videoURL.lastPathComponent)
-                            .font(.headline)
-                        
-                        Button("別のファイルを選択") {
-                            viewModel.selectedVideoURL = nil
-                        }
-                        .buttonStyle(.link)
-                    }
-                } else {
-                    VStack(spacing: 15) {
-                        Image(systemName: "video.badge.plus")
-                            .font(.system(size: 60))
-                            .foregroundColor(.blue)
-                        
-                        Text("動画ファイルをドラッグ&ドロップ")
-                            .font(.headline)
-                        
-                        Text("または")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        
-                        Button("ファイルを選択") {
-                            viewModel.selectFile()
-                        }
-                        .buttonStyle(.borderedProminent)
-                    }
-                }
-            }
-            .frame(width: 400, height: 200)
-            .background(
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(Color.gray.opacity(0.1))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 12)
-                            .stroke(style: StrokeStyle(lineWidth: 2, dash: [10]))
-                            .foregroundColor(.blue.opacity(0.5))
-                    )
+        ZStack {
+            // Liquid Glass が映える鮮やかなグラデーション背景
+            LinearGradient(
+                colors: [
+                    Color(hue: 0.62, saturation: 0.80, brightness: 0.60),
+                    Color(hue: 0.78, saturation: 0.90, brightness: 0.42)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
             )
-            .onDrop(of: [.fileURL], isTargeted: nil) { providers in
-                viewModel.handleDrop(providers: providers)
-                return true
-            }
-            
-            // ビットレート選択
-            HStack(spacing: 15) {
-                Text("ビットレート:")
-                    .font(.body)
-                
-                Picker("", selection: $viewModel.selectedBitrate) {
-                    Text("8 Mbps").tag(8)
-                    Text("10 Mbps").tag(10)
-                    Text("12 Mbps").tag(12)
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 250)
-            }
-            
-            // スマートフレーミング設定
-            VStack(spacing: 10) {
-                Toggle("スマートフレーミング（人物追従）", isOn: $viewModel.smartFramingEnabled)
-                    .toggleStyle(.switch)
+            .ignoresSafeArea()
 
-                if viewModel.smartFramingEnabled {
-                    HStack(spacing: 10) {
-                        Text("パン速度:")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-
-                        Picker("", selection: $viewModel.smartFramingSmoothness) {
-                            ForEach(SmartFramingSettings.Smoothness.allCases, id: \.self) { s in
-                                Text(s.rawValue).tag(s)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .frame(width: 200)
-                    }
-                    .transition(.opacity)
-                }
-            }
-            .padding(.horizontal)
-            
-            // 変換ボタン / 中止ボタン + プログレスバー + ステータス（固定高さで安定させる）
-            VStack(spacing: 8) {
-                // ボタン行（常に同じ高さを確保）
-                if viewModel.isProcessing {
-                    Button(action: {
-                        viewModel.cancelConversion()
-                    }) {
-                        HStack {
-                            Image(systemName: "xmark.circle.fill")
-                            Text("変換を中止")
-                        }
-                        .frame(width: 200)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.red)
-                } else {
-                    Button(action: {
-                        viewModel.convertVideo()
-                    }) {
-                        HStack {
-                            Image(systemName: "arrow.triangle.2.circlepath")
-                            Text("変換開始")
-                        }
-                        .frame(width: 200)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(viewModel.selectedVideoURL == nil)
-                }
-
-                // プログレスエリア（常に固定高さ）
+            VStack(spacing: 12) {
+                // ヘッダー
                 VStack(spacing: 4) {
-                    if viewModel.isProcessing {
-                        HStack(spacing: 8) {
-                            ProgressView()
-                                .scaleEffect(0.7)
-                                .frame(width: 14, height: 14)
-                            Text("変換中...")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                        ProgressView(value: viewModel.progress)
-                            .frame(width: 300)
-                        Text(String(format: "%.0f%%", viewModel.progress * 100))
+                    Text("Vertical Converter")
+                        .font(.title.bold())
+                        .foregroundStyle(.white)
+                    Text("16:9 → 9:16 変換")
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.75))
+                }
+                .padding(.top, 22)
+
+                dropZone
+                settingsPanel
+                smartFramingPanel
+                actionPanel
+
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 20)
+        }
+        .frame(width: 500, height: 690)
+    }
+
+    // MARK: - ドロップゾーン
+
+    private var dropZone: some View {
+        ZStack {
+            if let videoURL = viewModel.selectedVideoURL {
+                VStack(spacing: 12) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 44))
+                        .foregroundStyle(.white)
+                    Text(videoURL.lastPathComponent)
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
+                    Button("別のファイルを選択") {
+                        viewModel.selectedVideoURL = nil
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.white.opacity(0.8))
+                    .underline()
+                }
+                .padding()
+            } else {
+                VStack(spacing: 12) {
+                    Image(systemName: "video.badge.plus")
+                        .font(.system(size: 52))
+                        .foregroundStyle(.white)
+                        .symbolEffect(.pulse, isActive: isTargeted)
+                    Text("ドラッグ＆ドロップ")
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                    Text("または")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.6))
+                    Button("ファイルを選択") {
+                        viewModel.selectFile()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.white.opacity(0.2))
+                }
+                .padding()
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 175)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 20))
+        // TODO: Xcode 26+→.glassEffect(in: RoundedRectangle(cornerRadius: 20))
+        .overlay(
+            RoundedRectangle(cornerRadius: 20)
+                .strokeBorder(
+                    isTargeted ? Color.white.opacity(0.9) : Color.white.opacity(0.25),
+                    style: StrokeStyle(
+                        lineWidth: 1.5,
+                        dash: viewModel.selectedVideoURL == nil ? [8, 4] : []
+                    )
+                )
+        )
+        .onDrop(of: [UTType.fileURL], isTargeted: $isTargeted) { providers in
+            viewModel.handleDrop(providers: providers)
+            return true
+        }
+        .animation(Animation.easeInOut(duration: 0.2), value: isTargeted)
+    }
+
+    // MARK: - 出力設定パネル
+
+    private var settingsPanel: some View {
+        VStack(spacing: 0) {
+            settingRow(label: "解像度", icon: "aspectratio") {
+                SlidingPicker(
+                    labels: VideoExportSettings.Resolution.allCases.map { $0.rawValue },
+                    values: VideoExportSettings.Resolution.allCases,
+                    selection: $viewModel.exportSettings.resolution
+                )
+            }
+            panelDivider
+            settingRow(label: "FPS", icon: "camera.aperture") {
+                SlidingPicker(
+                    labels: VideoExportSettings.FrameRate.allCases.map { $0.displayLabel },
+                    values: VideoExportSettings.FrameRate.allCases,
+                    selection: $viewModel.exportSettings.frameRate
+                )
+            }
+            panelDivider
+            settingRow(label: "ビットレート", icon: "waveform") {
+                SlidingPicker(
+                    labels: [8, 10, 12].map { "\($0) Mbps" },
+                    values: [8, 10, 12],
+                    selection: $viewModel.exportSettings.bitrate
+                )
+            }
+            panelDivider
+            settingRow(label: "品質モード", icon: "slider.horizontal.3") {
+                SlidingPicker(
+                    labels: VideoExportSettings.EncodingMode.allCases.map { $0.rawValue },
+                    values: VideoExportSettings.EncodingMode.allCases,
+                    selection: $viewModel.exportSettings.encodingMode
+                )
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 20))
+        // TODO: Xcode 26+→.glassEffect(in: RoundedRectangle(cornerRadius: 20))
+    }
+
+    // MARK: - スマートフレーミングパネル（常に固定高さ）
+
+    private var smartFramingPanel: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Label("スマートフレーミング", systemImage: "person.crop.rectangle.badge.plus")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.white)
+                Spacer()
+                Toggle("", isOn: $viewModel.smartFramingEnabled)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+            }
+            panelDivider
+            // パン速度: 常に表示。OFFのときはグレーアウト（高さ変化なし）
+            settingRow(label: "パン速度", icon: "arrow.left.and.right") {
+                SlidingPicker(
+                    labels: SmartFramingSettings.Smoothness.allCases.map { $0.rawValue },
+                    values: SmartFramingSettings.Smoothness.allCases,
+                    selection: $viewModel.smartFramingSmoothness
+                )
+            }
+            .opacity(viewModel.smartFramingEnabled ? 1.0 : 0.35)
+            .allowsHitTesting(viewModel.smartFramingEnabled)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 20))
+        // TODO: Xcode 26+→.glassEffect(in: RoundedRectangle(cornerRadius: 20))
+    }
+
+    // MARK: - アクションパネル
+
+    private var actionPanel: some View {
+        VStack(spacing: 10) {
+            if viewModel.isProcessing {
+                Button {
+                    viewModel.cancelConversion()
+                } label: {
+                    HStack {
+                        Image(systemName: "xmark.circle.fill")
+                        Text("変換を中止")
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 4)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red.opacity(0.65))
+            } else {
+                Button {
+                    viewModel.convertVideo()
+                } label: {
+                    HStack {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                        Text("変換開始")
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 4)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Color(hue: 0.38, saturation: 0.75, brightness: 0.72))
+                .disabled(viewModel.selectedVideoURL == nil)
+            }
+
+            // プログレス（固定高さ）
+            VStack(spacing: 5) {
+                if viewModel.isProcessing {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .scaleEffect(0.7)
+                            .frame(width: 14, height: 14)
+                        Text(viewModel.phaseLabel)
                             .font(.caption)
-                            .foregroundColor(.secondary)
+                            .foregroundStyle(.white.opacity(0.8))
+                        Spacer()
+                        Text(String(format: "%.0f%%", viewModel.progress * 100))
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.white.opacity(0.8))
+                    }
+                    ProgressView(value: viewModel.progress)
+                        .tint(.white)
+                }
+            }
+            .frame(height: 40)
+
+            Text(viewModel.statusMessage.isEmpty ? " " : viewModel.statusMessage)
+                .font(.caption)
+                .foregroundStyle(viewModel.hasError ? Color.red : Color.white.opacity(0.85))
+                .multilineTextAlignment(.center)
+                .frame(height: 32)
+                .lineLimit(2)
+        }
+        .padding(16)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 20))
+        // TODO: Xcode 26 以降は下記に差し替え
+        // .glassEffect(in: RoundedRectangle(cornerRadius: 20))
+    }
+
+    // MARK: - Panel Helpers
+
+    private var panelDivider: some View {
+        Divider()
+            .overlay(Color.white.opacity(0.18))
+            .padding(.vertical, 6)
+    }
+
+    private func settingRow<Content: View>(
+        label: String, icon: String,
+        @ViewBuilder picker: () -> Content
+    ) -> some View {
+        HStack(spacing: 10) {
+            Label(label, systemImage: icon)
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(.white)
+                .frame(width: 115, alignment: .leading)
+            picker()
+        }
+    }
+}
+
+// MARK: - Helpers
+
+private struct SlidingPicker<T: Hashable>: View {
+    let labels: [String]
+    let values: [T]
+    @Binding var selection: T
+    @Namespace private var ns
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(labels.indices, id: \.self) { i in
+                let isSelected = selection == values[i]
+                Button {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.76)) {
+                        selection = values[i]
+                    }
+                } label: {
+                    Text(labels[i])
+                        .font(.caption.weight(isSelected ? .semibold : .regular))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(isSelected ? Color.white : Color.white.opacity(0.55))
+                .background {
+                    if isSelected {
+                        RoundedRectangle(cornerRadius: 7)
+                            .fill(Color.white.opacity(0.28))
+                            .matchedGeometryEffect(id: "pill", in: ns)
                     }
                 }
-                .frame(height: 52) // 常にこの高さをキープ
-
-                // ステータスメッセージエリア（常に固定高さ）
-                Text(viewModel.statusMessage.isEmpty ? " " : viewModel.statusMessage)
-                    .font(.caption)
-                    .foregroundColor(viewModel.hasError ? .red : .green)
-                    .padding(.horizontal)
-                    .multilineTextAlignment(.center)
-                    .frame(height: 36)
-                    .lineLimit(2)
             }
-            .padding(.vertical, 4)
-
-            Spacer(minLength: 0)
         }
-        .frame(width: 500, height: 560)
-        .padding()
+        .padding(3)
+        .background(Color.black.opacity(0.18))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }
 
 @MainActor
 class ContentViewModel: ObservableObject {
     @Published var selectedVideoURL: URL?
-    @Published var selectedBitrate: Int = 10
+    @Published var exportSettings = VideoExportSettings()
     @Published var smartFramingEnabled: Bool = false
     @Published var smartFramingSmoothness: SmartFramingSettings.Smoothness = .normal
     @Published var isProcessing: Bool = false
@@ -256,7 +401,7 @@ class ContentViewModel: ObservableObject {
                 try await videoProcessor.convertToVertical(
                     inputURL: inputURL,
                     outputURL: outputURL,
-                    bitrate: selectedBitrate,
+                    exportSettings: exportSettings,
                     smartFramingSettings: settings,
                     progressHandler: { progress, label in
                         Task { @MainActor in
