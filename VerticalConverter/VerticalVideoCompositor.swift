@@ -31,6 +31,9 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     private var currentPrecomputedOffsets: [CGPoint]? = nil    
     // レターボックスモード
     private var letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth
+    // HDR -> SDR
+    private var hdrConversionEnabled: Bool = false
+    private var hdrTarget: CustomVideoCompositionInstruction.HDRTarget = .sRGB
     override init() {
         ciContext = CIContext(options: [
             .workingColorSpace: CGColorSpaceCreateDeviceRGB(),
@@ -93,6 +96,12 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             self.dampingFactor = instruction.dampingFactor
             self.currentPrecomputedOffsets = instruction.precomputedOffsets
             self.letterboxMode = instruction.letterboxMode
+            // HDR settings
+            let hdrEnabled = instruction.hdrConversionEnabled
+            let hdrTarget = instruction.hdrTarget
+            // store in local vars for composeFrame
+            self.hdrConversionEnabled = hdrEnabled
+            self.hdrTarget = hdrTarget
 
             guard let sourcePixelBuffer = asyncVideoCompositionRequest.sourceFrame(byTrackID: layerInstruction.trackID) else {
                 asyncVideoCompositionRequest.finish(with: NSError(
@@ -152,7 +161,20 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             )
         }
 
-        ciContext.render(finalImage, to: outputPixelBuffer)
+        var imageToRender = finalImage
+
+        if hdrConversionEnabled {
+            // 簡易トーンマッピング: 軽く露出を落としガンマで丸める
+            imageToRender = imageToRender.applyingFilter("CIExposureAdjust", parameters: ["inputEV": -1.0])
+            switch hdrTarget {
+            case .sRGB:
+                imageToRender = imageToRender.applyingFilter("CIGammaAdjust", parameters: ["inputPower": 1.0/2.2])
+            case .rec709:
+                imageToRender = imageToRender.applyingFilter("CIGammaAdjust", parameters: ["inputPower": 1.0/2.4])
+            }
+        }
+
+        ciContext.render(imageToRender, to: outputPixelBuffer)
     }
 
     // MARK: - レターボックス
@@ -189,8 +211,18 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             return mainVideo.composited(over: blurredBg)
         }
 
-        // centerSquare または centerPortrait4x3: 中央を指定アスペクトでクロップして高さに合わせてフィット
-        let targetAspect: CGFloat = (mode == .centerSquare) ? 1.0 : (3.0 / 4.0)
+        // centerSquare / centerPortrait4x3 / centerPortrait3x4: 中央を指定アスペクトでクロップ
+        let targetAspect: CGFloat
+        switch mode {
+        case .centerSquare:
+            targetAspect = 1.0
+        case .centerPortrait4x3:
+            targetAspect = 3.0 / 4.0
+        case .centerPortrait3x4:
+            targetAspect = 4.0 / 3.0
+        default:
+            targetAspect = 1.0
+        }
 
         var cropRect = CGRect(origin: .zero, size: sourceSize)
         let sourceAspect = sourceSize.width / sourceSize.height

@@ -41,6 +41,7 @@ struct ContentView: View {
                 dropZone
                 settingsPanel
                 smartFramingPanel
+                hdrPanel
                 actionPanel
 
                 Spacer(minLength: 0)
@@ -199,6 +200,36 @@ struct ContentView: View {
         // TODO: Xcode 26+→.glassEffect(in: RoundedRectangle(cornerRadius: 20))
     }
 
+    // MARK: - HDR -> SDR パネル
+
+    private var hdrPanel: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Label("HDR→SDR 変換", systemImage: "sun.max.trianglebadge.exclamation")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.white)
+                Spacer()
+                Toggle("", isOn: $viewModel.hdrConversionEnabled)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+            }
+            panelDivider
+            settingRow(label: "ターゲット色空間", icon: "paintpalette") {
+                SlidingPicker(
+                    labels: ["sRGB", "Rec.709"],
+                    values: [CustomVideoCompositionInstruction.HDRTarget.sRGB, CustomVideoCompositionInstruction.HDRTarget.rec709],
+                    selection: $viewModel.hdrTarget
+                )
+            }
+            .opacity(viewModel.hdrConversionEnabled ? 1.0 : 0.35)
+            .allowsHitTesting(viewModel.hdrConversionEnabled)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 20))
+    }
+
     // MARK: - アクションパネル
 
     private var actionPanel: some View {
@@ -338,6 +369,8 @@ class ContentViewModel: ObservableObject {
     @Published var smartFramingEnabled: Bool = false
     @Published var smartFramingSmoothness: SmartFramingSettings.Smoothness = .normal
     @Published var letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth
+    @Published var hdrConversionEnabled: Bool = false
+    @Published var hdrTarget: CustomVideoCompositionInstruction.HDRTarget = .sRGB
     @Published var isProcessing: Bool = false
     @Published var progress: Double = 0.0
     @Published var phaseLabel: String = "変換中..."
@@ -413,6 +446,8 @@ class ContentViewModel: ObservableObject {
                     exportSettings: exportSettings,
                     smartFramingSettings: settings,
                     letterboxMode: letterboxMode,
+                    hdrConversionEnabled: hdrConversionEnabled,
+                    hdrTarget: hdrTarget,
                     progressHandler: { progress, label in
                         Task { @MainActor in
                             self.progress = progress

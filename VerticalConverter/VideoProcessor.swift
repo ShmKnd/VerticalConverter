@@ -41,6 +41,8 @@ actor VideoProcessor {
         exportSettings: VideoExportSettings = VideoExportSettings(),
         smartFramingSettings: SmartFramingSettings,
         letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth,
+        hdrConversionEnabled: Bool = false,
+        hdrTarget: CustomVideoCompositionInstruction.HDRTarget = .sRGB,
         progressHandler: @escaping (Double, String) -> Void  // (progress, phaseLabel)
     ) async throws {
         // 既存の出力ファイルを削除
@@ -95,6 +97,8 @@ actor VideoProcessor {
             smartFramingSettings: smartFramingSettings,
             precomputedOffsets: precomputedOffsets,
             letterboxMode: letterboxMode
+            , hdrConversionEnabled: hdrConversionEnabled,
+            hdrTarget: hdrTarget
         )
         
         // エクスポート
@@ -119,6 +123,8 @@ actor VideoProcessor {
         smartFramingSettings: SmartFramingSettings,
         precomputedOffsets: [CGPoint]? = nil,
         letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth
+        , hdrConversionEnabled: Bool = false,
+        hdrTarget: CustomVideoCompositionInstruction.HDRTarget = .sRGB
     ) async throws -> (AVMutableComposition, AVMutableVideoComposition) {
         let composition = AVMutableComposition()
         
@@ -174,6 +180,8 @@ actor VideoProcessor {
             precomputedOffsets: precomputedOffsets
         )
         instruction.letterboxMode = letterboxMode
+        instruction.hdrConversionEnabled = hdrConversionEnabled
+        instruction.hdrTarget = hdrTarget
         
         videoComposition.instructions = [instruction]
         

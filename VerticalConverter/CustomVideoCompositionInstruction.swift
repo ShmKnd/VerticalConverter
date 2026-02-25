@@ -31,15 +31,25 @@ class CustomVideoCompositionInstruction: NSObject, AVVideoCompositionInstruction
         case fitWidth = 0           // 既存の幅に合わせるモード
         case centerSquare = 1       // 中央を正方形にトリミングして表示
         case centerPortrait4x3 = 2  // 中央を縦4:横3にトリミングして表示
+        case centerPortrait3x4 = 3  // 中央を縦3:横4にトリミングして表示
 
         var displayName: String {
             switch self {
             case .fitWidth: return "幅に合わせる"
             case .centerSquare: return "中央を正方形"
             case .centerPortrait4x3: return "中央を縦4:横3"
+            case .centerPortrait3x4: return "中央を縦3:横4"
             }
         }
     }
+
+    // HDR -> SDR 変換設定
+    enum HDRTarget: Int {
+        case sRGB = 0
+        case rec709 = 1
+    }
+    var hdrConversionEnabled: Bool = false
+    var hdrTarget: HDRTarget = .sRGB
     var letterboxMode: LetterboxMode = .fitWidth
     
     init(
