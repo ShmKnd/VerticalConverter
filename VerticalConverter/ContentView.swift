@@ -39,17 +39,22 @@ struct ContentView: View {
                 .padding(.top, 22)
 
                 dropZone
+                    .frame(maxWidth: .infinity)
                 settingsPanel
+                    .frame(maxWidth: .infinity)
                 smartFramingPanel
+                    .frame(maxWidth: .infinity)
                 hdrPanel
+                    .frame(maxWidth: .infinity)
                 actionPanel
+                    .frame(maxWidth: .infinity)
 
-                Spacer(minLength: 0)
+                // Spacer removed to avoid large empty area below panels
             }
             .padding(.horizontal, 20)
             .padding(.bottom, 20)
         }
-        .frame(width: 500, height: 690)
+        .frame(width: 500, height: 850)
     }
 
     // MARK: - ドロップゾーン
@@ -163,7 +168,7 @@ struct ContentView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
-        .background(.ultraThinMaterial)
+        .background(.thinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 20))
         // TODO: Xcode 26+→.glassEffect(in: RoundedRectangle(cornerRadius: 20))
     }
@@ -195,7 +200,7 @@ struct ContentView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
-        .background(.ultraThinMaterial)
+        .background(.thinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 20))
         // TODO: Xcode 26+→.glassEffect(in: RoundedRectangle(cornerRadius: 20))
     }
@@ -226,14 +231,14 @@ struct ContentView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
-        .background(.ultraThinMaterial)
+        .background(.thinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 20))
     }
 
     // MARK: - アクションパネル
 
     private var actionPanel: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 14) {
             if viewModel.isProcessing {
                 Button {
                     viewModel.cancelConversion()
@@ -243,7 +248,7 @@ struct ContentView: View {
                         Text("変換を中止")
                     }
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 4)
+                    .padding(.vertical, 6)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.red.opacity(0.65))
@@ -256,43 +261,52 @@ struct ContentView: View {
                         Text("変換開始")
                     }
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 4)
+                    .padding(.vertical, 6)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(Color(hue: 0.38, saturation: 0.75, brightness: 0.72))
                 .disabled(viewModel.selectedVideoURL == nil)
             }
 
-            // プログレス（固定高さ）
-            VStack(spacing: 5) {
-                if viewModel.isProcessing {
-                    HStack(spacing: 8) {
+            // プログレス（常に表示。非処理時は淡く表示）
+            VStack(spacing: 6) {
+                HStack(spacing: 8) {
+                    if viewModel.isProcessing {
                         ProgressView()
                             .scaleEffect(0.7)
                             .frame(width: 14, height: 14)
-                        Text(viewModel.phaseLabel)
-                            .font(.caption)
-                            .foregroundStyle(.white.opacity(0.8))
-                        Spacer()
-                        Text(String(format: "%.0f%%", viewModel.progress * 100))
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.white.opacity(0.8))
+                    } else {
+                        ProgressView()
+                            .scaleEffect(0.7)
+                            .frame(width: 14, height: 14)
+                            .hidden()
                     }
-                    ProgressView(value: viewModel.progress)
-                        .tint(.white)
+
+                    Text(viewModel.phaseLabel)
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(viewModel.isProcessing ? 0.85 : 0.35))
+
+                    Spacer()
+
+                    Text(String(format: "%.0f%%", viewModel.progress * 100))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.white.opacity(viewModel.isProcessing ? 0.85 : 0.35))
                 }
+
+                ProgressView(value: viewModel.progress)
+                    .tint(viewModel.isProcessing ? .white : Color.white.opacity(0.25))
             }
-            .frame(height: 40)
+            .frame(height: 32)
 
             Text(viewModel.statusMessage.isEmpty ? " " : viewModel.statusMessage)
                 .font(.caption)
                 .foregroundStyle(viewModel.hasError ? Color.red : Color.white.opacity(0.85))
                 .multilineTextAlignment(.center)
-                .frame(height: 32)
                 .lineLimit(2)
+                .frame(height: 36) // 固定高さを確保して UI のジャンプを防止
         }
-        .padding(16)
-        .background(.ultraThinMaterial)
+        .padding(EdgeInsets(top: 16, leading: 16, bottom: 4, trailing: 16))
+        .background(.thinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 20))
         // TODO: Xcode 26 以降は下記に差し替え
         // .glassEffect(in: RoundedRectangle(cornerRadius: 20))
@@ -344,6 +358,7 @@ private struct SlidingPicker<T: Hashable>: View {
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 6)
                         .contentShape(Rectangle())
+                        .animation(nil, value: isSelected)
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(isSelected ? Color.white : Color.white.opacity(0.55))
@@ -412,7 +427,7 @@ class ContentViewModel: ObservableObject {
 
     func convertVideo() {
         guard let inputURL = selectedVideoURL else { return }
-        
+
         isProcessing = true
         hasError = false
         statusMessage = "変換を開始しています..."
@@ -423,7 +438,7 @@ class ContentViewModel: ObservableObject {
         let inputFilename = inputURL.deletingPathExtension().lastPathComponent
         let outputURL = inputURL.deletingLastPathComponent()
             .appendingPathComponent("\(inputFilename)_vertical.mp4")
-        
+
         conversionTask = Task {
             do {
                 // セキュリティスコープ付きリソースへのアクセスを開始
@@ -433,13 +448,13 @@ class ContentViewModel: ObservableObject {
                         inputURL.stopAccessingSecurityScopedResource()
                     }
                 }
-                
+
                 // スマートフレーミング設定を作成
                 let settings = SmartFramingSettings(
                     enabled: smartFramingEnabled,
                     smoothness: smartFramingSmoothness
                 )
-                
+
                 try await videoProcessor.convertToVertical(
                     inputURL: inputURL,
                     outputURL: outputURL,
@@ -456,10 +471,10 @@ class ContentViewModel: ObservableObject {
                         }
                     }
                 )
-                
+
                 self.statusMessage = "変換完了！\n保存先: \(outputURL.path)"
                 self.hasError = false
-                
+
                 // 保存先をFinderで表示
                 NSWorkspace.shared.activateFileViewerSelecting([outputURL])
             } catch VideoProcessorError.cancelled {
@@ -469,7 +484,7 @@ class ContentViewModel: ObservableObject {
                 self.statusMessage = "エラー: \(error.localizedDescription)"
                 self.hasError = true
             }
-            
+
             self.isProcessing = false
             DockProgress.stop()
         }
