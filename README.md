@@ -1,6 +1,199 @@
 # Vertical Converter
 
-16:9の横長動画をYouTubeショート用の縦型動画（9:16）に変換するmacOSアプリです。
+16:9の横長動画をYouTubeショート/リール用の縦型動画（9:16）に変換するmacOSアプリです。
+
+---
+
+## 機能
+
+| 機能 | 説明 |
+|---|---|
+| ドラッグ&ドロップ | 動画ファイルをウィンドウにドロップするだけで選択 |
+| ブラー背景生成 | 上下の余白部分に元動画を拡大ブラーした背景を自動生成 |
+| **スマートフレーミング** | Visionで人物を事前解析し、被写体を追従しながら縦クロップ |
+| **IOUトラッキング** | 複数人物を個别追跡し、主役（長時間・安定）を自動推定 |
+| **Y方向ヘッドルーム制御** | 上半身・ダンス等でも頭の余白を自動確保 |
+| 解像度選択 | 720p / 1080p |
+| フレームレート選択 | 24 / 29.97 DF / 30 / 60 fps |
+| エンコードモード | VBR / CBR / ABR |
+| ビットレート選択 | 任意 Mbps |
+| キャンセル | 変換中断ボタン |
+| Dockプログレス | Dockアイコンにプログレスバー表示 |
+
+---
+
+## 技術仕様
+
+- **対応OS**: macOS 14.0以降
+- **言語**: Swift / SwiftUI
+- **フレームワーク**: AVFoundation, Vision, Core Image, VideoToolbox
+- **出力形式**: MP4（H.265 HEVC + AAC）
+- **処理方式**: 2パス（解析→変換）
+
+---
+
+## ビルド方法
+
+```bash
+cd VerticalConverter
+open VerticalConverter.xcodeproj
+# Xcode で ⌘+B または ⌘+R
+```
+
+---
+
+## 使用方法
+
+1. 動画ファイルをウィンドウにドラッグ、またはクリックして選択
+2. 設定パネルで解像度・FPS・ビットレート・エンコードモードを選択
+3. スマートフレーミングパネルでON/OFF・追従速度を設定
+4. 「変換開始」ボタンをクリック
+5. 変換完了後、Finderで保存先が自動表示される
+
+---
+
+## プロジェクト構造
+
+```
+VerticalConverter/
+├── VerticalConverterApp.swift              # エントリーポイント
+├── ContentView.swift                       # メインUI + ContentViewModel
+├── VideoProcessor.swift                    # 変換オーケストレーション（2パス）
+├── VideoExportSettings.swift               # エクスポート設定（解像度・FPS・モード）
+├── SmartFramingSettings.swift              # スマートフレーミング設定
+├── SmartFramingAnalyzer.swift              # 第1パス: Vision解析 + IOUトラッキング
+├── VerticalVideoCompositor.swift           # 第2パス: カスタムフレーム合成
+├── CustomVideoCompositionInstruction.swift # AVVideoCompositionInstruction実装
+└── DockProgress.swift                      # Dockプログレスバー
+```
+
+---
+
+## アーキテクチャ
+
+### 処理フロー（2パス）
+
+```
+[第1パス: SmartFramingAnalyzer]
+  入力動画を全フレームスキャン
+    → 人物検出（VNDetectHumanBodyPoseRequest + VNDetectFaceRectanglesRequest）
+    → IOUトラッキング（PersonTracker）
+    → 主役スコア計算
+    → X/Y 正規化座標を記録
+    → 線形補間（検出間フレームを補完）
+    → 双方向ガウシアンスムージング（fps依存 sigma）
+    → ホールド＆フォロー（X: 3秒ホールド / Y: 0.5秒ホールド）
+    → precomputedOffsets: [CGPoint] を出力
+
+[第2パス: VerticalVideoCompositor]
+  フレームごとに precomputedOffsets[i] を参照
+    → scale × (offsetX, offsetY) を適用してクロップ
+    → スマートフレーミングOFFの場合はレターボックス+ブラー背景
+```
+
+---
+
+## スマートフレーミング詳細
+
+### ① fps依存ガウシアン sigma
+
+固定sigma=20フレームを廃止。FPSに比例して平滑化半径を最適化：
+
+```
+sigma = fps × 0.4
+// 24fps → 9.6f  ≈ 0.4秒
+// 30fps → 12.0f ≈ 0.4秒
+// 60fps → 24.0f ≈ 0.4秒
+```
+
+ダンス・スポーツ等で遅延感が出ない。
+
+---
+
+### ② IOUトラッキング + 主役推定
+
+**旧実装の問題点**  
+`(minX + maxX) / 2` では主役と通過者を区別できない。
+
+**新アーキテクチャ**
+
+```
+検出 → PersonTracker（IOUマッチング）→ subjectScore 計算 → 加重中心
+```
+
+#### PersonTracker
+
+- IOU ≥ 0.20 でグリーディマッチング
+- 連続5検出間隔（≈40フレーム）未検出で削除
+- 各トラックに `lifespan`（累計検出回数）・`velocities`（直近6サンプルの移動量）を蓄積
+
+#### subjectScore（主役らしさ）
+
+$$\text{score} = \text{confidence} \times \underbrace{\max(0.2,\ 1 - |x{-}0.5| \times 1.6)}_{\text{centrality}} \times \underbrace{\min\!\left(1,\ \frac{\text{lifespan}}{fps \times 1.5}\right)}_{\text{lifespanWeight}} \times \underbrace{\frac{1}{1 + v \times 6}}_{\text{motionWeight}}$$
+
+| ケース | 結果 |
+|---|---|
+| **グループ3人（等価）** | 全員が長寿命・低速度 → 全員高スコア → グループ中心を追う |
+| **主役＋通過者** | 通過者は短命・高速 → motionWeight + lifespanWeight が激減 → 主役が支配的 |
+
+---
+
+### ③ 適応的検出間隔
+
+```swift
+let deviation = hypot(center.x - lastCenter.x, center.y - lastCenter.y)
+detectionInterval = deviation > 0.10 ? 4 : 8
+```
+
+激しい動き（ダンス・スポーツ）では4フレーム毎に自動短縮。
+
+---
+
+### ④ Y方向ヘッドルーム制御
+
+```
+yZoomFactor = 1.1   // 10%ズームインでY方向パン余白を確保
+targetRatio = 0.80  // 下から80%（上から20%）の位置に上半身を配置
+deadZoneRatio = 0.08
+minHoldFrames = fps × 0.5秒
+```
+
+ダンス・トーク動画で頭が切れず、上半身が自然なヘッドルームで収まる。
+
+---
+
+## VideoExportSettings
+
+| 設定 | 選択肢 |
+|---|---|
+| Resolution | `720p` (720×1280) / `1080p` (1080×1920) |
+| FrameRate | `24` / `29.97 DF` / `30` / `60` fps |
+| EncodingMode | `VBR` / `CBR`（フレーム順序固定＋最大1フレームIフレーム） / `ABR` |
+| Bitrate | 任意 Mbps |
+
+---
+
+## SmartFramingSettings
+
+| 設定 | 説明 |
+|---|---|
+| enabled | スマートフレーミングON/OFF |
+| smoothness | **Fast** (followFactor=0.12) / **Normal** (0.06) / **Slow** (0.03) |
+
+---
+
+## 注意事項
+
+- スマートフレーミングONの場合、第1パスで全フレームをスキャンするため変換時間が増加する。
+- サンドボックス有効のため、ユーザーが選択したファイルのみアクセス可能。
+- Liquid Glass UI（`.glassEffect()`）は Xcode 26 / macOS 26 以降で利用可能。現在は `.ultraThinMaterial` + グラデーション背景で代替（コード内に `// TODO: Xcode 26+` コメントあり）。
+
+---
+
+## ライセンス
+
+このプロジェクトは教育・研究目的で作成されています。
+
 
 ## 機能
 

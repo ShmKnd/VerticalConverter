@@ -3,10 +3,169 @@
 //  VerticalConverter
 //
 //  動画全体を事前解析してフレームごとのカメラオフセットを計算する（2パス処理）
+//  人物追跡: IOUベーストラッキング → 寿命・速度による主役推定
 //
 
 import AVFoundation
 import Vision
+
+// MARK: - Data Types
+
+/// 1フレームにおける1人分の生検出結果（Vision正規化座標）
+private struct RawPerson {
+    var x: CGFloat          // 上半身中心 X（0=左, 1=右）
+    var y: CGFloat          // 上半身中心 Y（0=下, 1=上）
+    var w: CGFloat          // バウンディング幅（IOUマッチング用）
+    var h: CGFloat          // バウンディング高さ
+    var confidence: CGFloat
+}
+
+/// IOUトラッカーが管理する個人の追跡状態
+private struct TrackedPerson {
+    let id: Int
+    var x, y, w, h: CGFloat
+    var confidence: CGFloat
+    var lifespan: Int           // 検出成功フレーム数の累計
+    var missedFrames: Int       // 連続未検出フレーム数
+    var velocities: [CGFloat]   // 直近の移動量（正規化座標/検出間隔）
+    var lastX: CGFloat?         // 前フレームの中心X（速度計算用）
+
+    var avgVelocity: CGFloat {
+        guard !velocities.isEmpty else { return 0 }
+        return velocities.reduce(0, +) / CGFloat(velocities.count)
+    }
+}
+
+// MARK: - Person Tracker
+
+/// IOUベースのシンプルなパーソントラッカー
+/// 各人物に寿命・速度を蓄積し「主役らしさ」スコアを提供する
+private final class PersonTracker {
+    private var tracked: [TrackedPerson] = []
+    private var nextID: Int = 0
+    private let iouThreshold: CGFloat = 0.20
+    private let maxMissed: Int = 5          // 連続5検出間隔（≈40フレーム）で削除
+    private let maxVelocityHistory: Int = 6
+
+    /// fps × 1.5秒 = 主役と判定するのに必要な最低寿命フレーム数
+    var lifespanTarget: CGFloat = 45
+
+    /// 検出フレームごとに呼び出す。追跡状態を更新し、加重中心点を返す。
+    /// - Returns: 主役推定済みの加重 (x, y)、全員消えた場合は nil
+    func update(with rawPersons: [RawPerson]) -> CGPoint? {
+        if rawPersons.isEmpty {
+            // 全員未検出: missedFrames を増加させてタイムアウト削除
+            for i in tracked.indices {
+                tracked[i].missedFrames += 1
+            }
+            tracked.removeAll { $0.missedFrames > maxMissed }
+            return nil
+        }
+
+        // ── IOU グリーディマッチング ──
+        var matched = Set<Int>()        // rawPersons のindex
+        var updatedTracked: [TrackedPerson] = []
+
+        for var tp in tracked {
+            // このトラックに最もIOUが高い未マッチ検出を探す
+            var bestIOU: CGFloat = iouThreshold
+            var bestIdx: Int = -1
+            for (ri, rp) in rawPersons.enumerated() where !matched.contains(ri) {
+                let score = iou(tp, rp)
+                if score > bestIOU { bestIOU = score; bestIdx = ri }
+            }
+
+            if bestIdx >= 0 {
+                let rp = rawPersons[bestIdx]
+                matched.insert(bestIdx)
+
+                // 速度を記録（前フレームとのX距離）
+                let vel: CGFloat
+                if let lx = tp.lastX {
+                    vel = abs(rp.x - lx)
+                } else {
+                    vel = 0
+                }
+                var newVels = tp.velocities + [vel]
+                if newVels.count > maxVelocityHistory { newVels.removeFirst() }
+
+                tp.x = rp.x; tp.y = rp.y; tp.w = rp.w; tp.h = rp.h
+                tp.confidence = rp.confidence
+                tp.lifespan += 1
+                tp.missedFrames = 0
+                tp.velocities = newVels
+                tp.lastX = rp.x
+                updatedTracked.append(tp)
+            } else {
+                tp.missedFrames += 1
+                if tp.missedFrames <= maxMissed { updatedTracked.append(tp) }
+            }
+        }
+
+        // 未マッチの検出 → 新規トラック
+        for (ri, rp) in rawPersons.enumerated() where !matched.contains(ri) {
+            updatedTracked.append(TrackedPerson(
+                id: nextID, x: rp.x, y: rp.y, w: rp.w, h: rp.h,
+                confidence: rp.confidence, lifespan: 1, missedFrames: 0,
+                velocities: [], lastX: rp.x
+            ))
+            nextID += 1
+        }
+
+        tracked = updatedTracked
+
+        // ── 主役スコアで加重平均 ──
+        return weightedCenter()
+    }
+
+    // MARK: - Score & Center
+
+    private func weightedCenter() -> CGPoint? {
+        let active = tracked.filter { $0.missedFrames == 0 }
+        guard !active.isEmpty else { return nil }
+
+        var totalW: CGFloat = 0
+        var wx: CGFloat = 0
+        var wy: CGFloat = 0
+
+        for tp in active {
+            let w = subjectScore(tp)
+            wx += tp.x * w
+            wy += tp.y * w
+            totalW += w
+        }
+        guard totalW > 0 else { return nil }
+        return CGPoint(x: wx / totalW, y: wy / totalW)
+    }
+
+    /// 人物ごとの「主役らしさ」スコア
+    ///   = confidence × centrality × lifespanWeight × motionWeight
+    private func subjectScore(_ tp: TrackedPerson) -> CGFloat {
+        // 寿命重み: 1.5秒以上存在すれば 1.0
+        let lifespanWeight = min(1.0, CGFloat(tp.lifespan) / lifespanTarget)
+        // 速度重み: 速い人物（通過者）は減衰
+        let motionWeight = 1.0 / (1.0 + tp.avgVelocity * 6.0)
+        // 中央近傍: 画面端は減衰
+        let centrality = max(0.2, 1.0 - abs(tp.x - 0.5) * 1.6)
+        return tp.confidence * centrality * lifespanWeight * motionWeight
+    }
+
+    // MARK: - IOU Helper
+
+    private func iou(_ a: TrackedPerson, _ b: RawPerson) -> CGFloat {
+        let ax1 = a.x - a.w/2, ax2 = a.x + a.w/2
+        let ay1 = a.y - a.h/2, ay2 = a.y + a.h/2
+        let bx1 = b.x - b.w/2, bx2 = b.x + b.w/2
+        let by1 = b.y - b.h/2, by2 = b.y + b.h/2
+        let iw = max(0, min(ax2, bx2) - max(ax1, bx1))
+        let ih = max(0, min(ay2, by2) - max(ay1, by1))
+        let inter = iw * ih
+        let union = a.w*a.h + b.w*b.h - inter
+        return union > 0 ? inter / union : 0
+    }
+}
+
+// MARK: - SmartFramingAnalyzer
 
 struct SmartFramingAnalyzer {
 
@@ -31,7 +190,6 @@ struct SmartFramingAnalyzer {
         let totalFrames = max(1, Int(ceil(duration.seconds * Double(fps))))
 
         // ① fps依存のガウシアン sigma（≈ 0.4秒分の平滑化半径）
-        //   30fps → sigma=12, 60fps → sigma=24, 24fps → sigma=9.6
         let sigma = Double(fps) * 0.4
 
         // スケール（Y方向ズーム込み）
@@ -41,15 +199,16 @@ struct SmartFramingAnalyzer {
         let scaledHeight = inputSize.height * scale
 
         let minOffsetX    = -(scaledWidth  - outputSize.width)
-        let minOffsetY    = -(scaledHeight - outputSize.height)   // 負値（上シフト上限）
+        let minOffsetY    = -(scaledHeight - outputSize.height)
         let centerOffsetX = minOffsetX / 2
-        let centerOffsetY = minOffsetY / 2                         // 上下中央を初期位置
+        let centerOffsetY = minOffsetY / 2
 
-        // Step 1: 全フレームをスキャンして人物 XY 座標を取得（③ 適応的間隔）
+        // Step 1: 全フレームをスキャン（IOUトラッキング + 主役推定）
         let rawPositions = try await detectAllPositions(
             asset: asset,
             videoTrack: videoTrack,
             totalFrames: totalFrames,
+            fps: Double(fps),
             progressHandler: { progressHandler($0 * 0.85) }
         )
 
@@ -57,7 +216,7 @@ struct SmartFramingAnalyzer {
         let rawX = rawPositions.map { $0.map { $0.x } }
         let rawY = rawPositions.map { $0.map { $0.y } }
         let interpX = interpolate(rawX, fallback: 0.5)
-        let interpY = interpolate(rawY, fallback: 0.72)   // 未検出時は上から28%付近
+        let interpY = interpolate(rawY, fallback: 0.72)
 
         // Step 3: 双方向ガウシアンスムージング（fps依存 sigma）
         let smoothedX = gaussianSmooth(interpX, sigma: sigma)
@@ -71,22 +230,21 @@ struct SmartFramingAnalyzer {
             renderDimension: outputSize.width,
             minOffset: minOffsetX,
             centerOffset: centerOffsetX,
-            targetRatio: 0.5,          // X: 画面中央に被写体
+            targetRatio: 0.5,
             deadZoneRatio: 0.25,
             minHoldFrames: minHoldFrames,
             followFactor: followFactor
         )
 
         // Step 4Y: Y方向 ホールド＆フォロー（0.5秒ホールド、ヘッドルーム優先）
-        //   headroomTarget=0.80 → 上から20%のヘッドルームを確保して上半身を配置
         let offsetsY = holdAndFollow(
             smoothedY,
             scaledDimension: scaledHeight,
             renderDimension: outputSize.height,
             minOffset: minOffsetY,
             centerOffset: centerOffsetY,
-            targetRatio: 0.80,         // Y: 上から20%ヘッドルーム
-            deadZoneRatio: 0.08,       // 狭いデッドゾーン（Yは細かく追従）
+            targetRatio: 0.80,
+            deadZoneRatio: 0.08,
             minHoldFrames: max(1, Int(0.5 * Double(fps))),
             followFactor: followFactor * 1.5
         )
@@ -95,17 +253,23 @@ struct SmartFramingAnalyzer {
         return zip(offsetsX, offsetsY).map { CGPoint(x: $0, y: $1) }
     }
 
-    // MARK: - Step 1: Vision 検出（③ 適応的間隔）
+    // MARK: - Step 1: IOUトラッキング付きフレームスキャン
 
     private func detectAllPositions(
         asset: AVAsset,
         videoTrack: AVAssetTrack,
         totalFrames: Int,
+        fps: Double,
         progressHandler: @escaping (Double) -> Void
     ) async throws -> [CGPoint?] {
         var result = [CGPoint?](repeating: nil, count: totalFrames)
-        var detectionInterval = 8      // ③ 適応的間隔: 初期8、激しい動きで4に短縮
-        var lastDetectedPos: CGPoint? = nil
+
+        let tracker = PersonTracker()
+        tracker.lifespanTarget = CGFloat(fps * 1.5)     // 1.5秒で主役と判定
+
+        // ③ 適応的検出間隔: 動き大 → 4フレーム毎、安定 → 8フレーム毎
+        var detectionInterval = 8
+        var lastWeightedCenter: CGPoint? = nil
 
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: [
@@ -126,15 +290,17 @@ struct SmartFramingAnalyzer {
             if frameIndex % detectionInterval == 0,
                frameIndex < totalFrames,
                let pixelBuffer = CMSampleBufferGetImageBuffer(sample) {
-                if let detected = detectPersonXY(in: pixelBuffer) {
-                    // ③ 動き量が大きい場合は間隔を短縮（0.12以上の偏差で激しい動きと判定）
-                    if let last = lastDetectedPos {
-                        let deviation = hypot(detected.x - last.x, detected.y - last.y)
-                        detectionInterval = deviation > 0.12 ? 4 : 8
-                    }
-                    result[frameIndex] = detected
-                    lastDetectedPos = detected
+
+                let rawPersons = detectRawPersons(in: pixelBuffer)
+                let center = tracker.update(with: rawPersons)
+                result[frameIndex] = center
+
+                // 適応的間隔: 前回中心との差が大きければ短縮
+                if let c = center, let lc = lastWeightedCenter {
+                    let deviation = hypot(c.x - lc.x, c.y - lc.y)
+                    detectionInterval = deviation > 0.10 ? 4 : 8
                 }
+                lastWeightedCenter = center
             }
 
             frameIndex += 1
@@ -146,53 +312,48 @@ struct SmartFramingAnalyzer {
         return result
     }
 
-    /// ② 複数人物を信頼度・画面中央近傍・面積で重み付き平均して代表 XY を返す。
-    /// Vision 座標系: x=0左/1右, y=0下/1上
-    private func detectPersonXY(in pixelBuffer: CVPixelBuffer) -> CGPoint? {
+    /// 1フレームから全ての人物を検出して返す（トラッカーに渡す生データ）
+    private func detectRawPersons(in pixelBuffer: CVPixelBuffer) -> [RawPerson] {
         let bodyRequest = VNDetectHumanBodyPoseRequest()
         let faceRequest = VNDetectFaceRectanglesRequest()
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
-        do { try handler.perform([bodyRequest, faceRequest]) } catch { return nil }
+        do { try handler.perform([bodyRequest, faceRequest]) } catch { return [] }
 
-        struct Candidate { var x, y, weight: CGFloat }
-        var candidates: [Candidate] = []
+        var persons: [RawPerson] = []
 
-        // ① 人体ポーズ優先: 上半身キーポイントの加重平均 ×（信頼度 × 中央近傍度）
+        // 人体ポーズ（優先）: 上半身キーポイントから中心・バウンディングを算出
         if let bodyResults = bodyRequest.results, !bodyResults.isEmpty {
             for obs in bodyResults {
-                guard let points = try? obs.recognizedPoints(.all) else { continue }
-                let upper = [points[.neck], points[.leftShoulder],
-                             points[.rightShoulder], points[.nose],
-                             points[.leftEar], points[.rightEar]]
-                    .compactMap { $0 }.filter { $0.confidence > 0.3 }
+                guard let pts = try? obs.recognizedPoints(.all) else { continue }
+                let upper = [pts[.neck], pts[.leftShoulder], pts[.rightShoulder],
+                             pts[.nose], pts[.leftEar], pts[.rightEar],
+                             pts[.leftWrist], pts[.rightWrist]]
+                    .compactMap { $0 }.filter { $0.confidence > 0.25 }
                 guard !upper.isEmpty else { continue }
+                let xs = upper.map { $0.location.x }
+                let ys = upper.map { $0.location.y }
+                let cx = xs.reduce(0, +) / CGFloat(xs.count)
+                let cy = ys.reduce(0, +) / CGFloat(ys.count)
+                let bw = (xs.max()! - xs.min()!) + 0.05   // 少し余裕を持たせる
+                let bh = (ys.max()! - ys.min()!) + 0.05
                 let avgConf = upper.map { CGFloat($0.confidence) }.reduce(0, +) / CGFloat(upper.count)
-                let avgX = upper.map { $0.location.x }.reduce(0, +) / CGFloat(upper.count)
-                let avgY = upper.map { $0.location.y }.reduce(0, +) / CGFloat(upper.count)
-                // 中央近傍ほど高重み（中央から遠いほど減衰）
-                let centerWeight = max(0.2, 1.0 - abs(avgX - 0.5) * 1.6)
-                candidates.append(Candidate(x: avgX, y: avgY, weight: avgConf * centerWeight))
+                persons.append(RawPerson(x: cx, y: cy, w: bw, h: bh, confidence: avgConf))
             }
         }
 
-        // ② 顔検出フォールバック: 面積 × 中央近傍度で重み付け
-        if candidates.isEmpty, let faces = faceRequest.results, !faces.isEmpty {
+        // 顔検出（ボディが1件も取れなかった場合のフォールバック）
+        if persons.isEmpty, let faces = faceRequest.results, !faces.isEmpty {
             for face in faces {
                 let bb = face.boundingBox
-                let area = bb.width * bb.height
-                let centerWeight = max(0.2, 1.0 - abs(bb.midX - 0.5) * 1.6)
-                candidates.append(Candidate(x: bb.midX, y: bb.midY, weight: area * centerWeight))
+                persons.append(RawPerson(
+                    x: bb.midX, y: bb.midY,
+                    w: bb.width, h: bb.height,
+                    confidence: CGFloat(face.confidence)
+                ))
             }
         }
 
-        guard !candidates.isEmpty else { return nil }
-
-        // 重み付き平均
-        let totalW = candidates.map(\.weight).reduce(0, +)
-        guard totalW > 0 else { return nil }
-        let wx = candidates.map { $0.x * $0.weight }.reduce(0, +) / totalW
-        let wy = candidates.map { $0.y * $0.weight }.reduce(0, +) / totalW
-        return CGPoint(x: wx, y: wy)
+        return persons
     }
 
     // MARK: - Step 2: 線形補間
@@ -262,7 +423,6 @@ struct SmartFramingAnalyzer {
     // MARK: - Step 4: 汎用 ホールド＆フォロー
 
     /// - targetRatio: 被写体をレンダーフレーム内のどの位置（下から何割）に置くか
-    ///   X軸 = 0.5（中央）, Y軸 = 0.80（上から20%のヘッドルーム）
     private func holdAndFollow(
         _ positions: [CGFloat],
         scaledDimension: CGFloat,
@@ -281,9 +441,7 @@ struct SmartFramingAnalyzer {
         var isFollowing  = false
 
         for i in 0..<positions.count {
-            // Vision 正規化座標 → スケール済みピクセル座標（CIImage: 0=下）
             let personPos    = positions[i] * scaledDimension
-            // 被写体を targetRatio の位置に置くオフセット
             let targetOffset = max(minOffset, min(0, renderDimension * targetRatio - personPos))
             let deviation    = abs(targetOffset - cameraOffset)
             let holdElapsed  = i - settledFrame
