@@ -25,6 +25,9 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     private var frameCount: Int = 0
     private let detectionInterval: Int = 8          // 何フレームごとに検出するか
     private var lastDetectedNormalizedX: CGFloat? = nil
+    private var consecutiveMissCount: Int = 0
+    private let missThreshold: Int = 5              // 何回連続で未検出なら「いない」と判断するか（8フレーム×5=約40フレーム≒1.3秒）
+    private var isFirstSmartFrame: Bool = true      // 初回フレーム判定
     
     override init() {
         ciContext = CIContext(options: [
@@ -193,18 +196,28 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
 
         // 一定フレーム間隔でのみVision検出を実行（重い処理を間引く）
         frameCount += 1
-        if frameCount % detectionInterval == 0 {
+        if frameCount % detectionInterval == 0 || frameCount == 1 {
             detectPersonNormalizedX(in: sourcePixelBuffer)
         }
 
         // 検出値からrawTargetを計算
         let minOffsetX = -(scaledWidth - renderSize.width)
+
+        // 初回フレーム: 全オフセットを中央に初期化（左端スタートを防ぐ）
+        if isFirstSmartFrame {
+            isFirstSmartFrame = false
+            let centerOffset = minOffsetX / 2
+            rawTargetOffsetX = centerOffset
+            smoothedTargetOffsetX = centerOffset
+            currentOffsetX = centerOffset
+        }
         if let normalizedX = lastDetectedNormalizedX {
             let personX = normalizedX * scaledWidth
             let desired = renderSize.width / 2 - personX
             rawTargetOffsetX = max(minOffsetX, min(0, desired))
         } else {
-            rawTargetOffsetX = minOffsetX / 2
+            // 人物が長時間いない場合のみ中央へ（非常にゆっくり）
+            rawTargetOffsetX = rawTargetOffsetX + (minOffsetX / 2 - rawTargetOffsetX) * 0.002
         }
 
         // ターゲット自体をゆっくり動かす（検出間隔のジャンプを滑らかに）
@@ -253,16 +266,31 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             }
         }
 
-        guard !allPersonsX.isEmpty else { return }
+        guard !allPersonsX.isEmpty else {
+            // 未検出: ミスカウンター増加。閾値を超えたら lastDetected をリセット
+            consecutiveMissCount += 1
+            if consecutiveMissCount >= missThreshold {
+                lastDetectedNormalizedX = nil
+            }
+            return
+        }
 
+        // 検出成功: ミスカウンターをリセット
+        consecutiveMissCount = 0
+        let detectedX: CGFloat
         if allPersonsX.count == 1 {
-            // 1人: そのままの位置
-            lastDetectedNormalizedX = allPersonsX[0]
+            detectedX = allPersonsX[0]
         } else {
             // 複数人: 全員を包むバウンディングボックスの中心を使用
             let minX = allPersonsX.min()!
             let maxX = allPersonsX.max()!
-            lastDetectedNormalizedX = (minX + maxX) / 2
+            detectedX = (minX + maxX) / 2
+        }
+        // Visionのノイズを抑えるため検出値自体もローパスフィルター（新値50%ブレンド）
+        if let existing = lastDetectedNormalizedX {
+            lastDetectedNormalizedX = existing + (detectedX - existing) * 0.5
+        } else {
+            lastDetectedNormalizedX = detectedX
         }
     }
 
