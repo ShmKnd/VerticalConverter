@@ -12,6 +12,20 @@ import VideoToolbox
 import Vision
 
 class VerticalVideoCompositor: NSObject, AVVideoCompositing {
+    // ── Static configuration ──
+    // Set by VideoProcessor BEFORE customVideoCompositorClass is assigned.
+    // AVFoundation queries sourcePixelBufferAttributes and
+    // requiredPixelBufferAttributesForRenderContext immediately after init(),
+    // before any startRequest(), so instance variables cannot carry this in time.
+    static var staticHDRConversionEnabled: Bool = false
+    /// Whether the source video is HDR (used to decide source pixel format)
+    static var staticSourceIsHDR: Bool = false
+    /// Transfer function string detected from source (e.g. "SMPTE_ST_2084_PQ")
+    static var staticTransferFunction: String = ""
+    /// Color primaries string detected from source (e.g. "ITU_R_2020")
+    static var staticColorPrimaries: String = ""
+    /// YCbCr matrix string detected from source
+    static var staticYCbCrMatrix: String = ""
     private let renderQueue = DispatchQueue(label: "com.verticalconverter.renderqueue")
     private var renderContext: AVVideoCompositionRenderContext?
     private let ciContext: CIContext
@@ -45,32 +59,143 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     }
     
     var sourcePixelBufferAttributes: [String : Any]? {
-        // Accept both 64RGBAHalf (for HDR passthrough) and 32BGRA (SDR fallback).
-        // AVFoundation will prefer the first matching format it can provide.
-        return [
-            kCVPixelBufferPixelFormatTypeKey as String: [
-                kCVPixelFormatType_64RGBAHalf,
-                kCVPixelFormatType_32BGRA
-            ] as [OSType],
-            kCVPixelBufferOpenGLCompatibilityKey as String: true
-        ]
+        // For HDR source (passthrough OR →SDR), always request 64RGBAHalf
+        // to preserve the full dynamic range for compositing.
+        // For SDR, 32BGRA is sufficient and more efficient.
+        // Using a single format ensures AVFoundation delivers a consistent
+        // pixel format across ALL frames (including frame 0).
+        if VerticalVideoCompositor.staticSourceIsHDR {
+            return [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_64RGBAHalf,
+                kCVPixelBufferOpenGLCompatibilityKey as String: true
+            ]
+        } else {
+            return [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferOpenGLCompatibilityKey as String: true
+            ]
+        }
     }
     
     var requiredPixelBufferAttributesForRenderContext: [String : Any] {
-        // Use 64RGBAHalf so the render output buffer can hold HDR values (>1.0)
-        // without clipping. CIContext renders to this format correctly.
-        return [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_64RGBAHalf,
-            kCVPixelBufferOpenGLCompatibilityKey as String: true
-        ]
+        // AVFoundation queries this ONCE at compositor init, before any frame
+        // arrives. We read the static properties (set by VideoProcessor before
+        // the compositor is created) so the render buffer pool gets the correct
+        // format.
+        //
+        // CRITICAL: This format MUST match the reader output's
+        // preferredPixelFormat set in VideoProcessor.exportVideo().
+        // Any mismatch forces AVFoundation to perform implicit format
+        // conversion between compositor output and reader output, which may
+        // initialize lazily and cause frame-0 gamma/color inconsistency.
+        //
+        //  • HDR passthrough → 64RGBAHalf (preserve HDR values)
+        //  • HDR→SDR         → 32BGRA (SDR output)
+        //  • SDR             → 32BGRA (SDR output)
+        let isHDRPassthrough = VerticalVideoCompositor.staticSourceIsHDR
+            && !VerticalVideoCompositor.staticHDRConversionEnabled
+        if isHDRPassthrough {
+            return [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_64RGBAHalf,
+                kCVPixelBufferOpenGLCompatibilityKey as String: true
+            ]
+        } else {
+            return [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferOpenGLCompatibilityKey as String: true
+            ]
+        }
     }
     
     func renderContextChanged(_ newRenderContext: AVVideoCompositionRenderContext) {
         renderQueue.sync {
             renderContext = newRenderContext
+            primeCIContext(renderSize: newRenderContext.size)
         }
     }
-    
+
+    /// Production `ciContext` を frame 0 到着前に完全に初期化する。
+    ///
+    /// WarmupContext 分離では不十分だった理由：
+    /// `CIContext` の Metal シェーダーキャッシュは同じ `MTLDevice` を共有するので
+    /// 別 Context でコンパイルされたシェーダー自体は共有される。
+    /// しかし **Metal コマンドバッファ・テクスチャキャッシュ・IOSurface backing** など
+    /// ciContext 固有の内部状態は共有されない。
+    /// これが frame 0 でのみ色変換の挙動が変わる直接原因。
+    ///
+    /// 解決策：本番 ciContext で本番 composeFrame を完全に通す。
+    /// dummy バッファへの書き込みなので出力は捨てる。
+    private func primeCIContext(renderSize: CGSize) {
+        let isHDRPassthrough = VerticalVideoCompositor.staticSourceIsHDR
+            && !VerticalVideoCompositor.staticHDRConversionEnabled
+        let outputFormat: OSType = isHDRPassthrough
+            ? kCVPixelFormatType_64RGBAHalf
+            : kCVPixelFormatType_32BGRA
+        let srcFormat: OSType = VerticalVideoCompositor.staticSourceIsHDR
+            ? kCVPixelFormatType_64RGBAHalf
+            : kCVPixelFormatType_32BGRA
+
+        let width = Int(renderSize.width)
+        let height = Int(renderSize.height)
+
+        var dummyOut: CVPixelBuffer?
+        var dummySrc: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, width, height, outputFormat, nil, &dummyOut)
+        CVPixelBufferCreate(kCFAllocatorDefault, width, height, srcFormat, nil, &dummySrc)
+        guard let outBuf = dummyOut, let srcBuf = dummySrc else { return }
+
+        // instance variables のバックアップ（prime 後に復元）
+        let savedHDR = hdrConversionEnabled
+        let savedTarget = hdrTarget
+        let savedSmart = smartFramingEnabled
+
+        // prime 時は本番の設定を使う（static から派生）
+        hdrConversionEnabled = VerticalVideoCompositor.staticHDRConversionEnabled
+        hdrTarget = .sRGB
+        smartFramingEnabled = false   // letterbox パスを強制（Vision 不要）
+
+        // 本番 ciContext で本番 composeFrame を完全に通す。
+        // これにより Metal コマンドバッファ・テクスチャキャッシュが
+        // frame 0 と同じ条件で初期化される。
+        composeFrame(
+            sourcePixelBuffer: srcBuf,
+            outputPixelBuffer: outBuf,
+            renderSize: renderSize
+        )
+
+        // instance variables を復元
+        hdrConversionEnabled = savedHDR
+        hdrTarget = savedTarget
+        smartFramingEnabled = savedSmart
+        // outBuf / srcBuf の内容は破棄される
+    }
+
+    // MARK: - Source color space resolution
+
+    /// Return the correct CGColorSpace for HDR source buffers.
+    /// Uses ONLY the static metadata detected from the track's format description.
+    /// NEVER depend on per-frame CVBuffer properties because some decoders
+    /// deliver frame 0 without correct color metadata, causing frame-to-frame
+    /// color space inconsistency (the root cause of the 1-frame gamma bug).
+    private static func resolvedHDRSourceColorSpace() -> CGColorSpace {
+        let pLower = staticColorPrimaries.lowercased()
+
+        // 64RGBAHalf from the decoder is LINEAR light.
+        // Use the extendedLinear variant of the source gamut.
+        if pLower.contains("2020") {
+            if let cs = CGColorSpace(name: CGColorSpace.extendedLinearITUR_2020) {
+                return cs
+            }
+        } else if pLower.contains("p3") {
+            if let cs = CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3) {
+                return cs
+            }
+        }
+        // Fallback: extendedLinearSRGB
+        return CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
+            ?? CGColorSpaceCreateDeviceRGB()
+    }
+
     func startRequest(_ asyncVideoCompositionRequest: AVAsynchronousVideoCompositionRequest) {
         renderQueue.async { [weak self] in
             guard let self = self else {
@@ -131,7 +256,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
                 removePending()
                 return
             }
-            
+
             // 出力バッファを作成
             guard let renderContext = self.renderContext,
                   let outputPixelBuffer = renderContext.newPixelBuffer() else {
@@ -161,7 +286,30 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         outputPixelBuffer: CVPixelBuffer,
         renderSize: CGSize
     ) {
-        let sourceImage = CIImage(cvPixelBuffer: sourcePixelBuffer)
+        // ── Source color space determination ──
+        // CRITICAL: For HDR sources, ALWAYS use the color space resolved from
+        // static metadata (track format description). NEVER rely on per-frame
+        // CVImageBufferGetColorSpace() because some decoders do NOT attach
+        // correct color metadata to frame 0. This inconsistency (frame 0 gets
+        // Rec.709/nil, frame 1+ gets BT.2020) is the root cause of the
+        // "first frame gamma mismatch" bug.
+        let sourceColorSpace: CGColorSpace
+        if VerticalVideoCompositor.staticSourceIsHDR {
+            // Same color space for ALL HDR frames — both passthrough and →SDR.
+            sourceColorSpace = Self.resolvedHDRSourceColorSpace()
+        } else {
+            // SDR: Use sRGB consistently for ALL frames.
+            // DO NOT use per-buffer CVImageBufferGetColorSpace — frame 0 may
+            // return nil (falling back to itur_709), while frame 1+ may return
+            // sRGB. itur_709 and sRGB have subtly different gamma curves (pure
+            // power vs piecewise-linear), so mixing them through the
+            // extendedLinearSRGB working space produces a visible contrast
+            // difference on frame 0.
+            sourceColorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+                ?? CGColorSpaceCreateDeviceRGB()
+        }
+        let sourceImage = CIImage(cvPixelBuffer: sourcePixelBuffer,
+                                  options: [.colorSpace: sourceColorSpace])
         let sourceSize = sourceImage.extent.size
         let outputRect = CGRect(origin: .zero, size: renderSize)
 
@@ -187,15 +335,21 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
 
         if hdrConversionEnabled {
             // HDR->SDR: CoreImage color space conversion handles the EOTF mapping
-            // during the render call below. Mark output buffer as Rec.709 / sRGB.
+            // during the render call below. Mark output buffer with the correct
+            // transfer function for the selected target.
             let primariesStr = NSString(string: "ITU_R_709_2")
-            let transferStr = NSString(string: "ITU_R_709_2")
-            let matrixStr = NSString(string: "ITU_R_709_2")
+            let matrixStr    = NSString(string: "ITU_R_709_2")
+            // sRGB uses the IEC 61966-2.1 piecewise gamma;
+            // Rec.709 uses the pure power curve.
+            let transferStr: NSString = (hdrTarget == .sRGB)
+                ? (kCVImageBufferTransferFunction_sRGB as NSString)
+                : (kCVImageBufferTransferFunction_ITU_R_709_2 as NSString)
             CVBufferSetAttachment(outputPixelBuffer, kCVImageBufferColorPrimariesKey as CFString, primariesStr, .shouldPropagate)
             CVBufferSetAttachment(outputPixelBuffer, kCVImageBufferTransferFunctionKey as CFString, transferStr, .shouldPropagate)
             CVBufferSetAttachment(outputPixelBuffer, kCVImageBufferYCbCrMatrixKey as CFString, matrixStr, .shouldPropagate)
         } else {
-            // Preserve HDR metadata: copy color attachments from source to output when present
+            // Preserve HDR/SDR metadata on the output buffer.
+            // First try to copy from the source buffer's attachments.
             let attachKeys: [CFString] = [
                 kCVImageBufferColorPrimariesKey as CFString,
                 kCVImageBufferTransferFunctionKey as CFString,
@@ -211,28 +365,52 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
                 if let dict = any as? [AnyHashable: Any] { return dict as NSDictionary }
                 if let arr = any as? NSArray { return arr }
                 if let arr = any as? [Any] { return arr as NSArray }
-                // As a last resort, attach a string description to avoid passing
-                // Swift-only boxed values into CoreVideo/IOSurface.
                 return NSString(string: String(describing: any))
             }
 
+            var copiedTransfer = false
             for key in attachKeys {
                 if let val = CVBufferGetAttachment(sourcePixelBuffer, key, nil) {
                     if let cf = makeCFCompatible(val) {
                         CVBufferSetAttachment(outputPixelBuffer, key, cf, .shouldPropagate)
+                        if key == kCVImageBufferTransferFunctionKey as CFString {
+                            copiedTransfer = true
+                        }
                     }
+                }
+            }
+
+            // If the source buffer lacked color attachments (common on frame 0
+            // from certain decoders), fall back to the static metadata so the
+            // output buffer is ALWAYS correctly tagged.
+            if !copiedTransfer && VerticalVideoCompositor.staticSourceIsHDR {
+                let tf = VerticalVideoCompositor.staticTransferFunction
+                let pr = VerticalVideoCompositor.staticColorPrimaries
+                let mx = VerticalVideoCompositor.staticYCbCrMatrix
+                if !tf.isEmpty {
+                    CVBufferSetAttachment(outputPixelBuffer,
+                        kCVImageBufferTransferFunctionKey as CFString,
+                        tf as NSString, .shouldPropagate)
+                }
+                if !pr.isEmpty {
+                    CVBufferSetAttachment(outputPixelBuffer,
+                        kCVImageBufferColorPrimariesKey as CFString,
+                        pr as NSString, .shouldPropagate)
+                }
+                if !mx.isEmpty {
+                    CVBufferSetAttachment(outputPixelBuffer,
+                        kCVImageBufferYCbCrMatrixKey as CFString,
+                        mx as NSString, .shouldPropagate)
                 }
             }
         }
 
-        // Render: when HDR->SDR is enabled we render into the SDR color space
-        // (Rec.709 or sRGB). When preserving HDR, render without a target
-        // colorSpace so original color values are preserved and metadata
-        // describes the colorimetry.
+        // ── Render ──
+        // sourceColorSpace is ALWAYS determined from static metadata for HDR
+        // (never per-buffer), so this is perfectly consistent across all frames.
         if hdrConversionEnabled {
-            // Render to the SDR target color space. CoreImage performs the color
-            // space conversion (including EOTF linearization) from the source
-            // color space that CIImage auto-detects from the pixel buffer.
+            // HDR→SDR: CIContext converts from sourceColorSpace (e.g.
+            // extendedLinearITUR_2020) to the SDR target (sRGB/Rec.709).
             let targetCS: CGColorSpace
             switch hdrTarget {
             case .sRGB:
@@ -240,15 +418,17 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             case .rec709:
                 targetCS = CGColorSpace(name: CGColorSpace.itur_709) ?? CGColorSpaceCreateDeviceRGB()
             }
-            ciContext.render(imageToRender, to: outputPixelBuffer, bounds: imageToRender.extent, colorSpace: targetCS)
+            // bounds を outputRect（固定矩形）で指定することで、
+            // CIImage の論理 extent がフレームごとに変動しても
+            // 常に同じ領域に render される。
+            ciContext.render(imageToRender, to: outputPixelBuffer, bounds: outputRect, colorSpace: targetCS)
+        } else if VerticalVideoCompositor.staticSourceIsHDR {
+            // HDR passthrough: render to the SAME static-based HDR color space
+            // so no conversion happens. This avoids per-frame CS variation.
+            ciContext.render(imageToRender, to: outputPixelBuffer, bounds: outputRect, colorSpace: sourceColorSpace)
         } else {
-            // Passthrough: render to the source buffer's own color space so no
-            // accidental conversion takes place. Falls back to Rec.709 for
-            // untagged SDR buffers.
-            let sourceCS: CGColorSpace = CVImageBufferGetColorSpace(sourcePixelBuffer)?.takeUnretainedValue()
-                ?? CGColorSpace(name: CGColorSpace.itur_709)
-                ?? CGColorSpaceCreateDeviceRGB()
-            ciContext.render(imageToRender, to: outputPixelBuffer, bounds: imageToRender.extent, colorSpace: sourceCS)
+            // SDR passthrough: render to sRGB (fixed, consistent across all frames).
+            ciContext.render(imageToRender, to: outputPixelBuffer, bounds: outputRect, colorSpace: sourceColorSpace)
         }
     }
 
@@ -272,6 +452,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             let mainVideo = sourceImage
                 .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
                 .transformed(by: CGAffineTransform(translationX: mainX, y: mainY))
+                .cropped(to: outputRect)  // extent を outputRect に揃える
 
             let bgScale = renderSize.height / sourceSize.height
             let bgWidth = sourceSize.width * bgScale
@@ -377,10 +558,15 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             detectPersonNormalizedX(in: sourcePixelBuffer)
         }
 
-        // 初回フレーム: 中央に初期化
+        // 初回フレーム: 中央に初期化（Vision 未検出のまま走る場合も安全な中央値を確定させる）
         if isFirstSmartFrame {
             isFirstSmartFrame = false
-            currentOffsetX = minOffsetX / 2
+            // True center: half of the negative total excess width.
+            currentOffsetX = -(scaledWidth - renderSize.width) / 2
+            if lastDetectedNormalizedX == nil {
+                // No person detected yet — stay dead-center rather than drifting.
+                currentOffsetX = -(scaledWidth - renderSize.width) / 2
+            }
         }
 
         // カットベース: 人物がコンフォートゾーンを外れたときだけスナップ

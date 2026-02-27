@@ -303,6 +303,20 @@ actor VideoProcessor {
         videoComposition.frameDuration = frameDuration
         
         // カスタムコンポジターを使用
+        // Detect HDR characteristics from the composition track's format description
+        // so we can configure the compositor's static properties BEFORE it's instantiated.
+        let (isHDR, detTransfer, detPrimaries, detMatrix) =
+            VideoProcessor.detectHDRInfo(from: composition)
+        
+        // Set ALL static configuration BEFORE assigning customVideoCompositorClass.
+        // AVFoundation queries sourcePixelBufferAttributes and
+        // requiredPixelBufferAttributesForRenderContext immediately after init(),
+        // before any startRequest() call.
+        VerticalVideoCompositor.staticSourceIsHDR = isHDR
+        VerticalVideoCompositor.staticHDRConversionEnabled = hdrConversionEnabled
+        VerticalVideoCompositor.staticTransferFunction = detTransfer
+        VerticalVideoCompositor.staticColorPrimaries = detPrimaries
+        VerticalVideoCompositor.staticYCbCrMatrix = detMatrix
         videoComposition.customVideoCompositorClass = VerticalVideoCompositor.self
         
         let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: compositionVideoTrack)
@@ -371,19 +385,28 @@ actor VideoProcessor {
 
         let renderSize = videoComposition.renderSize
 
-        // Determine whether composition requests HDR->SDR conversion.
+        // Determine whether composition requests HDR->SDR conversion and the target color space.
         let hdrConversionRequested = (videoComposition.instructions.first as? CustomVideoCompositionInstruction)?.hdrConversionEnabled ?? false
+        let hdrTarget = (videoComposition.instructions.first as? CustomVideoCompositionInstruction)?.hdrTarget ?? .sRGB
 
         // Detect input HDR characteristics from the composition track's format description.
         let (isHDRInput, detectedTransfer, detectedPrimaries, detectedMatrix) =
             VideoProcessor.detectHDRInfo(from: composition)
         NSLog("VideoProcessor: isHDRInput=\(isHDRInput) hdrConversionRequested=\(hdrConversionRequested)")
 
-        // ビデオ読み込み: カスタムVideoCompositionを適用して読む
-        // HDR素材でパススルー、かつProRes以外のとき: 64RGBAHalf（値>1.0を保持）
-        // ProResはfloat RGBAを受け付けないため、HDRでもBGRAを使用
-        // HDR→SDR変換時、またはSDR素材: 32BGRA
-        let preferredPixelFormat: OSType = (isHDRInput && !hdrConversionRequested && codec != .prores422VT)
+        // ビデオ読み込み: カスタム VideoComposition を適用して読む
+        //
+        // CRITICAL: ここで指定するフォーマットは、コンポジターの
+        // requiredPixelBufferAttributesForRenderContext が返すフォーマットと
+        // 必ず一致させること。不一致があると AVFoundation が暗黙の
+        // ピクセルフォーマット変換を行い、フレーム 0 のガンマ/色が狂う原因になる。
+        //
+        //  • HDR パススルー → 64RGBAHalf (HDR 値を保持)
+        //  • HDR→SDR       → 32BGRA (SDR 出力)
+        //  • SDR            → 32BGRA (SDR 出力)
+        // ProRes VT は float RGBA を受け付けないため HDR でも BGRA を使用
+        let isHDRPassthrough = isHDRInput && !hdrConversionRequested && codec != .prores422VT
+        let preferredPixelFormat: OSType = isHDRPassthrough
             ? kCVPixelFormatType_64RGBAHalf
             : kCVPixelFormatType_32BGRA
         let videoOutput = AVAssetReaderVideoCompositionOutput(
@@ -505,10 +528,19 @@ actor VideoProcessor {
             ]
             videoSettingsMutable[AVVideoColorPropertiesKey] = colorProps
         } else {
-            // SDR入力パススルー / HDR→SDR変換: 常にRec.709
+            // SDR input passthrough / HDR→SDR: use the target transfer function.
+            // For HDR→SDR with sRGB target use "IEC_sRGB"; otherwise Rec.709.
+            let transferFunction: String
+            if hdrConversionRequested {
+                transferFunction = (hdrTarget == .sRGB)
+                    ? (kCVImageBufferTransferFunction_sRGB as String)
+                    : AVVideoTransferFunction_ITU_R_709_2
+            } else {
+                transferFunction = AVVideoTransferFunction_ITU_R_709_2
+            }
             let colorProps: [String: Any] = [
                 AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
-                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoTransferFunctionKey: transferFunction,
                 AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
             ]
             videoSettingsMutable[AVVideoColorPropertiesKey] = colorProps
