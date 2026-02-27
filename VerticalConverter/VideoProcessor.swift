@@ -6,7 +6,7 @@
 //
 
 import Foundation
-import AVFoundation
+@preconcurrency import AVFoundation
 import CoreImage
 import VideoToolbox
 import CoreMedia
@@ -113,6 +113,50 @@ actor VideoProcessor {
         default:
             return false
         }
+    }
+
+    /// Inspect the first video track of a composition to determine whether its
+    /// content is HDR and, if so, which transfer function / primaries it uses.
+    private static func detectHDRInfo(from composition: AVMutableComposition)
+        -> (isHDR: Bool, transferFunction: String, colorPrimaries: String, ycbcrMatrix: String)
+    {
+        let sdrResult = (false,
+                         AVVideoTransferFunction_ITU_R_709_2,
+                         AVVideoColorPrimaries_ITU_R_709_2,
+                         AVVideoYCbCrMatrix_ITU_R_709_2)
+
+        guard let videoTrack = composition.tracks(withMediaType: .video).first,
+              let desc = videoTrack.formatDescriptions.first,
+              let exts = CMFormatDescriptionGetExtensions(desc as! CMFormatDescription) as? [String: Any]
+        else { return sdrResult }
+
+        let transferRaw = (exts[kCVImageBufferTransferFunctionKey as String] as? String) ?? ""
+        let primariesRaw = (exts[kCVImageBufferColorPrimariesKey as String] as? String) ?? ""
+        let matrixRaw   = (exts[kCVImageBufferYCbCrMatrixKey as String] as? String) ?? ""
+        let tLower = transferRaw.lowercased()
+
+        let isHDR = tLower.contains("2084") || tLower.contains("pq") ||
+                    tLower.contains("hlg")  || tLower.contains("st2084")
+        guard isHDR else { return sdrResult }
+
+        let transferFunction: String
+        if tLower.contains("hlg") {
+            transferFunction = AVVideoTransferFunction_ITU_R_2100_HLG
+        } else {
+            transferFunction = AVVideoTransferFunction_SMPTE_ST_2084_PQ
+        }
+
+        let pLower = primariesRaw.lowercased()
+        let primaries: String
+        if pLower.contains("2020")      { primaries = AVVideoColorPrimaries_ITU_R_2020 }
+        else if pLower.contains("p3")   { primaries = "P3-D65" }
+        else                            { primaries = AVVideoColorPrimaries_ITU_R_709_2 }
+
+        let mLower = matrixRaw.lowercased()
+        let matrix: String = mLower.contains("2020") ? AVVideoYCbCrMatrix_ITU_R_2020
+                                                      : AVVideoYCbCrMatrix_ITU_R_709_2
+
+        return (true, transferFunction, primaries, matrix)
     }
 
     private static func isHardwareEncoderAvailable(codecType: CMVideoCodecType) -> Bool {
@@ -327,11 +371,25 @@ actor VideoProcessor {
 
         let renderSize = videoComposition.renderSize
 
+        // Determine whether composition requests HDR->SDR conversion.
+        let hdrConversionRequested = (videoComposition.instructions.first as? CustomVideoCompositionInstruction)?.hdrConversionEnabled ?? false
+
+        // Detect input HDR characteristics from the composition track's format description.
+        let (isHDRInput, detectedTransfer, detectedPrimaries, detectedMatrix) =
+            VideoProcessor.detectHDRInfo(from: composition)
+        NSLog("VideoProcessor: isHDRInput=\(isHDRInput) hdrConversionRequested=\(hdrConversionRequested)")
+
         // ビデオ読み込み: カスタムVideoCompositionを適用して読む
+        // HDR素材でパススルー、かつProRes以外のとき: 64RGBAHalf（値>1.0を保持）
+        // ProResはfloat RGBAを受け付けないため、HDRでもBGRAを使用
+        // HDR→SDR変換時、またはSDR素材: 32BGRA
+        let preferredPixelFormat: OSType = (isHDRInput && !hdrConversionRequested && codec != .prores422VT)
+            ? kCVPixelFormatType_64RGBAHalf
+            : kCVPixelFormatType_32BGRA
         let videoOutput = AVAssetReaderVideoCompositionOutput(
             videoTracks: composition.tracks(withMediaType: .video),
             videoSettings: [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+                kCVPixelBufferPixelFormatTypeKey as String: preferredPixelFormat
             ]
         )
         videoOutput.videoComposition = videoComposition
@@ -382,7 +440,12 @@ actor VideoProcessor {
         case .h265, .h265VT:
             videoCodecType = .hevc
             compressionProps[AVVideoAverageBitRateKey] = videoBitrate
-            compressionProps[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main_AutoLevel
+            // Main10 (10-bit) only when preserving HDR; Main (8-bit) for SDR or HDR->SDR.
+            let chosenProfile = (isHDRInput && !hdrConversionRequested)
+                ? kVTProfileLevel_HEVC_Main10_AutoLevel
+                : kVTProfileLevel_HEVC_Main_AutoLevel
+            compressionProps[AVVideoProfileLevelKey] = chosenProfile
+            NSLog("VideoProcessor: HEVC profile chosen = \(chosenProfile as CFString)")
         case .prores422VT:
             // ProRes: bitrate not applicable; prefer quality-oriented settings
             // Use rawValue fallback for SDKs that don't expose a typed constant
@@ -427,13 +490,37 @@ actor VideoProcessor {
             AVVideoCompressionPropertiesKey: compressionProps
         ]
 
+        // Add color properties to writer settings so that color metadata is
+        // preserved/declared. If the composition requested HDR->SDR conversion,
+        // emit Rec.709/sRGB properties; otherwise advertise BT.2020/PQ for HDR preservation.
+        var videoSettingsMutable = videoSettings
+        // 2軸分岐: isHDRInput × hdrConversionRequested
+        // HDR入力でパススルー → 入力素材の色空間メタデータをそのまま使用
+        // それ以外（SDR入力、またはHDR→SDR変換ON）→ Rec.709で書き出し
+        if isHDRInput && !hdrConversionRequested {
+            let colorProps: [String: Any] = [
+                AVVideoColorPrimariesKey: detectedPrimaries,
+                AVVideoTransferFunctionKey: detectedTransfer,
+                AVVideoYCbCrMatrixKey: detectedMatrix
+            ]
+            videoSettingsMutable[AVVideoColorPropertiesKey] = colorProps
+        } else {
+            // SDR入力パススルー / HDR→SDR変換: 常にRec.709
+            let colorProps: [String: Any] = [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+            ]
+            videoSettingsMutable[AVVideoColorPropertiesKey] = colorProps
+        }
+
         if useSoftwareVT {
             // For software VT (we'll produce compressed CMSampleBuffers),
             // delay creating/adding the passthrough AVAssetWriterInput until
             // we have a compressed sample to obtain its format description.
             videoInput = nil
         } else {
-            let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+            let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettingsMutable)
             vIn.expectsMediaDataInRealTime = false
             if !writer.canAdd(vIn) {
                 throw VideoProcessorError.exportFailed
@@ -571,6 +658,31 @@ actor VideoProcessor {
                                 return
                             }
                                 localCompSession = compSession
+                                // Ensure VTCompressionSession uses the intended HEVC profile
+                                // (Main vs Main10) so the compressed sample format matches
+                                // the writer expectations. This avoids format mismatches
+                                // that cause writer.canAdd to fail and produce audio-only outputs.
+                                if codec == .h265 {
+                                    let profile: CFString = (isHDRInput && !hdrConversionRequested)
+                                        ? kVTProfileLevel_HEVC_Main10_AutoLevel
+                                        : kVTProfileLevel_HEVC_Main_AutoLevel
+                                    VTSessionSetProperty(compSession, key: kVTCompressionPropertyKey_ProfileLevel, value: profile)
+                                    NSLog("VideoProcessor: VTCompressionSession profile set = \(profile)")
+                                }
+                                // For HDR passthrough, embed color metadata into the compressed bitstream
+                                // so the passthrough AVAssetWriterInput picks up the correct colorimetry.
+                                if isHDRInput && !hdrConversionRequested {
+                                    VTSessionSetProperty(compSession,
+                                        key: kVTCompressionPropertyKey_ColorPrimaries,
+                                        value: detectedPrimaries as CFString)
+                                    VTSessionSetProperty(compSession,
+                                        key: kVTCompressionPropertyKey_TransferFunction,
+                                        value: detectedTransfer as CFString)
+                                    VTSessionSetProperty(compSession,
+                                        key: kVTCompressionPropertyKey_YCbCrMatrix,
+                                        value: detectedMatrix as CFString)
+                                    NSLog("VideoProcessor: VT color metadata set: primaries=\(detectedPrimaries) transfer=\(detectedTransfer)")
+                                }
                                 // Register session so cancellation handler can invalidate it
                                 VTSessionRegistry.shared.add(session: compSession, refcon: refconPtr)
 
@@ -671,17 +783,48 @@ actor VideoProcessor {
                                             }
                                         }
                                         if let fs = firstSbuf, let fmt = CMSampleBufferGetFormatDescription(fs) {
+                                            // Build writer settings based on the previously computed
+                                            // videoSettingsMutable, but prefer to add explicit
+                                            // color properties discovered from the sample's
+                                            // format description so the writer does not default
+                                            // to Rec.709 for HDR content.
+                                            var settingsToUse = videoSettingsMutable
+                                            if let exts = CMFormatDescriptionGetExtensions(fmt) as? [String: Any] {
+                                                var colorProps: [String: Any] = [:]
+                                                if let prim = exts[kCVImageBufferColorPrimariesKey as String] as? String {
+                                                    let lower = prim.lowercased()
+                                                    if lower.contains("2020") { colorProps[AVVideoColorPrimariesKey] = AVVideoColorPrimaries_ITU_R_2020 }
+                                                    else if lower.contains("p3") { colorProps[AVVideoColorPrimariesKey] = "P3-D65" }
+                                                    else { colorProps[AVVideoColorPrimariesKey] = AVVideoColorPrimaries_ITU_R_709_2 }
+                                                }
+                                                if let transfer = exts[kCVImageBufferTransferFunctionKey as String] as? String {
+                                                    let lower = transfer.lowercased()
+                                                    if lower.contains("hlg") { colorProps[AVVideoTransferFunctionKey] = AVVideoTransferFunction_ITU_R_2100_HLG }
+                                                    else if lower.contains("pq") || lower.contains("2084") { colorProps[AVVideoTransferFunctionKey] = AVVideoTransferFunction_SMPTE_ST_2084_PQ }
+                                                    else { colorProps[AVVideoTransferFunctionKey] = AVVideoTransferFunction_ITU_R_709_2 }
+                                                }
+                                                if let matrix = exts[kCVImageBufferYCbCrMatrixKey as String] as? String {
+                                                    let lower = matrix.lowercased()
+                                                    if lower.contains("2020") { colorProps[AVVideoYCbCrMatrixKey] = AVVideoYCbCrMatrix_ITU_R_2020 }
+                                                    else { colorProps[AVVideoYCbCrMatrixKey] = AVVideoYCbCrMatrix_ITU_R_709_2 }
+                                                }
+                                                if !colorProps.isEmpty {
+                                                    settingsToUse[AVVideoColorPropertiesKey] = colorProps
+                                                }
+                                            }
+
+                                            // We're feeding compressed CMSampleBuffer objects from VT, so
+                                            // this must be a passthrough input: use `outputSettings: nil`.
                                             let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: fmt)
                                             vIn.expectsMediaDataInRealTime = false
-                                                if writer.canAdd(vIn) {
+                                            NSLog("VideoProcessor: canAdd video: \(writer.canAdd(vIn))")
+                                            if writer.canAdd(vIn) {
                                                 writer.add(vIn)
                                                 videoInput = vIn
                                                 // Add audio input if it was deferred
                                                 if let aIn = audioInput {
                                                     if writer.canAdd(aIn) {
                                                         writer.add(aIn)
-                                                    } else {
-                                                        
                                                     }
                                                 }
                                                 // Start writer session now
@@ -712,7 +855,6 @@ actor VideoProcessor {
                                                         if let sb = next {
                                                             let appended = vIn.append(sb)
                                                             if !appended {
-                                                                // Append failed — if we have been cancelled, treat as cancelled.
                                                                 context.bufferLock.async {
                                                                     context.encodingFinished = true
                                                                     if !context.didResumeContinuation {
@@ -747,7 +889,7 @@ actor VideoProcessor {
                                                     context.encodingFinished = true
                                                     if !context.didResumeContinuation {
                                                         context.didResumeContinuation = true
-                                                            safeResume({ continuation.resume(throwing: VideoProcessorError.exportFailed) })
+                                                        safeResume({ continuation.resume(throwing: VideoProcessorError.exportFailed) })
                                                     }
                                                 }
                                             }

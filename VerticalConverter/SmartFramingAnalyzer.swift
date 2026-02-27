@@ -6,7 +6,7 @@
 //  人物追跡: IOUベーストラッキング → 寿命・速度による主役推定
 //
 
-import AVFoundation
+@preconcurrency import AVFoundation
 import Vision
 
 // MARK: - Data Types

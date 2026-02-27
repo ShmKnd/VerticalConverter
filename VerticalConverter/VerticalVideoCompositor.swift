@@ -5,7 +5,7 @@
 //  Created on 2026/02/25.
 //
 
-import AVFoundation
+@preconcurrency import AVFoundation
 import CoreImage
 import CoreVideo
 import VideoToolbox
@@ -37,23 +37,30 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     private var hdrConversionEnabled: Bool = false
     private var hdrTarget: CustomVideoCompositionInstruction.HDRTarget = .sRGB
     override init() {
-        ciContext = CIContext(options: [
-            .workingColorSpace: CGColorSpaceCreateDeviceRGB(),
-            .outputColorSpace: CGColorSpaceCreateDeviceRGB()
-        ])
+        // Use extended linear sRGB as working color space so CoreImage can
+        // represent HDR values (> 1.0) without clipping during compositing.
+        let workingCS = CGColorSpace(name: CGColorSpace.extendedLinearSRGB) ?? CGColorSpaceCreateDeviceRGB()
+        ciContext = CIContext(options: [.workingColorSpace: workingCS])
         super.init()
     }
     
     var sourcePixelBufferAttributes: [String : Any]? {
+        // Accept both 64RGBAHalf (for HDR passthrough) and 32BGRA (SDR fallback).
+        // AVFoundation will prefer the first matching format it can provide.
         return [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferPixelFormatTypeKey as String: [
+                kCVPixelFormatType_64RGBAHalf,
+                kCVPixelFormatType_32BGRA
+            ] as [OSType],
             kCVPixelBufferOpenGLCompatibilityKey as String: true
         ]
     }
     
     var requiredPixelBufferAttributesForRenderContext: [String : Any] {
+        // Use 64RGBAHalf so the render output buffer can hold HDR values (>1.0)
+        // without clipping. CIContext renders to this format correctly.
         return [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_64RGBAHalf,
             kCVPixelBufferOpenGLCompatibilityKey as String: true
         ]
     }
@@ -176,20 +183,73 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             )
         }
 
-        var imageToRender = finalImage
+        let imageToRender = finalImage
 
         if hdrConversionEnabled {
-            // 簡易トーンマッピング: 軽く露出を落としガンマで丸める
-            imageToRender = imageToRender.applyingFilter("CIExposureAdjust", parameters: ["inputEV": -1.0])
-            switch hdrTarget {
-            case .sRGB:
-                imageToRender = imageToRender.applyingFilter("CIGammaAdjust", parameters: ["inputPower": 1.0/2.2])
-            case .rec709:
-                imageToRender = imageToRender.applyingFilter("CIGammaAdjust", parameters: ["inputPower": 1.0/2.4])
+            // HDR->SDR: CoreImage color space conversion handles the EOTF mapping
+            // during the render call below. Mark output buffer as Rec.709 / sRGB.
+            let primariesStr = NSString(string: "ITU_R_709_2")
+            let transferStr = NSString(string: "ITU_R_709_2")
+            let matrixStr = NSString(string: "ITU_R_709_2")
+            CVBufferSetAttachment(outputPixelBuffer, kCVImageBufferColorPrimariesKey as CFString, primariesStr, .shouldPropagate)
+            CVBufferSetAttachment(outputPixelBuffer, kCVImageBufferTransferFunctionKey as CFString, transferStr, .shouldPropagate)
+            CVBufferSetAttachment(outputPixelBuffer, kCVImageBufferYCbCrMatrixKey as CFString, matrixStr, .shouldPropagate)
+        } else {
+            // Preserve HDR metadata: copy color attachments from source to output when present
+            let attachKeys: [CFString] = [
+                kCVImageBufferColorPrimariesKey as CFString,
+                kCVImageBufferTransferFunctionKey as CFString,
+                kCVImageBufferYCbCrMatrixKey as CFString,
+                kCVImageBufferMasteringDisplayColorVolumeKey as CFString,
+                kCVImageBufferContentLightLevelInfoKey as CFString
+            ]
+            func makeCFCompatible(_ any: Any) -> CFTypeRef? {
+                if let ns = any as? NSString { return ns }
+                if let s = any as? String { return NSString(string: s) }
+                if let num = any as? NSNumber { return num }
+                if let dict = any as? NSDictionary { return dict }
+                if let dict = any as? [AnyHashable: Any] { return dict as NSDictionary }
+                if let arr = any as? NSArray { return arr }
+                if let arr = any as? [Any] { return arr as NSArray }
+                // As a last resort, attach a string description to avoid passing
+                // Swift-only boxed values into CoreVideo/IOSurface.
+                return NSString(string: String(describing: any))
+            }
+
+            for key in attachKeys {
+                if let val = CVBufferGetAttachment(sourcePixelBuffer, key, nil) {
+                    if let cf = makeCFCompatible(val) {
+                        CVBufferSetAttachment(outputPixelBuffer, key, cf, .shouldPropagate)
+                    }
+                }
             }
         }
 
-        ciContext.render(imageToRender, to: outputPixelBuffer)
+        // Render: when HDR->SDR is enabled we render into the SDR color space
+        // (Rec.709 or sRGB). When preserving HDR, render without a target
+        // colorSpace so original color values are preserved and metadata
+        // describes the colorimetry.
+        if hdrConversionEnabled {
+            // Render to the SDR target color space. CoreImage performs the color
+            // space conversion (including EOTF linearization) from the source
+            // color space that CIImage auto-detects from the pixel buffer.
+            let targetCS: CGColorSpace
+            switch hdrTarget {
+            case .sRGB:
+                targetCS = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+            case .rec709:
+                targetCS = CGColorSpace(name: CGColorSpace.itur_709) ?? CGColorSpaceCreateDeviceRGB()
+            }
+            ciContext.render(imageToRender, to: outputPixelBuffer, bounds: imageToRender.extent, colorSpace: targetCS)
+        } else {
+            // Passthrough: render to the source buffer's own color space so no
+            // accidental conversion takes place. Falls back to Rec.709 for
+            // untagged SDR buffers.
+            let sourceCS: CGColorSpace = CVImageBufferGetColorSpace(sourcePixelBuffer)?.takeUnretainedValue()
+                ?? CGColorSpace(name: CGColorSpace.itur_709)
+                ?? CGColorSpaceCreateDeviceRGB()
+            ciContext.render(imageToRender, to: outputPixelBuffer, bounds: imageToRender.extent, colorSpace: sourceCS)
+        }
     }
 
     // MARK: - レターボックス
@@ -410,4 +470,44 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             pendingRequests.removeAll()
         }
     }
+
+    // MARK: - HDR -> SDR helpers
+
+    private func detectTransferType(from pixelBuffer: CVPixelBuffer) -> Int {
+        // 0 = unknown/SDR, 1 = PQ(ST2084), 2 = HLG
+        if let rawAny = CVBufferGetAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey as CFString, nil) {
+            let rawStr = String(describing: rawAny)
+            let lower = rawStr.lowercased()
+            if lower.contains("pq") || lower.contains("2084") || lower.contains("st2084") { return 1 }
+            if lower.contains("hlg") { return 2 }
+        }
+
+        // Fallback: sometimes transfer info is embedded in color space/profile fields
+        if let cpAny = CVBufferGetAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey as CFString, nil) {
+            let s = String(describing: cpAny).lowercased()
+            if s.contains("bt2020") || s.contains("p3") { /* could be HDR-ish but unknown transfer */ }
+        }
+
+        return 0
+    }
+    // Previously a custom CIColorKernel handled inverse-EOTF, IDT and RRT.
+    // For now, remove the custom tonemapper and use a simpler CI-based
+    // path (linearization/exposure + gamma) to validate pipeline behavior.
+
+    private func detectColorPrimaries(from pixelBuffer: CVPixelBuffer) -> Int {
+        // 0 = unknown, 1 = BT.2020, 2 = DisplayP3, 3 = Rec.709/sRGB
+        if let any = CVBufferGetAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey as CFString, nil) {
+            let s = String(describing: any).lowercased()
+            if s.contains("bt2020") || s.contains("2020") { return 1 }
+            if s.contains("p3") || s.contains("displayp3") { return 2 }
+            if s.contains("bt709") || s.contains("rec709") || s.contains("srgb") { return 3 }
+        }
+        return 0
+    }
+
+    // applyHDRToSDR removed: HDR->SDR conversion is now handled entirely by
+    // CoreImage's color space management at render time. The CIImage retains
+    // the source color space (auto-detected from the CVPixelBuffer), and
+    // rendering to a Rec.709/sRGB CGColorSpace performs the correct EOTF
+    // mapping without the double-processing that broke SDR passthrough.
 }

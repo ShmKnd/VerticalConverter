@@ -5,7 +5,7 @@
 //  Created on 2026/02/25.
 //
 
-import AVFoundation
+@preconcurrency import AVFoundation
 
 class CustomVideoCompositionInstruction: NSObject, AVVideoCompositionInstructionProtocol {
     var timeRange: CMTimeRange

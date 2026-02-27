@@ -8,7 +8,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
 import AppKit
-import AVFoundation
+@preconcurrency import AVFoundation
 
 struct ContentView: View {
     @StateObject private var viewModel = ContentViewModel()
