@@ -15,6 +15,8 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     private let renderQueue = DispatchQueue(label: "com.verticalconverter.renderqueue")
     private var renderContext: AVVideoCompositionRenderContext?
     private let ciContext: CIContext
+    // 保留中のリクエストを追跡してキャンセル時に確実に完了させる
+    private var pendingRequests: [AVAsynchronousVideoCompositionRequest] = []
     
     // スマートフレーミング用の状態（X方向のオフセット）
     private var smartFramingEnabled: Bool = false
@@ -72,6 +74,14 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
                 ))
                 return
             }
+
+            // 追跡用に追加
+            self.pendingRequests.append(asyncVideoCompositionRequest)
+            let removePending: () -> Void = {
+                if let idx = self.pendingRequests.firstIndex(where: { $0 === asyncVideoCompositionRequest }) {
+                    self.pendingRequests.remove(at: idx)
+                }
+            }
             
             guard let instruction = asyncVideoCompositionRequest.videoCompositionInstruction as? CustomVideoCompositionInstruction else {
                 asyncVideoCompositionRequest.finish(with: NSError(
@@ -79,6 +89,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
                     code: -1,
                     userInfo: nil
                 ))
+                removePending()
                 return
             }
             
@@ -88,6 +99,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
                     code: -1,
                     userInfo: nil
                 ))
+                removePending()
                 return
             }
             
@@ -109,6 +121,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
                     code: -1,
                     userInfo: nil
                 ))
+                removePending()
                 return
             }
             
@@ -120,6 +133,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
                     code: -1,
                     userInfo: nil
                 ))
+                removePending()
                 return
             }
             
@@ -131,6 +145,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             )
             
             asyncVideoCompositionRequest.finish(withComposedVideoFrame: outputPixelBuffer)
+            removePending()
         }
     }
     
@@ -386,5 +401,13 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         }
     }
 
-    func cancelAllPendingVideoCompositionRequests() {}
+    func cancelAllPendingVideoCompositionRequests() {
+        // フレーム合成を中止する要求が来たら保留中の全リクエストを finishCancelledRequest() で終了する
+        renderQueue.sync {
+            for req in pendingRequests {
+                req.finishCancelledRequest()
+            }
+            pendingRequests.removeAll()
+        }
+    }
 }

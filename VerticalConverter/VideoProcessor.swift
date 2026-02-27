@@ -11,6 +11,59 @@ import CoreImage
 import VideoToolbox
 import CoreMedia
 
+// Registry to track VTCompressionSession and refcon pointers so we can
+// invalidate them from outside encoder scope (best-effort on cancellation).
+private final class VTSessionRegistry {
+    static let shared = VTSessionRegistry()
+    private let q = DispatchQueue(label: "vt.session.registry")
+    private var sessions: [VTCompressionSession] = []
+    private var refcons: [UnsafeMutableRawPointer] = []
+
+    func add(session: VTCompressionSession, refcon: UnsafeMutableRawPointer) {
+        q.sync {
+            sessions.append(session)
+            refcons.append(refcon)
+            NSLog("VTSessionRegistry: added session \(session) refcon=\(refcon)")
+        }
+    }
+
+    func remove(refcon: UnsafeMutableRawPointer) {
+        q.sync {
+            if let idx = refcons.firstIndex(where: { $0 == refcon }) {
+                // Invalidate and release just in case
+                let s = sessions[idx]
+                VTCompressionSessionInvalidate(s)
+                // Release retained refcon
+                Unmanaged<AnyObject>.fromOpaque(refcon).release()
+                sessions.remove(at: idx)
+                refcons.remove(at: idx)
+                NSLog("VTSessionRegistry: removed refcon=\(refcon) and invalidated session")
+            }
+        }
+    }
+
+    func dumpInfo() {
+        q.sync {
+            NSLog("VTSessionRegistry: dump - sessions=\(sessions.count), refcons=\(refcons.count)")
+        }
+    }
+
+    func invalidateAll() {
+        q.sync {
+            for s in sessions {
+                VTCompressionSessionInvalidate(s)
+            }
+            // Release any retained refcons
+            for ref in refcons {
+                NSLog("VTSessionRegistry: releasing refcon \(ref)")
+                Unmanaged<AnyObject>.fromOpaque(ref).release()
+            }
+            sessions.removeAll()
+            refcons.removeAll()
+        }
+    }
+}
+
 enum VideoProcessorError: LocalizedError {
     case invalidInput
     case compositionFailed
@@ -287,6 +340,8 @@ actor VideoProcessor {
             throw VideoProcessorError.exportFailed
         }
         reader.add(videoOutput)
+        // Serialize access to copyNextSampleBuffer to avoid concurrent calls
+        let videoReadQueue = DispatchQueue(label: "video.read")
 
         // オーディオ読み込み
         var audioOutput: AVAssetReaderTrackOutput? = nil
@@ -412,7 +467,16 @@ actor VideoProcessor {
         // 総再生時間（プログレス計算用）
         let durationSeconds = composition.duration.seconds
 
-        
+
+        // キャンセル用トークン（DispatchQueueで保護）
+        class CancelToken {
+            private let q = DispatchQueue(label: "cancel.token.lock")
+            private var _cancelled: Bool = false
+            func cancel() { q.sync { _cancelled = true } }
+            func isCancelled() -> Bool { q.sync { _cancelled } }
+        }
+        let cancelToken = CancelToken()
+
         reader.startReading()
         // If not using software VT, start writer immediately. Otherwise we'll
         // start writer after receiving first compressed sample and adding inputs.
@@ -447,6 +511,20 @@ actor VideoProcessor {
                                 var didResumeContinuation: Bool = false
                             }
                             let context = VTEncoderContext()
+                            // captureable references for cancellation
+                            var localCompSession: VTCompressionSession? = nil
+                            var localRefconPtr: UnsafeMutableRawPointer? = nil
+                            // Continuation safety: ensure continuation.resume is only called once
+                            let contLock = DispatchQueue(label: "vt.cont.lock")
+                            var contDidResume = false
+                            func safeResume(_ block: @escaping () -> Void) {
+                                contLock.sync {
+                                    if !contDidResume {
+                                        contDidResume = true
+                                        block()
+                                    }
+                                }
+                            }
 
                             // Create passthrough writer input (expects compressed samples)
                             // videoInput is already created as passthrough earlier when needed.
@@ -476,6 +554,7 @@ actor VideoProcessor {
                             let codecType: CMVideoCodecType = (codec == .h264) ? kCMVideoCodecType_H264 : kCMVideoCodecType_HEVC
                             // Retain context and pass as refcon to callback
                             let refconPtr = Unmanaged.passRetained(context as AnyObject).toOpaque()
+                            localRefconPtr = refconPtr
                             var status = VTCompressionSessionCreate(allocator: nil,
                                                                      width: Int32(renderSize.width),
                                                                      height: Int32(renderSize.height),
@@ -487,10 +566,13 @@ actor VideoProcessor {
                                                                      refcon: refconPtr,
                                                                      compressionSessionOut: &session)
                             guard status == noErr, let compSession = session else {
-                                Unmanaged<AnyObject>.fromOpaque(refconPtr).release()
-                                continuation.resume(throwing: VideoProcessorError.exportFailed)
+                                if let ref = localRefconPtr { Unmanaged<AnyObject>.fromOpaque(ref).release() }
+                                safeResume({ continuation.resume(throwing: VideoProcessorError.exportFailed) })
                                 return
                             }
+                                localCompSession = compSession
+                                // Register session so cancellation handler can invalidate it
+                                VTSessionRegistry.shared.add(session: compSession, refcon: refconPtr)
 
                             // Configure session properties
                             var bitrateBps = Int32(bitrate * 1_000_000)
@@ -519,8 +601,18 @@ actor VideoProcessor {
                             // Read frames, feed to encoder
                             encodeQueue.async {
                                 while true {
-                                    if Task.isCancelled { break }
-                                    guard let sample = videoOutput.copyNextSampleBuffer() else {
+                                    if cancelToken.isCancelled() {
+                                        // Best-effort: complete and invalidate local compression session immediately
+                                        if let comp = localCompSession {
+                                            NSLog("VideoProcessor: encode loop cancellation - completing/invalidate local VT session")
+                                            VTCompressionSessionCompleteFrames(comp, untilPresentationTimeStamp: CMTime.invalid)
+                                            VTCompressionSessionInvalidate(comp)
+                                            // Also remove from shared registry if present
+                                            if let ref = localRefconPtr { VTSessionRegistry.shared.remove(refcon: ref) }
+                                        }
+                                        break
+                                    }
+                                    guard let sample = videoReadQueue.sync(execute: { videoOutput.copyNextSampleBuffer() }) else {
                                         // finished reading
                                         context.readingFinished = true
                                         break
@@ -546,7 +638,7 @@ actor VideoProcessor {
                                             context.encodingFinished = true
                                             if !context.didResumeContinuation {
                                                 context.didResumeContinuation = true
-                                                continuation.resume(throwing: VideoProcessorError.exportFailed)
+                                                safeResume({ continuation.resume(throwing: VideoProcessorError.exportFailed) })
                                             }
                                         }
                                         break
@@ -600,6 +692,17 @@ actor VideoProcessor {
                                                 // Register append loop for the newly created video input
                                                 vIn.requestMediaDataWhenReady(on: appendQueue) {
                                                     while vIn.isReadyForMoreMediaData {
+                                                        if cancelToken.isCancelled() {
+                                                            vIn.markAsFinished()
+                                                            context.bufferLock.async {
+                                                                context.encodingFinished = true
+                                                                if !context.didResumeContinuation {
+                                                                    context.didResumeContinuation = true
+                                                                    safeResume({ continuation.resume(throwing: VideoProcessorError.cancelled) })
+                                                                }
+                                                            }
+                                                            return
+                                                        }
                                                         var next: CMSampleBuffer? = nil
                                                         context.bufferLock.sync {
                                                             if !context.compressedBuffers.isEmpty {
@@ -609,11 +712,30 @@ actor VideoProcessor {
                                                         if let sb = next {
                                                             let appended = vIn.append(sb)
                                                             if !appended {
-                                                                
+                                                                // Append failed — if we have been cancelled, treat as cancelled.
+                                                                context.bufferLock.async {
+                                                                    context.encodingFinished = true
+                                                                    if !context.didResumeContinuation {
+                                                                        context.didResumeContinuation = true
+                                                                        safeResume({
+                                                                            if cancelToken.isCancelled() {
+                                                                                continuation.resume(throwing: VideoProcessorError.cancelled)
+                                                                            } else if writer.status == .failed {
+                                                                                continuation.resume(throwing: VideoProcessorError.exportFailed)
+                                                                            } else {
+                                                                                continuation.resume(throwing: VideoProcessorError.exportFailed)
+                                                                            }
+                                                                        })
+                                                                    }
+                                                                }
+                                                                return
                                                             }
                                                         } else if context.encodingFinished {
                                                             vIn.markAsFinished()
-                                                            continuation.resume()
+                                                            if !context.didResumeContinuation {
+                                                                context.didResumeContinuation = true
+                                                                safeResume({ continuation.resume() })
+                                                            }
                                                             return
                                                         } else {
                                                             break
@@ -625,7 +747,7 @@ actor VideoProcessor {
                                                     context.encodingFinished = true
                                                     if !context.didResumeContinuation {
                                                         context.didResumeContinuation = true
-                                                        continuation.resume(throwing: VideoProcessorError.exportFailed)
+                                                            safeResume({ continuation.resume(throwing: VideoProcessorError.exportFailed) })
                                                     }
                                                 }
                                             }
@@ -641,25 +763,58 @@ actor VideoProcessor {
                                 }
                                 // Invalidate session
                                 VTCompressionSessionInvalidate(compSession)
-                                // Release retained context
-                                Unmanaged<AnyObject>.fromOpaque(refconPtr).release()
+                                // Release retained context via registry to avoid double-release
+                                if let ref = localRefconPtr {
+                                    VTSessionRegistry.shared.remove(refcon: ref)
+                                }
+                                localRefconPtr = nil
+                                localCompSession = nil
                             }
                         }
                     } else {
                         try await withCheckedThrowingContinuation { continuation in
+                            let contLock = DispatchQueue(label: "cont.lock.video")
+                            var didResume = false
+                            func safeResume(_ resumeBlock: @escaping () -> Void) {
+                                contLock.sync {
+                                    if !didResume {
+                                        didResume = true
+                                        resumeBlock()
+                                    }
+                                }
+                            }
+
                             guard let vIn = videoInput else {
-                                continuation.resume(throwing: VideoProcessorError.exportFailed)
+                                safeResume({ continuation.resume(throwing: VideoProcessorError.exportFailed) })
                                 return
                             }
                             vIn.requestMediaDataWhenReady(on: DispatchQueue(label: "video.write")) {
                                 while vIn.isReadyForMoreMediaData {
-                                    guard let sample = videoOutput.copyNextSampleBuffer() else {
-                                        // reader がキャンセルされると nil が返る → 正常終了扱い
+                                    if cancelToken.isCancelled() {
                                         vIn.markAsFinished()
-                                        continuation.resume()
+                                        safeResume({ continuation.resume(throwing: VideoProcessorError.cancelled) })
                                         return
                                     }
-                                    vIn.append(sample)
+                                    guard let sample = videoReadQueue.sync(execute: { videoOutput.copyNextSampleBuffer() }) else {
+                                        // reader がキャンセルされると nil が返る → 正常終了扱い
+                                        vIn.markAsFinished()
+                                        safeResume({ continuation.resume() })
+                                        return
+                                    }
+                                    let appended = vIn.append(sample)
+                                    if !appended {
+                                        // Append failed — likely writer was cancelled or failed
+                                        safeResume({
+                                            if cancelToken.isCancelled() {
+                                                continuation.resume(throwing: VideoProcessorError.cancelled)
+                                            } else if writer.status == .failed {
+                                                continuation.resume(throwing: VideoProcessorError.exportFailed)
+                                            } else {
+                                                continuation.resume(throwing: VideoProcessorError.exportFailed)
+                                            }
+                                        })
+                                        return
+                                    }
 
                                     // プログレス更新
                                     let pts = CMSampleBufferGetPresentationTimeStamp(sample).seconds
@@ -677,16 +832,32 @@ actor VideoProcessor {
                 if let aOut = audioOutput, let aIn = audioInput {
                     group.addTask {
                         try await withCheckedThrowingContinuation { continuation in
+                            let contLock = DispatchQueue(label: "cont.lock.audio")
+                            var didResume = false
+                            func safeResume(_ resumeBlock: @escaping () -> Void) {
+                                contLock.sync {
+                                    if !didResume {
+                                        didResume = true
+                                        resumeBlock()
+                                    }
+                                }
+                            }
                             // If using software VT path, ensure writer has started and
                             // inputs have been added before we begin appending audio.
                             while useSoftwareVT && !writerStarted {
+                                if cancelToken.isCancelled() { safeResume({ continuation.resume(throwing: VideoProcessorError.cancelled) }); return }
                                 Thread.sleep(forTimeInterval: 0.01)
                             }
                             aIn.requestMediaDataWhenReady(on: DispatchQueue(label: "audio.write")) {
                                 while aIn.isReadyForMoreMediaData {
+                                    if cancelToken.isCancelled() {
+                                        aIn.markAsFinished()
+                                        safeResume({ continuation.resume(throwing: VideoProcessorError.cancelled) })
+                                        return
+                                    }
                                     guard let sample = aOut.copyNextSampleBuffer() else {
                                         aIn.markAsFinished()
-                                        continuation.resume()
+                                        safeResume({ continuation.resume() })
                                         return
                                     }
                                     aIn.append(sample)
@@ -698,23 +869,55 @@ actor VideoProcessor {
 
                 try await group.waitForAll()
             }
-        } onCancel: {
-            // ← ここが即時実行される（メインスレッド待ち不要）
-            reader.cancelReading()
-              videoInput?.markAsFinished()
-              audioInput?.markAsFinished()
-            writer.cancelWriting()
-        }
+                } onCancel: {
+                    // ← ここが即時実行される（メインスレッド待ち不要）
+                    NSLog("VideoProcessor: cancellation handler invoked")
+                    // 1) Signal internal cancel token so encode loops see cancellation quickly
+                    NSLog("VideoProcessor: setting cancel token (onCancel)")
+                    cancelToken.cancel()
+
+                    // 2) Invalidate VT sessions to stop encoders (best-effort)
+                    NSLog("VideoProcessor: invalidating VT sessions via registry (onCancel)")
+                    VTSessionRegistry.shared.invalidateAll()
+                    // Small pause to let invalidation propagate to encoder threads
+                    Thread.sleep(forTimeInterval: 0.1)
+
+                    // 3) Mark writer inputs finished (best-effort) before cancelling reader/writer
+                    NSLog("VideoProcessor: marking writer inputs finished (onCancel)")
+                    videoInput?.markAsFinished()
+                    audioInput?.markAsFinished()
+
+                    // 4) Stop reader and cancel writer
+                    reader.cancelReading()
+                    writer.cancelWriting()
+
+                    // Diagnostic dump
+                    NSLog("VideoProcessor: onCancel reader.status=\(reader.status.rawValue) writer.status=\(writer.status.rawValue)")
+                    VTSessionRegistry.shared.dumpInfo()
+
+                    // Do not remove output file here; wait until writer has settled in the outer scope
+                }
 
         // キャンセルチェック
         if Task.isCancelled || reader.status == .cancelled || writer.status == .cancelled {
-            // 未完了ファイルを削除
+            // Wait briefly for writer to settle (avoid deleting while writer is mid-state)
+            var waitCount = 0
+            while writer.status == .writing && waitCount < 20 {
+                Thread.sleep(forTimeInterval: 0.05)
+                waitCount += 1
+            }
+            NSLog("VideoProcessor: cancellation confirmed, writer.status=\(writer.status). Removing partial output")
             try? FileManager.default.removeItem(at: outputURL)
             throw VideoProcessorError.cancelled
         }
 
-        // 書き出し完了
-        await writer.finishWriting()
+        // 書き出し完了: writer が実際に書き込み中であれば finish を呼ぶ
+        if writer.status == .writing {
+            NSLog("VideoProcessor: writer.status == .writing; calling finishWriting()")
+            await writer.finishWriting()
+        } else {
+            NSLog("VideoProcessor: skipping finishWriting(), writer.status = \(writer.status)")
+        }
 
         if writer.status == .failed {
             throw writer.error ?? VideoProcessorError.exportFailed

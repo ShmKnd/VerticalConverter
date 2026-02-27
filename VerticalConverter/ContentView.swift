@@ -262,7 +262,7 @@ struct ContentView: View {
                 )
             }
             panelDivider
-            settingRow(label: "FPS", icon: "camera.aperture") {
+            settingRow(label: "FPS", icon: "film.stack") {
                 SlidingPicker(
                     labels: VideoExportSettings.FrameRate.allCases.map { $0.displayLabel },
                     values: VideoExportSettings.FrameRate.allCases,
@@ -287,7 +287,7 @@ struct ContentView: View {
                 )
             }
             panelDivider
-            settingRow(label: "Bitrate", icon: "waveform") {
+            settingRow(label: "Bitrate", icon: "dial.min.fill") {
                 SlidingPicker(
                     labels: [8, 10, 12].map { "\($0) Mbps" },
                     values: [8, 10, 12],
@@ -368,7 +368,7 @@ struct ContentView: View {
     private var hdrPanel: some View {
         VStack(spacing: 0) {
             HStack {
-                Label("HDR→SDR Conversion", systemImage: "sun.max.trianglebadge.exclamation")
+                Label("HDR→SDR Conversion", systemImage: "display")
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.primary)
                 Spacer()
@@ -483,10 +483,16 @@ struct ContentView: View {
         @ViewBuilder picker: () -> Content
     ) -> some View {
         HStack(spacing: 10) {
-                Label(label, systemImage: icon)
-                .font(.subheadline.weight(.medium))
-                .foregroundStyle(.primary)
-                .frame(width: 115, alignment: .leading)
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .font(.system(size: 16))
+                    .frame(width: 20, alignment: .center)
+                Text(label)
+                    .font(.subheadline.weight(.medium))
+            }
+            .foregroundStyle(.primary)
+            .frame(width: 115, alignment: .leading)
+
             picker()
         }
     }
