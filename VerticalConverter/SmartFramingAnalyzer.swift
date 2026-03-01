@@ -208,8 +208,10 @@ struct SmartFramingAnalyzer {
         let fps         = try await videoTrack.load(.nominalFrameRate)
         let totalFrames = max(1, Int(ceil(duration.seconds * Double(fps))))
 
-        // ① fps依存のガウシアン sigma（弱め: ≈ 0.2秒分の平滑化半径）
-        let sigma = Double(fps) * 0.2
+        // ① fps依存の EMA α（指数移動平均）
+        //   α = 1 / (1 + fps × 0.2)  → 直近フレームへの重み
+        //   24fps → α≈0.17, 30fps → α≈0.14, 60fps → α≈0.08
+        let emaAlpha = 1.0 / (1.0 + Double(fps) * 0.2)
 
         // スケール（Y方向ズーム込み）
         let zoomFactor   = SmartFramingAnalyzer.yZoomFactor
@@ -239,9 +241,9 @@ struct SmartFramingAnalyzer {
         let interpX = interpolate(rawX, fallback: 0.5, shortGapFrames: shortGap)
         let interpY = interpolate(rawY, fallback: 0.72, shortGapFrames: shortGap)
 
-        // Step 3: 双方向ガウシアンスムージング（fps依存 sigma）
-        let smoothedX = gaussianSmooth(interpX, sigma: sigma)
-        let smoothedY = gaussianSmooth(interpY, sigma: sigma)
+        // Step 3: EMA（指数移動平均）スムージング
+        let smoothedX = emaSmooth(interpX, alpha: emaAlpha)
+        let smoothedY = emaSmooth(interpY, alpha: emaAlpha)
 
         // Step 4X: X方向 ホールド＆フォロー（3秒ホールド、25%デッドゾーン）
         let minHoldFrames = Int(3.0 * Double(fps))
@@ -472,32 +474,29 @@ struct SmartFramingAnalyzer {
         return result
     }
 
-    // MARK: - Step 3: 双方向ガウシアンスムージング
+    // MARK: - Step 3: EMA（指数移動平均）スムージング
+    //
+    // y[n] = α·x[n] + (1-α)·y[n-1]
+    //
+    // 因果的（過去のみ参照）かつ IIR フィルタであるため:
+    //  - 未来フレームを一切参照しない → 先読みパンが発生しない
+    //  - 直近フレームに重みが集中し、過去は指数的に減衰 → カメラオペレーターの
+    //    「今を最重視し、古い情報は忘れる」自然な反応モデルと一致
+    //  - holdAndFollow (Step 4) も EMA 的追従であり、パイプライン全体で
+    //    一貫した指数減衰モデルとなる
+    //  - O(n) で計算可能（FIR の O(n×radius) より高速）
+    //  - 無限インパルス応答 → 窓の打ち切りによる境界アーティファクトなし
 
-    private func gaussianSmooth(_ values: [CGFloat], sigma: Double) -> [CGFloat] {
+    private func emaSmooth(_ values: [CGFloat], alpha: Double) -> [CGFloat] {
         let n = values.count
         guard n > 1 else { return values }
 
-        let radius = Int(ceil(sigma * 3))
-        var kernel = [Double]()
-        for i in -radius...radius {
-            kernel.append(exp(-Double(i * i) / (2 * sigma * sigma)))
-        }
-        let kernelSum = kernel.reduce(0, +)
-        let normKernel = kernel.map { $0 / kernelSum }
-
         var result = [CGFloat](repeating: 0, count: n)
-        for i in 0..<n {
-            var weighted = 0.0
-            var wSum     = 0.0
-            for (j, w) in normKernel.enumerated() {
-                let idx = i + j - radius
-                if idx >= 0 && idx < n {
-                    weighted += Double(values[idx]) * w
-                    wSum     += w
-                }
-            }
-            result[i] = CGFloat(weighted / wSum)
+        result[0] = values[0]
+
+        let a = CGFloat(alpha)
+        for i in 1..<n {
+            result[i] = a * values[i] + (1.0 - a) * result[i - 1]
         }
         return result
     }
