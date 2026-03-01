@@ -48,8 +48,21 @@ class CustomVideoCompositionInstruction: NSObject, AVVideoCompositionInstruction
         case sRGB = 0
         case rec709 = 1
     }
+
+    /// トーンマッピングのスタイル
+    enum ToneMappingMode: Int, CaseIterable {
+        case natural  = 0   // ニュートラル（Rec.709/sRGB に忠実な自然な色）
+        case cinematic = 1  // シネマティック（ACES / Apple Headroom – コントラスト高め）
+
+        var displayName: String {
+            switch self {
+            case .natural:   return "Natural"
+            case .cinematic: return "Cinematic"
+            }
+        }
+    }
     var hdrConversionEnabled: Bool = false
-    var hdrTarget: HDRTarget = .sRGB
+    var toneMappingMode: ToneMappingMode = .natural
     var letterboxMode: LetterboxMode = .fitWidth
     
     init(

@@ -303,44 +303,54 @@ struct SmartFramingAnalyzer {
         reader.startReading()
 
         var frameIndex = 0
-        while let sample = output.copyNextSampleBuffer() {
-            if Task.isCancelled {
-                reader.cancelReading()
-                throw CancellationError()
-            }
+        while true {
+            // autoreleasepool ensures CMSampleBuffer / CVPixelBuffer / Vision
+            // intermediates are freed every iteration, preventing multi-GB
+            // memory accumulation on long videos.
+            let shouldBreak: Bool = try autoreleasepool {
+                guard let sample = output.copyNextSampleBuffer() else {
+                    return true  // end of stream
+                }
+                if Task.isCancelled {
+                    reader.cancelReading()
+                    throw CancellationError()
+                }
 
-            if frameIndex % detectionInterval == 0,
-               frameIndex < totalFrames,
-               let pixelBuffer = CMSampleBufferGetImageBuffer(sample) {
+                if frameIndex % detectionInterval == 0,
+                   frameIndex < totalFrames,
+                   let pixelBuffer = CMSampleBufferGetImageBuffer(sample) {
 
-                let rawPersons = detectRawPersons(in: pixelBuffer)
-                let center = tracker.update(with: rawPersons)
+                    let rawPersons = detectRawPersons(in: pixelBuffer)
+                    let center = tracker.update(with: rawPersons)
 
-                // Fill any frames between lastFilledIndex and this sample with the
-                // last known weighted center (hold behavior). This avoids creating
-                // long linear interpolations across absent detections.
-                if lastFilledIndex + 1 <= frameIndex - 1 {
-                    for fi in (lastFilledIndex + 1)..<frameIndex {
-                        result[fi] = lastWeightedCenter
+                    // Fill any frames between lastFilledIndex and this sample with the
+                    // last known weighted center (hold behavior). This avoids creating
+                    // long linear interpolations across absent detections.
+                    if lastFilledIndex + 1 <= frameIndex - 1 {
+                        for fi in (lastFilledIndex + 1)..<frameIndex {
+                            result[fi] = lastWeightedCenter
+                        }
                     }
+
+                    result[frameIndex] = center
+
+                    // 適応的間隔: 前回中心との差が大きければ短縮
+                    if let c = center, let lc = lastWeightedCenter {
+                        let deviation = hypot(c.x - lc.x, c.y - lc.y)
+                        detectionInterval = deviation > 0.10 ? 4 : 8
+                    }
+
+                    if let c = center { lastWeightedCenter = c }
+                    lastFilledIndex = frameIndex
                 }
 
-                result[frameIndex] = center
-
-                // 適応的間隔: 前回中心との差が大きければ短縮
-                if let c = center, let lc = lastWeightedCenter {
-                    let deviation = hypot(c.x - lc.x, c.y - lc.y)
-                    detectionInterval = deviation > 0.10 ? 4 : 8
+                frameIndex += 1
+                if frameIndex % 30 == 0 {
+                    progressHandler(min(Double(frameIndex) / Double(totalFrames), 1.0))
                 }
-
-                if let c = center { lastWeightedCenter = c }
-                lastFilledIndex = frameIndex
+                return false
             }
-
-            frameIndex += 1
-            if frameIndex % 30 == 0 {
-                progressHandler(min(Double(frameIndex) / Double(totalFrames), 1.0))
-            }
+            if shouldBreak { break }
         }
 
         // Trailing frames after lastFilledIndex: hold lastWeightedCenter

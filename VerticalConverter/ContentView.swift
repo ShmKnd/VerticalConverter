@@ -377,11 +377,11 @@ struct ContentView: View {
                     .labelsHidden()
             }
             panelDivider
-            settingRow(label: "Target", icon: "paintpalette") {
+            settingRow(label: "Tone Map", icon: "camera.filters") {
                 SlidingPicker(
-                    labels: ["sRGB", "Rec.709"],
-                    values: [CustomVideoCompositionInstruction.HDRTarget.sRGB, CustomVideoCompositionInstruction.HDRTarget.rec709],
-                    selection: $viewModel.hdrTarget
+                    labels: ["Natural", "Cinematic"],
+                    values: [CustomVideoCompositionInstruction.ToneMappingMode.natural, CustomVideoCompositionInstruction.ToneMappingMode.cinematic],
+                    selection: $viewModel.toneMappingMode
                 )
             }
             .opacity(viewModel.hdrConversionEnabled ? 1.0 : 0.35)
@@ -686,7 +686,7 @@ class ContentViewModel: ObservableObject {
     @Published var smartFramingSmoothness: SmartFramingSettings.Smoothness = .normal
     @Published var letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth
     @Published var hdrConversionEnabled: Bool = false
-    @Published var hdrTarget: CustomVideoCompositionInstruction.HDRTarget = .sRGB
+    @Published var toneMappingMode: CustomVideoCompositionInstruction.ToneMappingMode = .natural
     @Published var isProcessing: Bool = false
     @Published var progress: Double = 0.0
     @Published var phaseLabel: String = ""
@@ -850,7 +850,7 @@ class ContentViewModel: ObservableObject {
                     smartFramingSettings: settings,
                     letterboxMode: letterboxMode,
                     hdrConversionEnabled: hdrConversionEnabled,
-                    hdrTarget: hdrTarget,
+                    toneMappingMode: toneMappingMode,
                     progressHandler: { progress, label in
                         Task { @MainActor in
                             self.progress = progress
