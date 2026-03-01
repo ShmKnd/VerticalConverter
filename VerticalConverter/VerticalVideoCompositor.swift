@@ -698,6 +698,20 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             return mainVideo.composited(over: blurredBg)
         }
 
+        // 高さに合わせるモード（左右をクロップ・背景不要）
+        if mode == .fitHeight {
+            let scale = renderSize.height / sourceSize.height
+            let scaledWidth = sourceSize.width * scale
+            let mainX = (renderSize.width - scaledWidth) / 2  // 負値 → 左右が画面外へ
+
+            let mainVideo = sourceImage
+                .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+                .transformed(by: CGAffineTransform(translationX: mainX, y: 0))
+                .cropped(to: outputRect)
+
+            return mainVideo
+        }
+
         // centerSquare / centerPortrait4x3 / centerPortrait3x4: 中央を指定アスペクトでクロップ
         let targetAspect: CGFloat
         switch mode {

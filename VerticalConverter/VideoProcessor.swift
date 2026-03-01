@@ -201,6 +201,50 @@ actor VideoProcessor {
         return codecType == hev1FourCC
     }
 
+    // MARK: - DNxHD/DNxHR 検知
+
+    /// DNxHD / DNxHR コーデックかどうか確認する。
+    /// macOS は Avid コーデックパックなしではこれらを復号できない。
+    /// 入力が DNx 系の場合、AVAssetReader はフレーム取得時に失敗または nil を返す。
+    static func isDNxCodec(asset: AVAsset) async -> Bool {
+        guard let videoTrack = try? await asset.loadTracks(withMediaType: .video).first,
+              let desc = videoTrack.formatDescriptions.first else { return false }
+        let fmt = desc as! CMFormatDescription
+        let codecType = CMFormatDescriptionGetMediaSubType(fmt)
+        NSLog("VideoProcessor: DNx check — codec FourCC = %{public}@",
+              String(format: "'%c%c%c%c'",
+                     (codecType >> 24) & 0xFF,
+                     (codecType >> 16) & 0xFF,
+                     (codecType >> 8)  & 0xFF,
+                     codecType & 0xFF))
+        // 既知の DNxHD/DNxHR FourCC 値:
+        //   0x4156646E = 'AVdn'  DNxHD (QuickTime MOV)
+        //   0x41564448 = 'AVDH'  DNxHR (QuickTime MOV)
+        //   0x64686C70 = 'dhlp'  DNxHR 444
+        //   0x41566468 = 'AVdh'  DNxHR MXF 変種
+        let dnxCodes: Set<FourCharCode> = [0x4156646E, 0x41564448, 0x64686C70, 0x41566468]
+        return dnxCodes.contains(codecType)
+    }
+
+    // MARK: - ProRes 検知
+
+    /// Apple ProRes コーデックかどうか確認する。
+    /// macOS は全 ProRes バリアント（422/4444 系）をネイティブにデコードできる。
+    static func isProResCodec(asset: AVAsset) async -> Bool {
+        guard let videoTrack = try? await asset.loadTracks(withMediaType: .video).first,
+              let desc = videoTrack.formatDescriptions.first else { return false }
+        let fmt = desc as! CMFormatDescription
+        let codecType = CMFormatDescriptionGetMediaSubType(fmt)
+        // ProRes FourCC 値:
+        //   'apcn' = ProRes 422 (Normal)    'apch' = ProRes 422 HQ
+        //   'apcs' = ProRes 422 LT          'apco' = ProRes 422 Proxy
+        //   'ap4h' = ProRes 4444            'ap4x' = ProRes 4444 XQ
+        let proresCodes: Set<FourCharCode> = [
+            0x6170636E, 0x61706368, 0x61706373, 0x6170636F, 0x61703468, 0x61703478
+        ]
+        return proresCodes.contains(codecType)
+    }
+
     /// Remux an hev1 video file to hvc1 (no re-encoding, no quality loss).
     ///
     /// hev1 stores HEVC parameter sets (VPS/SPS/PPS) in-band as NAL units.
@@ -641,6 +685,22 @@ actor VideoProcessor {
         var effectiveInputURL = inputURL
         var tempRemuxURL: URL? = nil
         let inputAssetForCheck = AVAsset(url: inputURL)
+
+        // ── DNxHR/DNxHD 入力チェック ──
+        // macOS は Avid コーデックパックなしでは DNxHD/DNxHR をデコードできない。
+        // 処理が途中で失敗する前に早期検知して分かりやすいエラーを返す。
+        if await VideoProcessor.isDNxCodec(asset: inputAssetForCheck) {
+            NSLog("VideoProcessor: DNxHR/DNxHD 入力を検出 — macOS は Avid コーデックパックなしでは復号不可。" +
+                  "Avid DNxHR QuickTime コンポーネントのインストールが必要です。")
+            throw VideoProcessorError.unsupportedFormat
+        }
+
+        // ── ProRes 入力ログ ──
+        // macOS は全 ProRes バリアントをネイティブにデコード可能。通常通り処理続行。
+        if await VideoProcessor.isProResCodec(asset: inputAssetForCheck) {
+            NSLog("VideoProcessor: ProRes 入力を検出 — macOS ネイティブデコードで処理します（正常）")
+        }
+
         let needsHev1Transcode = await VideoProcessor.isHev1(asset: inputAssetForCheck)
         if needsHev1Transcode {
             NSLog("VideoProcessor: input is hev1; will remux to hvc1 before processing")
