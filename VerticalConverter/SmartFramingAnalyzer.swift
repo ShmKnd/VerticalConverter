@@ -211,7 +211,7 @@ struct SmartFramingAnalyzer {
         // ① fps依存の EMA α（指数移動平均）
         //   α = 1 / (1 + fps × 0.2)  → 直近フレームへの重み
         //   24fps → α≈0.17, 30fps → α≈0.14, 60fps → α≈0.08
-        let emaAlpha = 1.0 / (1.0 + Double(fps) * 0.2)
+        let emaAlpha = 1.0 / (1.0 + Double(fps) * 0.14)
 
         // スケール（Y方向ズーム込み）
         let zoomFactor   = SmartFramingAnalyzer.yZoomFactor
