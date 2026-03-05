@@ -29,16 +29,18 @@ class CustomVideoCompositionInstruction: NSObject, AVVideoCompositionInstruction
     // レターボックスの表示モード
     enum LetterboxMode: Int, CaseIterable {
         case fitWidth = 0           // 既存の幅に合わせるモード
+        case fitHeight = 4          // 高さに合わせるモード（左右クロップ）
         case centerSquare = 1       // 中央を正方形にトリミングして表示
         case centerPortrait4x3 = 2  // 中央を縦4:横3にトリミングして表示
         case centerPortrait3x4 = 3  // 中央を縦3:横4にトリミングして表示
 
         var displayName: String {
             switch self {
-            case .fitWidth: return "Fit Width"
-            case .centerSquare: return "Center Square"
-            case .centerPortrait4x3: return "Portrait 4x3"
-            case .centerPortrait3x4: return "Portrait 3x4"
+            case .fitWidth: return "Fit W"
+            case .fitHeight: return "Fit H"
+            case .centerSquare: return "Square"
+            case .centerPortrait4x3: return "4:3"
+            case .centerPortrait3x4: return "3:4"
             }
         }
     }
@@ -48,8 +50,21 @@ class CustomVideoCompositionInstruction: NSObject, AVVideoCompositionInstruction
         case sRGB = 0
         case rec709 = 1
     }
+
+    /// トーンマッピングのスタイル
+    enum ToneMappingMode: Int, CaseIterable {
+        case natural  = 0   // ニュートラル（Rec.709/sRGB に忠実な自然な色）
+        case cinematic = 1  // シネマティック（ACES / Apple Headroom – コントラスト高め）
+
+        var displayName: String {
+            switch self {
+            case .natural:   return "Natural"
+            case .cinematic: return "Cinematic"
+            }
+        }
+    }
     var hdrConversionEnabled: Bool = false
-    var hdrTarget: HDRTarget = .sRGB
+    var toneMappingMode: ToneMappingMode = .natural
     var letterboxMode: LetterboxMode = .fitWidth
     
     init(

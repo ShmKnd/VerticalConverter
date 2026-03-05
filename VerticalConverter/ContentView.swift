@@ -50,63 +50,87 @@ struct ContentView: View {
             .padding(.bottom, 20)
         }
         .frame(width: 560, height: 900)
-        .overlay {
-            if showingCropPreview {
-                GeometryReader { geo in
-                    let panelWidth = min(geo.size.width * 0.9, 720)
-                    let panelHeight = min(geo.size.height * 0.82, 780)
-                    // Remove scrolling: expand vertically so all content is visible
-                    let extraVertical: CGFloat = 160.0
-
-                    VStack {
-                        HStack {
-                            Spacer()
-                            ZStack(alignment: .topTrailing) {
-                                // Panel background + clipping
-                                RoundedRectangle(cornerRadius: 20)
-                                    .fill(.ultraThinMaterial)
-                                    .frame(width: panelWidth, height: panelHeight + extraVertical)
-                                    .shadow(radius: 24)
-
-                                // Non-scrollable content (show everything; panel is taller)
-                                VStack(spacing: 12) {
-                                    CropPreviewView(thumbnail: viewModel.thumbnail, selection: $viewModel.letterboxMode)
-                                }
-                                // reduce top padding so label and close button align tighter
-                                .padding(.horizontal, 12)
-                                .padding(.bottom, 12)
-                                .frame(width: panelWidth - 2, height: panelHeight - 2 + extraVertical)
-                                .clipShape(RoundedRectangle(cornerRadius: 20))
-
-                                Button(action: { showingCropPreview = false }) {
-                                    Image(systemName: "xmark")
-                                        .font(.system(size: 14, weight: .semibold))
-                                        .foregroundStyle(Color.primary.opacity(0.9))
-                                        .padding(8)
-                                }
-                                .buttonStyle(.plain)
-                                // move close button down to match the panel title baseline
-                                .padding(.top, 20)
-                                .padding(.trailing, 16)
-                            }
-                            Spacer()
-                        }
+        .sheet(isPresented: $showingCropPreview) {
+            VStack(spacing: 0) {
+                // ── ヘッダー ──
+                HStack {
+                    Text("Crop Preview")
+                        .font(.headline)
+                    Spacer()
+                    Button("Done") {
+                        showingCropPreview = false
                     }
-                    .frame(width: geo.size.width, height: geo.size.height)
+                    .keyboardShortcut(.defaultAction)
                 }
-                .transition(.opacity.combined(with: .scale))
-                .zIndex(100)
+                .padding(.horizontal, 20)
+                .padding(.top, 20)
+                .padding(.bottom, 12)
+
+                Divider()
+
+                // ── コンテンツ ──
+                VStack(spacing: 12) {
+                    CropPreviewView(
+                        thumbnail: viewModel.thumbnail,
+                        selection: $viewModel.letterboxMode
+                    )
+
+                    // ── サムネイル時刻指定シーク ──
+                    if viewModel.videoDuration > 0 {
+                        VStack(spacing: 8) {
+                            Divider()
+                                .overlay(Color.primary.opacity(0.18))
+                            HStack(spacing: 8) {
+                                Label("Thumbnail Time", systemImage: "clock")
+                                    .font(.caption.weight(.medium))
+                                    .foregroundStyle(Color.primary.opacity(0.8))
+                                Spacer()
+                                Text(formatSeconds(viewModel.thumbnailTime))
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(.primary)
+                                    .frame(minWidth: 44, alignment: .trailing)
+                            }
+                            Slider(
+                                value: $viewModel.thumbnailTime,
+                                in: 0...max(viewModel.videoDuration - 0.066, 0.066),
+                                onEditingChanged: { editing in
+                                    if !editing {
+                                        viewModel.generateThumbnailAtCurrentTime()
+                                    }
+                                }
+                            )
+                            .tint(Color.primary.opacity(0.55))
+                        }
+                        .padding(.bottom, 20)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                .padding(.bottom, 12)
             }
+            .frame(width: 480)
+            .fixedSize(horizontal: false, vertical: true)
         }
-        .animation(.easeInOut(duration: 0.22), value: showingCropPreview)
     }
 
     // MARK: - Drop Zone
 
     private var dropZone: some View {
         ZStack {
-            // UX: When dragging over the drop zone, always show the drop prompt
-            // so users get clear feedback even if a file was previously loaded.
+            // ── サムネイル背景（単体ファイル読み込み時のみ、文字UIの後ろにうっすら表示）──
+            if let thumb = viewModel.thumbnail, !isTargeted, viewModel.selectedVideoURLs.count == 1 {
+                Image(nsImage: thumb)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipped()
+                    .opacity(0.50)
+                    .blur(radius: 3)
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+            }
+
+            // UX: D&D 中は常にドロップ案内を表示（既存ファイルがある場合も同様）
             if isTargeted {
                 VStack(spacing: 12) {
                     Image(systemName: "video.badge.plus")
@@ -126,6 +150,69 @@ struct ContentView: View {
                     .tint(Color.primary.opacity(0.2))
                 }
                 .padding()
+
+            } else if viewModel.selectedVideoURLs.count > 1 {
+                // ── バッチモード: 複数ファイル一覧 ──
+                if viewModel.hasConverted {
+                    VStack(spacing: 12) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 44))
+                            .foregroundStyle(.primary)
+                        Text("\(viewModel.selectedVideoURLs.count) files converted")
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+                        Button("Select Another File") {
+                            viewModel.selectedVideoURLs = []
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.primary.opacity(0.8))
+                        .underline()
+                    }
+                    .padding()
+                } else {
+                VStack(spacing: 8) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "film.stack")
+                            .font(.system(size: 26))
+                            .foregroundStyle(.primary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("\(viewModel.selectedVideoURLs.count) files queued")
+                                .font(.headline)
+                                .foregroundStyle(.primary)
+                            Text("Ready for batch conversion")
+                                .font(.caption)
+                                .foregroundStyle(Color.primary.opacity(0.65))
+                        }
+                        Spacer()
+                        Button("Clear") {
+                            viewModel.selectedVideoURLs = []
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.primary.opacity(0.75))
+                        .underline()
+                    }
+                    ScrollView(.vertical, showsIndicators: false) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            ForEach(viewModel.selectedVideoURLs, id: \.self) { url in
+                                HStack(spacing: 6) {
+                                    Image(systemName: "video.fill")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(Color.primary.opacity(0.5))
+                                    Text(url.lastPathComponent)
+                                        .font(.caption)
+                                        .foregroundStyle(Color.primary.opacity(0.8))
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 52)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                } // end else
+
             } else if let videoURL = viewModel.selectedVideoURL {
                 // If file is selected but not yet converted, show a neutral file view.
                 if viewModel.hasConverted {
@@ -139,7 +226,7 @@ struct ContentView: View {
                             .lineLimit(2)
                             .multilineTextAlignment(.center)
                         Button("Select Another File") {
-                            viewModel.selectedVideoURL = nil
+                            viewModel.selectedVideoURLs = []
                         }
                         .buttonStyle(.plain)
                         .foregroundStyle(Color.primary.opacity(0.8))
@@ -157,7 +244,7 @@ struct ContentView: View {
                             .lineLimit(2)
                             .multilineTextAlignment(.center)
                         Button("Select Another File") {
-                            viewModel.selectedVideoURL = nil
+                            viewModel.selectedVideoURLs = []
                         }
                         .buttonStyle(.plain)
                         .foregroundStyle(Color.primary.opacity(0.8))
@@ -197,7 +284,7 @@ struct ContentView: View {
                     isTargeted ? Color.primary.opacity(0.9) : Color.primary.opacity(0.25),
                     style: StrokeStyle(
                         lineWidth: 1.5,
-                        dash: viewModel.selectedVideoURL == nil ? [8, 4] : []
+                        dash: viewModel.selectedVideoURLs.isEmpty ? [8, 4] : []
                     )
                 )
         )
@@ -206,7 +293,7 @@ struct ContentView: View {
             return true
         }
         .animation(Animation.easeInOut(duration: 0.2), value: isTargeted)
-            .overlay(alignment: .topTrailing) {
+        .overlay(alignment: .topTrailing) {
             Button(action: { showingCropPreview.toggle() }) {
                 Text("Preview")
                     .font(.system(size: 12, weight: .semibold))
@@ -216,8 +303,8 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .padding(8)
-            .disabled(viewModel.selectedVideoURL == nil)
-            .opacity(viewModel.selectedVideoURL == nil ? 0.45 : 1.0)
+            .disabled(viewModel.selectedVideoURL == nil || viewModel.selectedVideoURLs.count > 1)
+            .opacity((viewModel.selectedVideoURL == nil || viewModel.selectedVideoURLs.count > 1) ? 0.35 : 1.0)
             // Note: Popover replaced by an in-window overlay to ensure the preview stays inside the window.
         }
     }
@@ -377,11 +464,11 @@ struct ContentView: View {
                     .labelsHidden()
             }
             panelDivider
-            settingRow(label: "Target", icon: "paintpalette") {
+            settingRow(label: "Tone Map", icon: "camera.filters") {
                 SlidingPicker(
-                    labels: ["sRGB", "Rec.709"],
-                    values: [CustomVideoCompositionInstruction.HDRTarget.sRGB, CustomVideoCompositionInstruction.HDRTarget.rec709],
-                    selection: $viewModel.hdrTarget
+                    labels: ["Natural", "Cinematic"],
+                    values: [CustomVideoCompositionInstruction.ToneMappingMode.natural, CustomVideoCompositionInstruction.ToneMappingMode.cinematic],
+                    selection: $viewModel.toneMappingMode
                 )
             }
             .opacity(viewModel.hdrConversionEnabled ? 1.0 : 0.35)
@@ -416,14 +503,18 @@ struct ContentView: View {
                 } label: {
                     HStack {
                         Image(systemName: "arrow.triangle.2.circlepath")
-                        Text("Start Conversion")
+                        if viewModel.selectedVideoURLs.count > 1 {
+                            Text("Start Batch Conversion (\(viewModel.selectedVideoURLs.count))")
+                        } else {
+                            Text("Start Conversion")
+                        }
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 6)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(Color(hue: 0.38, saturation: 0.75, brightness: 0.72))
-                .disabled(viewModel.selectedVideoURL == nil)
+                .disabled(viewModel.selectedVideoURLs.isEmpty)
             }
 
             // プログレス（常に表示。非処理時は淡く表示）
@@ -496,6 +587,15 @@ struct ContentView: View {
             picker()
         }
     }
+
+    /// 秒数を "M:SS.t" 形式の文字列に変換するヒルパー
+    private func formatSeconds(_ seconds: Double) -> String {
+        let total = Int(max(seconds, 0))
+        let m = total / 60
+        let s = total % 60
+        let tenths = Int((seconds - Double(total)) * 10)
+        return String(format: "%d:%02d.%d", m, s, tenths)
+    }
 }
 
 // MARK: - Helpers
@@ -552,39 +652,56 @@ private struct CropPreviewView: View {
     let thumbnail: NSImage?
     @Binding var selection: CustomVideoCompositionInstruction.LetterboxMode
 
-    private let modes = CustomVideoCompositionInstruction.LetterboxMode.allCases
+    /// 下段 3列の実アイテム幅を測定して上段 2列のサイズ合わせに使用
+    @State private var itemWidth: CGFloat = 0
+
     private let gridColumns: [GridItem] = [
+        GridItem(.flexible(), spacing: 12),
         GridItem(.flexible(), spacing: 12),
         GridItem(.flexible(), spacing: 12)
     ]
 
     var body: some View {
         VStack(spacing: 12) {
-            HStack {
-                Label("Crop Preview", systemImage: "crop")
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(.primary)
-                Spacer()
+            // ── 上段 2列・中央揃え（itemWidth = 下段の1列幅）──
+            HStack(spacing: 12) {
+                modeButton(.fitWidth)
+                    .frame(width: itemWidth > 0 ? itemWidth : nil)
+                modeButton(.fitHeight)
+                    .frame(width: itemWidth > 0 ? itemWidth : nil)
             }
 
+            // ── 下段 3列・アイテム幅を測定 ──
             LazyVGrid(columns: gridColumns, spacing: 12) {
-                ForEach(modes, id: \.self) { mode in
-                    Button(action: {
-                        withAnimation(.spring(response: 0.28, dampingFraction: 0.76)) {
-                            selection = mode
+                modeButton(.centerSquare)
+                    .background(
+                        GeometryReader { geo in
+                            Color.clear
+                                .onAppear { itemWidth = geo.size.width }
+                                .onChange(of: geo.size.width) { itemWidth = $0 }
                         }
-                    }) {
-                        CropPreviewThumbnail(image: thumbnail, mode: mode, isSelected: selection == mode)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
+                    )
+                modeButton(.centerPortrait4x3)
+                modeButton(.centerPortrait3x4)
             }
         }
         // ensure top inset matches the close button so the title and xmark align
         .padding(.horizontal, 12)
         .padding(.top, 8)
         .padding(.bottom, 6)
+    }
+
+    @ViewBuilder
+    private func modeButton(_ mode: CustomVideoCompositionInstruction.LetterboxMode) -> some View {
+        Button(action: {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.76)) {
+                selection = mode
+            }
+        }) {
+            CropPreviewThumbnail(image: thumbnail, mode: mode, isSelected: selection == mode)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -634,7 +751,8 @@ private struct CropPreviewThumbnail: View {
         let outputAspect: CGFloat = 9.0 / 16.0
         let targetAspect: CGFloat = {
             switch mode {
-            case .fitWidth: return outputAspect
+            case .fitWidth:  return outputAspect
+            case .fitHeight: return outputAspect  // unused; handled separately below
             case .centerSquare: return 1.0
             case .centerPortrait4x3: return 3.0 / 4.0
             case .centerPortrait3x4: return 4.0 / 3.0
@@ -650,6 +768,17 @@ private struct CropPreviewThumbnail: View {
                 .resizable()
                 .aspectRatio(contentMode: .fit)
                 .frame(width: canvasSize.width, height: scaledHeight)
+                .clipped()
+                .position(x: canvasSize.width * 0.5, y: canvasSize.height * 0.5)
+        } else if mode == .fitHeight {
+            // Fit the source height to the canvas height (left/right crop).
+            let scale = canvasSize.height / img.size.height
+            let scaledWidth = img.size.width * scale
+
+            return Image(nsImage: img)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: scaledWidth, height: canvasSize.height)
                 .clipped()
                 .position(x: canvasSize.width * 0.5, y: canvasSize.height * 0.5)
         } else {
@@ -669,216 +798,278 @@ private struct CropPreviewThumbnail: View {
 
 @MainActor
 class ContentViewModel: ObservableObject {
-    @Published var selectedVideoURL: URL? {
+
+    // MARK: - ファイル選択（バッチ対応）
+
+    /// 選択 / D&D されたファイル URL リスト（単体ファイルも含む）
+    @Published var selectedVideoURLs: [URL] = [] {
         didSet {
-            if let _ = selectedVideoURL {
-                self.hasConverted = false
-                generateThumbnail()
-            } else {
+            if selectedVideoURLs.isEmpty {
                 self.thumbnail = nil
+                self.videoDuration = 0.0
+            } else {
+                self.hasConverted = false
+                self.thumbnailTime = 1.0
+                generateThumbnail()
+                loadVideoDuration()
             }
         }
     }
+
+    /// 後方互換用: 先頭 URL（単体ファイルモードや UI 表示に使用）
+    var selectedVideoURL: URL? { selectedVideoURLs.first }
+
     @Published var thumbnail: NSImage? = nil
+    /// 動画の総デュレーション（秒）。0 はまだ取得できていないか不明。
+    @Published var videoDuration: Double = 0.0
+    /// プレビューでサムネイルを取得する時刻（秒）
+    @Published var thumbnailTime: Double = 1.0
     @Published var exportSettings = VideoExportSettings()
     @Published var hasConverted: Bool = false
     @Published var smartFramingEnabled: Bool = false
     @Published var smartFramingSmoothness: SmartFramingSettings.Smoothness = .normal
     @Published var letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth
     @Published var hdrConversionEnabled: Bool = false
-    @Published var hdrTarget: CustomVideoCompositionInstruction.HDRTarget = .sRGB
+    @Published var toneMappingMode: CustomVideoCompositionInstruction.ToneMappingMode = .natural
     @Published var isProcessing: Bool = false
     @Published var progress: Double = 0.0
     @Published var phaseLabel: String = ""
     @Published var statusMessage: String = ""
     @Published var hasError: Bool = false
-    
+
     private let videoProcessor = VideoProcessor()
     private var conversionTask: Task<Void, Never>?
-    
+
+    // MARK: - ファイル選択パネル
+
     func selectFile() {
         let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = false
+        panel.allowsMultipleSelection = true   // 複数選択対応
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         panel.allowedContentTypes = [.movie, .video, .mpeg4Movie, .quickTimeMovie]
-        
-        if panel.runModal() == .OK {
-            self.selectedVideoURL = panel.url
+
+        if panel.runModal() == .OK, !panel.urls.isEmpty {
+            self.selectedVideoURLs = panel.urls
             self.hasConverted = false
         }
     }
-    
-    func handleDrop(providers: [NSItemProvider]) {
-        guard let provider = providers.first else { return }
-        
 
-        // 1) Preferred modern API: try loading a URL/NSURL object directly
-        if provider.canLoadObject(ofClass: NSURL.self) {
-            provider.loadObject(ofClass: NSURL.self) { (obj, error) in
+    // MARK: - D&D（複数ファイル対応）
+
+    func handleDrop(providers: [NSItemProvider]) {
+        guard !providers.isEmpty else { return }
+
+        let total = providers.count
+        let lock = DispatchQueue(label: "drop.url.lock")
+        var completedCount = 0
+        var loadedURLs: [URL] = []
+
+        func finalize() {
+            // lock キューで呼ぶこと
+            completedCount += 1
+            if completedCount == total {
+                let urls = loadedURLs
                 DispatchQueue.main.async {
-                    if let nsurl = obj as? NSURL {
-                        self.selectedVideoURL = nsurl as URL
+                    if !urls.isEmpty {
+                        self.selectedVideoURLs = urls
                         self.hasConverted = false
-                        return
                     }
-                    // If that didn't work, continue to fallback attempts
-                    self.attemptFileLoadFallback(provider: provider)
                 }
             }
-            return
         }
 
-        // Otherwise, try fallbacks
-        attemptFileLoadFallback(provider: provider)
+        for provider in providers {
+            if provider.canLoadObject(ofClass: NSURL.self) {
+                provider.loadObject(ofClass: NSURL.self) { (obj, _) in
+                    lock.async {
+                        if let nsurl = obj as? NSURL { loadedURLs.append(nsurl as URL) }
+                        finalize()
+                    }
+                }
+            } else {
+                provider.loadFileRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { (tempURL, _) in
+                    if let temp = tempURL {
+                        lock.async {
+                            loadedURLs.append(temp)
+                            finalize()
+                        }
+                    } else {
+                        // フォールバック: loadItem で再試行
+                        provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { (item, _) in
+                            lock.async {
+                                if let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) {
+                                    loadedURLs.append(url)
+                                } else if let url = item as? URL {
+                                    loadedURLs.append(url)
+                                } else if let nsurl = item as? NSURL {
+                                    loadedURLs.append(nsurl as URL)
+                                }
+                                finalize()
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    private func attemptFileLoadFallback(provider: NSItemProvider) {
-        // 2) Try loadFileRepresentation for a temp local URL
-        provider.loadFileRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { (tempURL, error) in
-            if let temp = tempURL {
-                DispatchQueue.main.async {
-                    self.selectedVideoURL = temp
-                    self.hasConverted = false
-                }
-                return
-            }
+    // MARK: - サムネイル生成
 
-            // 3) Last-resort: loadItem and handle multiple possible return types
-            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { (item, error) in
-                DispatchQueue.main.async {
-                    if let data = item as? Data,
-                       let url = URL(dataRepresentation: data, relativeTo: nil) {
-                        self.selectedVideoURL = url
-                        self.hasConverted = false
-                    } else if let url = item as? URL {
-                        self.selectedVideoURL = url
-                        self.hasConverted = false
-                    } else if let nsurl = item as? NSURL {
-                        self.selectedVideoURL = nsurl as URL
-                        self.hasConverted = false
-                    } else if let str = item as? String, let url = URL(string: str) {
-                        self.selectedVideoURL = url
-                        self.hasConverted = false
-                    } else {
-                    }
-                }
-            }
-        }
+    /// 現在の thumbnailTime でサムネイルを再生成（プレビューの「Seek」ボタン用）
+    func generateThumbnailAtCurrentTime() {
+        generateThumbnail()
     }
 
     private func generateThumbnail() {
         thumbnail = nil
-        guard let url = selectedVideoURL else { return }
+        guard let url = selectedVideoURLs.first else { return }
 
         let asset = AVAsset(url: url)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
-        // reasonable max size for thumbnails
         generator.maximumSize = CGSize(width: 960, height: 960)
 
-        let time = CMTime(seconds: 1.0, preferredTimescale: 600)
+        let seekTime = CMTime(seconds: thumbnailTime, preferredTimescale: 600)
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 var actual = CMTime.zero
-                let cgImage = try generator.copyCGImage(at: time, actualTime: &actual)
+                let cgImage = try generator.copyCGImage(at: seekTime, actualTime: &actual)
                 let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-                DispatchQueue.main.async {
-                    self.thumbnail = nsImage
-                }
+                DispatchQueue.main.async { self.thumbnail = nsImage }
             } catch {
-                // fallback to time zero
+                // フォールバック: 先頭フレームを取得
                 do {
                     var actual = CMTime.zero
-                    let cgImage = try generator.copyCGImage(at: CMTime.zero, actualTime: &actual)
+                    let cgImage = try generator.copyCGImage(at: .zero, actualTime: &actual)
                     let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-                    DispatchQueue.main.async {
-                        self.thumbnail = nsImage
-                    }
+                    DispatchQueue.main.async { self.thumbnail = nsImage }
                 } catch {
-                    // could not generate thumbnail
+                    // サムネイル取得不可
                 }
             }
         }
     }
-    
+
+    // MARK: - 動画デュレーション読み込み
+
+    private func loadVideoDuration() {
+        videoDuration = 0.0
+        guard let url = selectedVideoURLs.first else { return }
+        Task {
+            let asset = AVAsset(url: url)
+            do {
+                let duration = try await asset.load(.duration)
+                let secs = duration.seconds
+                self.videoDuration = (secs.isNaN || secs.isInfinite) ? 0.0 : max(secs, 0.0)
+            } catch {
+                self.videoDuration = 0.0
+            }
+        }
+    }
+
+    // MARK: - キャンセル
+
     func cancelConversion() {
         conversionTask?.cancel()
         conversionTask = nil
     }
 
+    // MARK: - 変換（バッチ対応）
+
     func convertVideo() {
-        guard let inputURL = selectedVideoURL else { return }
+        guard !selectedVideoURLs.isEmpty else { return }
 
-        // Mark conversion as not-yet-completed at start
         self.hasConverted = false
-
         isProcessing = true
         hasError = false
         statusMessage = "Starting conversion..."
         progress = 0.0
         DockProgress.start()
 
-        // 出力ファイル名を生成（ProRes は .mov）
-        let inputFilename = inputURL.deletingPathExtension().lastPathComponent
-        let outExt = (exportSettings.codec == .prores422VT) ? "mov" : "mp4"
-        let outputURL = inputURL.deletingLastPathComponent()
-            .appendingPathComponent("\(inputFilename)_vertical")
-            .appendingPathExtension(outExt)
+        let urlsToProcess = selectedVideoURLs
+        let capturedExportSettings = exportSettings
+        let smartSettings = SmartFramingSettings(enabled: smartFramingEnabled, smoothness: smartFramingSmoothness)
+        let lboxMode = letterboxMode
+        let hdrEnabled = hdrConversionEnabled
+        let toneMode = toneMappingMode
+        let total = urlsToProcess.count
 
         conversionTask = Task {
-            do {
-                // セキュリティスコープ付きリソースへのアクセスを開始
-                let isAccessingSecurityScope = inputURL.startAccessingSecurityScopedResource()
-                defer {
-                    if isAccessingSecurityScope {
-                        inputURL.stopAccessingSecurityScopedResource()
-                    }
-                }
+            var completedCount = 0
+            var lastOutputURL: URL? = nil
 
-                // スマートフレーミング設定を作成
-                let settings = SmartFramingSettings(
-                    enabled: smartFramingEnabled,
-                    smoothness: smartFramingSmoothness
-                )
+            for (index, inputURL) in urlsToProcess.enumerated() {
+                if Task.isCancelled { break }
 
-                try await videoProcessor.convertToVertical(
-                    inputURL: inputURL,
-                    outputURL: outputURL,
-                    exportSettings: exportSettings,
-                    smartFramingSettings: settings,
-                    letterboxMode: letterboxMode,
-                    hdrConversionEnabled: hdrConversionEnabled,
-                    hdrTarget: hdrTarget,
-                    progressHandler: { progress, label in
-                        Task { @MainActor in
-                            self.progress = progress
-                            self.phaseLabel = label
-                            DockProgress.update(progress)
+                let filePrefix = total > 1 ? "[\(index + 1)/\(total)] " : ""
+                let isAccessing = inputURL.startAccessingSecurityScopedResource()
+                defer { if isAccessing { inputURL.stopAccessingSecurityScopedResource() } }
+
+                let outExt = (capturedExportSettings.codec == .prores422VT) ? "mov" : "mp4"
+                let inputFilename = inputURL.deletingPathExtension().lastPathComponent
+                let outputURL = inputURL.deletingLastPathComponent()
+                    .appendingPathComponent("\(inputFilename)_vertical")
+                    .appendingPathExtension(outExt)
+
+                // ファイルごとの進捗基準値をキャプチャ（クロージャが後から参照しても正しい値を使うため）
+                let countBeforeFile = completedCount
+
+                do {
+                    try await videoProcessor.convertToVertical(
+                        inputURL: inputURL,
+                        outputURL: outputURL,
+                        exportSettings: capturedExportSettings,
+                        smartFramingSettings: smartSettings,
+                        letterboxMode: lboxMode,
+                        hdrConversionEnabled: hdrEnabled,
+                        toneMappingMode: toneMode,
+                        progressHandler: { prog, label in
+                            Task { @MainActor in
+                                let overall = (Double(countBeforeFile) + prog) / Double(total)
+                                self.progress = overall
+                                self.phaseLabel = "\(filePrefix)\(label)"
+                                DockProgress.update(overall)
+                            }
                         }
+                    )
+                    completedCount += 1
+                    lastOutputURL = outputURL
+
+                    if total == 1 {
+                        self.statusMessage = "Conversion complete!\nSaved to: \(outputURL.path)"
+                        self.hasConverted = true
+                        NSWorkspace.shared.activateFileViewerSelecting([outputURL])
+                    } else {
+                        self.statusMessage = "[\(completedCount)/\(total)] Converted: \(inputURL.lastPathComponent)"
+                        self.progress = Double(completedCount) / Double(total)
+                        DockProgress.update(self.progress)
                     }
-                )
-
-                self.statusMessage = "Conversion complete!\nSaved to: \(outputURL.path)"
-                self.hasError = false
-
-                // Mark successful conversion
-                self.hasConverted = true
-
-                // 保存先をFinderで表示
-                NSWorkspace.shared.activateFileViewerSelecting([outputURL])
-            } catch VideoProcessorError.cancelled {
-                self.statusMessage = "Conversion cancelled"
-                self.hasError = false
-                self.hasConverted = false
-            } catch {
-                self.statusMessage = "Error: \(error.localizedDescription)"
-                self.hasError = true
-                self.hasConverted = false
+                } catch VideoProcessorError.cancelled {
+                    self.statusMessage = "Conversion cancelled"
+                    self.hasError = false
+                    self.hasConverted = false
+                    break
+                } catch {
+                    self.statusMessage = "\(filePrefix)Error: \(error.localizedDescription)"
+                    self.hasError = true
+                    // バッチモードでは次のファイルへ続行（単体は停止）
+                    if total == 1 { break }
+                }
             }
 
-            // Clear the transient phase label so "Converting..." doesn't remain visible
+            // バッチ完了サマリー
+            if total > 1, completedCount > 0, !Task.isCancelled {
+                let failed = total - completedCount
+                let failSuffix = failed > 0 ? " (\(failed) failed)" : ""
+                self.statusMessage = "Batch complete: \(completedCount)/\(total) files converted\(failSuffix)"
+                self.hasConverted = (completedCount == total)
+                if let lastURL = lastOutputURL {
+                    NSWorkspace.shared.activateFileViewerSelecting([lastURL])
+                }
+            }
+
             self.phaseLabel = ""
             self.isProcessing = false
             DockProgress.stop()

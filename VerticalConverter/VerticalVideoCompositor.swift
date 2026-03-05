@@ -26,6 +26,10 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     static var staticColorPrimaries: String = ""
     /// YCbCr matrix string detected from source
     static var staticYCbCrMatrix: String = ""
+    /// Tone mapping mode set by VideoProcessor before compositor instantiation.
+    /// Used by primeCIContext() to warm up the exact same CIFilter/kernel chain
+    /// that frame 0 will use.
+    static var staticToneMappingMode: CustomVideoCompositionInstruction.ToneMappingMode = .natural
     private let renderQueue = DispatchQueue(label: "com.verticalconverter.renderqueue")
     private var renderContext: AVVideoCompositionRenderContext?
     private let ciContext: CIContext
@@ -49,7 +53,121 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     private var letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth
     // HDR -> SDR
     private var hdrConversionEnabled: Bool = false
-    private var hdrTarget: CustomVideoCompositionInstruction.HDRTarget = .sRGB
+    private var toneMappingMode: CustomVideoCompositionInstruction.ToneMappingMode = .natural
+
+    // MARK: - Tone Map Kernels
+    //
+    // Two styles are provided:
+    //
+    // 1) **Natural** (Reinhard extended + desaturation):
+    //    Gentle highlight compression that preserves the original Rec.709/sRGB
+    //    color relationships. Highlights roll off smoothly without the S-curve
+    //    contrast boost of film stock emulation. The result looks like a
+    //    standard broadcast/consumer SDR render of the same scene.
+    //
+    //    Reinhard extended: t = x / (1 + x) × (1 + x / Lmax²)
+    //    Plus a subtle desaturation ramp in the highlights to avoid neon
+    //    blowouts that pure per-channel curves produce.
+    //
+    // 2) **Cinematic** (ACES filmic):
+    //    Industry-standard Academy curve with toe contrast lift, mid-tone
+    //    saturation, and smooth shoulder. Produces a graded, film-like look.
+
+    // ── Natural: Reinhard extended with highlight desaturation ──
+    private static let naturalToneMapKernel: CIColorKernel? = {
+        CIColorKernel(source: """
+            kernel vec4 naturalToneMap(__sample s) {
+                vec3 x = max(s.rgb, vec3(0.0));
+                // Reinhard extended (Lmax ~ 6.0 for typical HLG headroom)
+                float Lmax2 = 36.0;
+                vec3 t = x * (1.0 + x / Lmax2) / (1.0 + x);
+                // Subtle highlight desaturation: as luminance rises toward 1.0,
+                // blend toward the luminance to tame neon blowouts.
+                float lum = dot(t, vec3(0.2126, 0.7152, 0.0722));
+                float desat = smoothstep(0.5, 1.0, lum) * 0.4;
+                vec3 result = mix(t, vec3(lum), desat);
+                return vec4(clamp(result, 0.0, 1.0), s.a);
+            }
+        """)
+    }()
+
+    // ── Cinematic: ACES filmic ──
+    // CIContext's color-space conversion alone does NOT perform tone mapping;
+    // it simply clips linear values > 1.0 when rendering to an SDR color space.
+    // This destroys the relative brightness relationships of HDR content and
+    // produces a washed-out / pale image.
+    //
+    // The ACES filmic curve compresses the full HDR range into [0, 1] with
+    // natural highlight roll-off and good mid-tone / saturation preservation.
+    //
+    //   f(x) = clamp((x·(2.51x + 0.03)) / (x·(2.43x + 0.59) + 0.14), 0, 1)
+    //
+    // At reference white (x ≈ 1.0) → ~0.80 (maps to ~0.91 sRGB after gamma).
+    // At 5× reference white         → ~0.99 (smooth roll-off, no hard clip).
+    private static let acesToneMapKernel: CIColorKernel? = {
+        CIColorKernel(source: """
+            kernel vec4 acesToneMap(__sample s) {
+                vec3 x = max(s.rgb, vec3(0.0));
+                float a = 2.51;
+                float b = 0.03;
+                float c = 2.43;
+                float d = 0.59;
+                float e = 0.14;
+                vec3 m = clamp((x * (a * x + b)) / (x * (c * x + d) + e),
+                               0.0, 1.0);
+                return vec4(m, s.a);
+            }
+        """)
+    }()
+
+    /// Apply natural (Reinhard) tone mapping to a CIImage.
+    private func applyNaturalToneMap(to image: CIImage) -> CIImage {
+        guard let kernel = Self.naturalToneMapKernel else {
+            NSLog("VerticalVideoCompositor: Natural tone-map kernel unavailable")
+            return image
+        }
+        return kernel.apply(extent: image.extent, arguments: [image]) ?? image
+    }
+
+    /// Apply ACES filmic tone mapping to a CIImage (cinematic fallback).
+    private func applyACESToneMap(to image: CIImage) -> CIImage {
+        guard let kernel = Self.acesToneMapKernel else {
+            NSLog("VerticalVideoCompositor: ACES tone-map kernel unavailable")
+            return image
+        }
+        return kernel.apply(extent: image.extent, arguments: [image]) ?? image
+    }
+
+    /// Apply HDR → SDR tone mapping based on the selected `toneMappingMode`.
+    ///
+    /// - **Natural** (default): Reinhard extended + highlight desaturation.
+    ///   On macOS 15+ also tries `CIToneMapHeadroom` which produces an
+    ///   Apple-standard neutral result. Falls back to Reinhard kernel.
+    ///
+    /// - **Cinematic**: ACES filmic curve for a graded, film-like look.
+    ///   On macOS 15+ uses `CIToneMapHeadroom` as primary (its rendering
+    ///   is already quite cinematic), with ACES kernel as legacy fallback.
+    private func applyToneMapping(to image: CIImage) -> CIImage {
+        let tLower = VerticalVideoCompositor.staticTransferFunction.lowercased()
+
+        switch toneMappingMode {
+        case .cinematic:
+            // Cinematic: prefer Apple Headroom, fall back to ACES
+            if #available(macOS 15.0, iOS 18.0, *) {
+                let sourceHeadroom: Float = (tLower.contains("pq") || tLower.contains("2084")) ? 16.0 : 4.0
+                return image.applyingFilter("CIToneMapHeadroom", parameters: [
+                    "inputSourceHeadroom": sourceHeadroom,
+                    "inputTargetHeadroom": Float(1.0)
+                ])
+            }
+            return applyACESToneMap(to: image)
+
+        case .natural:
+            // Natural: gentle Reinhard – faithful to Rec.709/sRGB
+            return applyNaturalToneMap(to: image)
+        }
+    }
+
     override init() {
         // Use extended linear sRGB as working color space so CoreImage can
         // represent HDR values (> 1.0) without clipping during compositing.
@@ -125,6 +243,13 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     ///
     /// 解決策：本番 ciContext で本番 composeFrame を完全に通す。
     /// dummy バッファへの書き込みなので出力は捨てる。
+    ///
+    /// CRITICAL (IOSurface):
+    /// AVFoundation のデコーダとレンダーコンテキストのピクセルバッファプールは
+    /// IOSurface/Metal 互換のバッファを返す。CIContext は IOSurface 有無で
+    /// Metal テクスチャの生成パスが異なるため、prime でも IOSurface 付きの
+    /// バッファを使う必要がある。これがないと frame 0 で別の Metal パスが走り
+    /// ガンマが狂う。
     private func primeCIContext(renderSize: CGSize) {
         let isHDRPassthrough = VerticalVideoCompositor.staticSourceIsHDR
             && !VerticalVideoCompositor.staticHDRConversionEnabled
@@ -138,66 +263,151 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         let width = Int(renderSize.width)
         let height = Int(renderSize.height)
 
-        var dummyOut: CVPixelBuffer?
+        // IOSurface + Metal 互換属性。AVFoundation の本番バッファと同じ
+        // バッキングを使うことで CIContext 内部の Metal テクスチャ生成パスを
+        // 本番と一致させる。
+        let ioSurfaceAttrs: [String: Any] = [
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+            kCVPixelBufferMetalCompatibilityKey as String: true
+        ]
+
+        // 出力バッファ: renderContext のプールから取得（本番と同一プロパティ）。
+        // プール未準備時は IOSurface 付きで自前生成。
+        let outBuf: CVPixelBuffer
+        if let poolBuf = renderContext?.newPixelBuffer() {
+            outBuf = poolBuf
+        } else {
+            var temp: CVPixelBuffer?
+            CVPixelBufferCreate(kCFAllocatorDefault, width, height, outputFormat,
+                                ioSurfaceAttrs as CFDictionary, &temp)
+            guard let t = temp else { return }
+            outBuf = t
+        }
+
+        // ソースバッファ: IOSurface + Metal 互換で生成
         var dummySrc: CVPixelBuffer?
-        CVPixelBufferCreate(kCFAllocatorDefault, width, height, outputFormat, nil, &dummyOut)
-        CVPixelBufferCreate(kCFAllocatorDefault, width, height, srcFormat, nil, &dummySrc)
-        guard let outBuf = dummyOut, let srcBuf = dummySrc else { return }
+        CVPixelBufferCreate(kCFAllocatorDefault, width, height, srcFormat,
+                            ioSurfaceAttrs as CFDictionary, &dummySrc)
+        guard let srcBuf = dummySrc else { return }
+
+        // ソースバッファに非ゼロのピクセル値を書き込む。
+        // 全ゼロデータは Metal の fast-clear 最適化により実際のシェーダー実行が
+        // スキップされる可能性がある。HDR ソースには half-float 2.0 (0x4000) を
+        // 書いてトーンマッピングカーブの圧縮領域を実際に通す。
+        CVPixelBufferLockBaseAddress(srcBuf, [])
+        if let baseAddr = CVPixelBufferGetBaseAddress(srcBuf) {
+            let bytesPerRow = CVPixelBufferGetBytesPerRow(srcBuf)
+            if srcFormat == kCVPixelFormatType_64RGBAHalf {
+                // Half-float 2.0 = 0x4000 — typical HLG bright pixel
+                for row in 0..<height {
+                    let rowPtr = baseAddr.advanced(by: row * bytesPerRow)
+                        .assumingMemoryBound(to: UInt16.self)
+                    for i in 0..<(width * 4) {
+                        rowPtr[i] = 0x4000
+                    }
+                }
+            } else {
+                // 32BGRA: mid-gray (128)
+                memset(baseAddr, 0x80, bytesPerRow * height)
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(srcBuf, [])
 
         // instance variables のバックアップ（prime 後に復元）
         let savedHDR = hdrConversionEnabled
-        let savedTarget = hdrTarget
         let savedSmart = smartFramingEnabled
+        let savedToneMap = toneMappingMode
 
         // prime 時は本番の設定を使う（static から派生）
         hdrConversionEnabled = VerticalVideoCompositor.staticHDRConversionEnabled
-        hdrTarget = .sRGB
+        toneMappingMode = VerticalVideoCompositor.staticToneMappingMode
         smartFramingEnabled = false   // letterbox パスを強制（Vision 不要）
 
-        // 本番 ciContext で本番 composeFrame を完全に通す。
-        // これにより Metal コマンドバッファ・テクスチャキャッシュが
-        // frame 0 と同じ条件で初期化される。
-        composeFrame(
-            sourcePixelBuffer: srcBuf,
-            outputPixelBuffer: outBuf,
-            renderSize: renderSize
-        )
+        // 本番 ciContext で本番 composeFrame を 2 回完全に通す。
+        // 1 回目: Metal シェーダーコンパイル + パイプラインステート生成 +
+        //         テクスチャキャッシュ初期化
+        // 2 回目: コマンドバッファ・IOSurface バッキングの定常状態を確立。
+        //         1 回だけでは lazy-init が完了しないケースがある。
+        for _ in 0..<2 {
+            composeFrame(
+                sourcePixelBuffer: srcBuf,
+                outputPixelBuffer: outBuf,
+                renderSize: renderSize
+            )
+        }
 
         // instance variables を復元
         hdrConversionEnabled = savedHDR
-        hdrTarget = savedTarget
         smartFramingEnabled = savedSmart
+        toneMappingMode = savedToneMap
         // outBuf / srcBuf の内容は破棄される
     }
 
     // MARK: - Source color space resolution
 
     /// Return the correct CGColorSpace for HDR source buffers.
-    /// Uses ONLY the static metadata detected from the track's format description.
-    /// NEVER depend on per-frame CVBuffer properties because some decoders
-    /// deliver frame 0 without correct color metadata, causing frame-to-frame
-    /// color space inconsistency (the root cause of the 1-frame gamma bug).
-    private static func resolvedHDRSourceColorSpace() -> CGColorSpace {
+    ///
+    /// The correct color space depends on whether we are doing HDR passthrough
+    /// or HDR→SDR conversion:
+    ///
+    /// **HDR→SDR** (`forToneMapping: true`):
+    ///   Use the non-linear `itur_2100_HLG` / `itur_2100_PQ` color space.
+    ///   AVFoundation’s decoder outputs 64RGBAHalf with OETF-encoded values.
+    ///   Tagging with the correct non-linear CS makes CIContext apply the
+    ///   inverse OETF during processing, producing true linear values in the
+    ///   working space. Tone mapping then compresses these to [0, 1].
+    ///
+    /// **HDR passthrough** (`forToneMapping: false`):
+    ///   Use `extendedLinearITUR_2020`. This tells CIContext the values are
+    ///   already linear, so it skips the OETF→linear→OETF round-trip.
+    ///   The HLG OOTF (system gamma ~1.2) applied during linearization
+    ///   combined with the sRGB working-space conversion does not perfectly
+    ///   round-trip, causing systematic darkening of the entire image.
+    ///   Since passthrough only needs geometric transforms (scale, translate,
+    ///   crop) and a background blur, skipping linearization is safe and
+    ///   avoids the brightness loss.
+    private static func resolvedHDRSourceColorSpace(forToneMapping: Bool) -> CGColorSpace {
+        let tLower = staticTransferFunction.lowercased()
         let pLower = staticColorPrimaries.lowercased()
 
-        // 64RGBAHalf from the decoder is LINEAR light.
-        // Use the extendedLinear variant of the source gamut.
-        if pLower.contains("2020") {
-            if let cs = CGColorSpace(name: CGColorSpace.extendedLinearITUR_2020) {
-                return cs
-            }
-        } else if pLower.contains("p3") {
-            if let cs = CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3) {
-                return cs
+        if forToneMapping {
+            // Non-linear: CIContext will apply inverse OETF for proper tone mapping.
+            if tLower.contains("hlg") {
+                if pLower.contains("2020") {
+                    if let cs = CGColorSpace(name: CGColorSpace.itur_2100_HLG) {
+                        return cs
+                    }
+                }
+            } else if tLower.contains("pq") || tLower.contains("2084") {
+                if pLower.contains("2020") {
+                    if let cs = CGColorSpace(name: CGColorSpace.itur_2100_PQ) {
+                        return cs
+                    }
+                }
             }
         }
-        // Fallback: extendedLinearSRGB
+
+        // Passthrough or fallback: extended linear – no OETF round-trip
+        if pLower.contains("2020") {
+            return CGColorSpace(name: CGColorSpace.extendedLinearITUR_2020)
+                ?? CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
+                ?? CGColorSpaceCreateDeviceRGB()
+        } else if pLower.contains("p3") {
+            return CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)
+                ?? CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
+                ?? CGColorSpaceCreateDeviceRGB()
+        }
         return CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
             ?? CGColorSpaceCreateDeviceRGB()
     }
 
     func startRequest(_ asyncVideoCompositionRequest: AVAsynchronousVideoCompositionRequest) {
         renderQueue.async { [weak self] in
+            // autoreleasepool: CIImage / CIContext render intermediates and
+            // CVPixelBuffer wrappers are autoreleased. Without a pool each
+            // frame's temporaries accumulate until the queue drains, which
+            // for a long video means gigabytes of unreleased memory.
+            autoreleasepool {
             guard let self = self else {
                 asyncVideoCompositionRequest.finish(with: NSError(
                     domain: "VerticalVideoCompositor",
@@ -242,10 +452,9 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             self.letterboxMode = instruction.letterboxMode
             // HDR settings
             let hdrEnabled = instruction.hdrConversionEnabled
-            let hdrTarget = instruction.hdrTarget
             // store in local vars for composeFrame
             self.hdrConversionEnabled = hdrEnabled
-            self.hdrTarget = hdrTarget
+            self.toneMappingMode = instruction.toneMappingMode
 
             guard let sourcePixelBuffer = asyncVideoCompositionRequest.sourceFrame(byTrackID: layerInstruction.trackID) else {
                 asyncVideoCompositionRequest.finish(with: NSError(
@@ -278,6 +487,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             
             asyncVideoCompositionRequest.finish(withComposedVideoFrame: outputPixelBuffer)
             removePending()
+            } // end autoreleasepool
         }
     }
     
@@ -295,8 +505,10 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         // "first frame gamma mismatch" bug.
         let sourceColorSpace: CGColorSpace
         if VerticalVideoCompositor.staticSourceIsHDR {
-            // Same color space for ALL HDR frames — both passthrough and →SDR.
-            sourceColorSpace = Self.resolvedHDRSourceColorSpace()
+            // Use non-linear CS for tone mapping, linear for passthrough
+            sourceColorSpace = Self.resolvedHDRSourceColorSpace(
+                forToneMapping: hdrConversionEnabled
+            )
         } else {
             // SDR: Use sRGB consistently for ALL frames.
             // DO NOT use per-buffer CVImageBufferGetColorSpace — frame 0 may
@@ -336,27 +548,31 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         if hdrConversionEnabled {
             // HDR->SDR: CoreImage color space conversion handles the EOTF mapping
             // during the render call below. Mark output buffer with the correct
-            // transfer function for the selected target.
+            // transfer function (always Rec.709 for SDR output).
             let primariesStr = NSString(string: "ITU_R_709_2")
             let matrixStr    = NSString(string: "ITU_R_709_2")
-            // sRGB uses the IEC 61966-2.1 piecewise gamma;
-            // Rec.709 uses the pure power curve.
-            let transferStr: NSString = (hdrTarget == .sRGB)
-                ? (kCVImageBufferTransferFunction_sRGB as NSString)
-                : (kCVImageBufferTransferFunction_ITU_R_709_2 as NSString)
+            let transferStr: NSString = kCVImageBufferTransferFunction_ITU_R_709_2 as NSString
             CVBufferSetAttachment(outputPixelBuffer, kCVImageBufferColorPrimariesKey as CFString, primariesStr, .shouldPropagate)
             CVBufferSetAttachment(outputPixelBuffer, kCVImageBufferTransferFunctionKey as CFString, transferStr, .shouldPropagate)
             CVBufferSetAttachment(outputPixelBuffer, kCVImageBufferYCbCrMatrixKey as CFString, matrixStr, .shouldPropagate)
         } else {
             // Preserve HDR/SDR metadata on the output buffer.
-            // First try to copy from the source buffer's attachments.
-            let attachKeys: [CFString] = [
-                kCVImageBufferColorPrimariesKey as CFString,
-                kCVImageBufferTransferFunctionKey as CFString,
-                kCVImageBufferYCbCrMatrixKey as CFString,
-                kCVImageBufferMasteringDisplayColorVolumeKey as CFString,
-                kCVImageBufferContentLightLevelInfoKey as CFString
-            ]
+            //
+            // CRITICAL (VTB first-frame gamma workaround):
+            // For HDR sources, ALWAYS set primaries / transfer function /
+            // YCbCr matrix from track-level static metadata. NEVER copy
+            // these three keys from the source pixel buffer's per-frame
+            // attachments, because some VT decoders deliver frame 0 with
+            // INCORRECT colorimetry (e.g. Rec.709 instead of BT.2020/PQ).
+            // The previous code only fell back to static metadata when the
+            // transfer function was *missing*, but the real-world failure
+            // mode is *wrong* values being present — so the fallback never
+            // triggered and the wrong metadata propagated to VTB encoder,
+            // causing it to interpret frame 0 under a different EOTF.
+            //
+            // Optional per-frame keys (mastering display colour volume,
+            // content light level) are safe to copy from the source because
+            // they do not influence the EOTF / gamma interpretation.
             func makeCFCompatible(_ any: Any) -> CFTypeRef? {
                 if let ns = any as? NSString { return ns }
                 if let s = any as? String { return NSString(string: s) }
@@ -368,22 +584,9 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
                 return NSString(string: String(describing: any))
             }
 
-            var copiedTransfer = false
-            for key in attachKeys {
-                if let val = CVBufferGetAttachment(sourcePixelBuffer, key, nil) {
-                    if let cf = makeCFCompatible(val) {
-                        CVBufferSetAttachment(outputPixelBuffer, key, cf, .shouldPropagate)
-                        if key == kCVImageBufferTransferFunctionKey as CFString {
-                            copiedTransfer = true
-                        }
-                    }
-                }
-            }
-
-            // If the source buffer lacked color attachments (common on frame 0
-            // from certain decoders), fall back to the static metadata so the
-            // output buffer is ALWAYS correctly tagged.
-            if !copiedTransfer && VerticalVideoCompositor.staticSourceIsHDR {
+            if VerticalVideoCompositor.staticSourceIsHDR {
+                // ── HDR: force-write the three critical colorimetry keys
+                //    from track-level static metadata ──
                 let tf = VerticalVideoCompositor.staticTransferFunction
                 let pr = VerticalVideoCompositor.staticColorPrimaries
                 let mx = VerticalVideoCompositor.staticYCbCrMatrix
@@ -402,6 +605,32 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
                         kCVImageBufferYCbCrMatrixKey as CFString,
                         mx as NSString, .shouldPropagate)
                 }
+                // Copy optional mastering display + content light level from source
+                let optionalKeys: [CFString] = [
+                    kCVImageBufferMasteringDisplayColorVolumeKey as CFString,
+                    kCVImageBufferContentLightLevelInfoKey as CFString
+                ]
+                for key in optionalKeys {
+                    if let val = CVBufferGetAttachment(sourcePixelBuffer, key, nil) {
+                        if let cf = makeCFCompatible(val) {
+                            CVBufferSetAttachment(outputPixelBuffer, key, cf, .shouldPropagate)
+                        }
+                    }
+                }
+            } else {
+                // ── SDR: copy color attachments from source buffer ──
+                let attachKeys: [CFString] = [
+                    kCVImageBufferColorPrimariesKey as CFString,
+                    kCVImageBufferTransferFunctionKey as CFString,
+                    kCVImageBufferYCbCrMatrixKey as CFString
+                ]
+                for key in attachKeys {
+                    if let val = CVBufferGetAttachment(sourcePixelBuffer, key, nil) {
+                        if let cf = makeCFCompatible(val) {
+                            CVBufferSetAttachment(outputPixelBuffer, key, cf, .shouldPropagate)
+                        }
+                    }
+                }
             }
         }
 
@@ -409,19 +638,21 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         // sourceColorSpace is ALWAYS determined from static metadata for HDR
         // (never per-buffer), so this is perfectly consistent across all frames.
         if hdrConversionEnabled {
-            // HDR→SDR: CIContext converts from sourceColorSpace (e.g.
-            // extendedLinearITUR_2020) to the SDR target (sRGB/Rec.709).
-            let targetCS: CGColorSpace
-            switch hdrTarget {
-            case .sRGB:
-                targetCS = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-            case .rec709:
-                targetCS = CGColorSpace(name: CGColorSpace.itur_709) ?? CGColorSpaceCreateDeviceRGB()
-            }
+            // HDR→SDR: Apply tone mapping BEFORE the color-space conversion.
+            // Without this step CIContext simply clips linear values > 1.0,
+            // destroying brightness relationships and producing a washed-out
+            // / pale image. The source CIImage was created with the correct
+            // non-linear HLG/PQ color space, so CIContext has already applied
+            // the inverse OETF → the working-space values are true linear with
+            // HDR highlights > 1.0. Tone mapping compresses them to [0, 1].
+            let toneMapped = applyToneMapping(to: imageToRender)
+
+            // Always render to Rec.709 for SDR output
+            let targetCS: CGColorSpace = CGColorSpace(name: CGColorSpace.itur_709) ?? CGColorSpaceCreateDeviceRGB()
             // bounds を outputRect（固定矩形）で指定することで、
             // CIImage の論理 extent がフレームごとに変動しても
             // 常に同じ領域に render される。
-            ciContext.render(imageToRender, to: outputPixelBuffer, bounds: outputRect, colorSpace: targetCS)
+            ciContext.render(toneMapped, to: outputPixelBuffer, bounds: outputRect, colorSpace: targetCS)
         } else if VerticalVideoCompositor.staticSourceIsHDR {
             // HDR passthrough: render to the SAME static-based HDR color space
             // so no conversion happens. This avoids per-frame CS variation.
@@ -465,6 +696,20 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
                 .cropped(to: outputRect)
 
             return mainVideo.composited(over: blurredBg)
+        }
+
+        // 高さに合わせるモード（左右をクロップ・背景不要）
+        if mode == .fitHeight {
+            let scale = renderSize.height / sourceSize.height
+            let scaledWidth = sourceSize.width * scale
+            let mainX = (renderSize.width - scaledWidth) / 2  // 負値 → 左右が画面外へ
+
+            let mainVideo = sourceImage
+                .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+                .transformed(by: CGAffineTransform(translationX: mainX, y: 0))
+                .cropped(to: outputRect)
+
+            return mainVideo
         }
 
         // centerSquare / centerPortrait4x3 / centerPortrait3x4: 中央を指定アスペクトでクロップ
@@ -676,10 +921,6 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
 
         return 0
     }
-    // Previously a custom CIColorKernel handled inverse-EOTF, IDT and RRT.
-    // For now, remove the custom tonemapper and use a simpler CI-based
-    // path (linearization/exposure + gamma) to validate pipeline behavior.
-
     private func detectColorPrimaries(from pixelBuffer: CVPixelBuffer) -> Int {
         // 0 = unknown, 1 = BT.2020, 2 = DisplayP3, 3 = Rec.709/sRGB
         if let any = CVBufferGetAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey as CFString, nil) {
@@ -691,9 +932,4 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         return 0
     }
 
-    // applyHDRToSDR removed: HDR->SDR conversion is now handled entirely by
-    // CoreImage's color space management at render time. The CIImage retains
-    // the source color space (auto-detected from the CVPixelBuffer), and
-    // rendering to a Rec.709/sRGB CGColorSpace performs the correct EOTF
-    // mapping without the double-processing that broke SDR passthrough.
 }

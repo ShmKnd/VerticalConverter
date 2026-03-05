@@ -178,6 +178,492 @@ actor VideoProcessor {
         }
         return false
     }
+
+    // MARK: - hev1 detection & remux
+
+    /// Check whether the first video track of an asset uses the hev1 codec tag.
+    /// hev1 stores HEVC parameter sets in-band (NAL units) which AVFoundation's
+    /// composition pipeline cannot decode. We need to remux to hvc1 first.
+    private static func isHev1(asset: AVAsset) async -> Bool {
+        guard let videoTrack = try? await asset.loadTracks(withMediaType: .video).first,
+              let desc = videoTrack.formatDescriptions.first else {
+            return false
+        }
+        let fmt = desc as! CMFormatDescription
+        let codecType = CMFormatDescriptionGetMediaSubType(fmt)
+        let hev1FourCC: FourCharCode = 0x68657631 // 'hev1'
+        NSLog("VideoProcessor: input codec FourCC = %{public}@",
+              String(format: "%c%c%c%c",
+                     (codecType >> 24) & 0xFF,
+                     (codecType >> 16) & 0xFF,
+                     (codecType >> 8) & 0xFF,
+                     codecType & 0xFF))
+        return codecType == hev1FourCC
+    }
+
+    // MARK: - DNxHD/DNxHR 検知
+
+    /// DNxHD / DNxHR コーデックかどうか確認する。
+    /// macOS は Avid コーデックパックなしではこれらを復号できない。
+    /// 入力が DNx 系の場合、AVAssetReader はフレーム取得時に失敗または nil を返す。
+    static func isDNxCodec(asset: AVAsset) async -> Bool {
+        guard let videoTrack = try? await asset.loadTracks(withMediaType: .video).first,
+              let desc = videoTrack.formatDescriptions.first else { return false }
+        let fmt = desc as! CMFormatDescription
+        let codecType = CMFormatDescriptionGetMediaSubType(fmt)
+        NSLog("VideoProcessor: DNx check — codec FourCC = %{public}@",
+              String(format: "'%c%c%c%c'",
+                     (codecType >> 24) & 0xFF,
+                     (codecType >> 16) & 0xFF,
+                     (codecType >> 8)  & 0xFF,
+                     codecType & 0xFF))
+        // 既知の DNxHD/DNxHR FourCC 値:
+        //   0x4156646E = 'AVdn'  DNxHD (QuickTime MOV)
+        //   0x41564448 = 'AVDH'  DNxHR (QuickTime MOV)
+        //   0x64686C70 = 'dhlp'  DNxHR 444
+        //   0x41566468 = 'AVdh'  DNxHR MXF 変種
+        let dnxCodes: Set<FourCharCode> = [0x4156646E, 0x41564448, 0x64686C70, 0x41566468]
+        return dnxCodes.contains(codecType)
+    }
+
+    // MARK: - ProRes 検知
+
+    /// Apple ProRes コーデックかどうか確認する。
+    /// macOS は全 ProRes バリアント（422/4444 系）をネイティブにデコードできる。
+    static func isProResCodec(asset: AVAsset) async -> Bool {
+        guard let videoTrack = try? await asset.loadTracks(withMediaType: .video).first,
+              let desc = videoTrack.formatDescriptions.first else { return false }
+        let fmt = desc as! CMFormatDescription
+        let codecType = CMFormatDescriptionGetMediaSubType(fmt)
+        // ProRes FourCC 値:
+        //   'apcn' = ProRes 422 (Normal)    'apch' = ProRes 422 HQ
+        //   'apcs' = ProRes 422 LT          'apco' = ProRes 422 Proxy
+        //   'ap4h' = ProRes 4444            'ap4x' = ProRes 4444 XQ
+        let proresCodes: Set<FourCharCode> = [
+            0x6170636E, 0x61706368, 0x61706373, 0x6170636F, 0x61703468, 0x61703478
+        ]
+        return proresCodes.contains(codecType)
+    }
+
+    /// Remux an hev1 video file to hvc1 (no re-encoding, no quality loss).
+    ///
+    /// hev1 stores HEVC parameter sets (VPS/SPS/PPS) in-band as NAL units.
+    /// AVFoundation's composition pipeline requires hvc1, which stores them
+    /// out-of-band in an hvcC configuration record.
+    ///
+    /// This method:
+    ///  1. Reads compressed hev1 samples as-is (passthrough, no decode)
+    ///  2. Extracts VPS/SPS/PPS from the format description or bitstream
+    ///  3. Creates a proper hvc1 CMFormatDescription via
+    ///     CMVideoFormatDescriptionCreateFromHEVCParameterSets
+    ///  4. Writes samples with the correct format description
+    ///
+    /// Audio is copied as passthrough.
+    private func remuxHev1ToHvc1(
+        inputURL: URL,
+        outputURL: URL,
+        progressHandler: @escaping (Double) -> Void
+    ) async throws {
+        let remuxStart = CFAbsoluteTimeGetCurrent()
+        NSLog("VideoProcessor: remuxing hev1 → hvc1 (proper parameter set extraction)")
+        let asset = AVAsset(url: inputURL)
+
+        guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
+            throw VideoProcessorError.invalidInput
+        }
+
+        let origDesc = videoTrack.formatDescriptions.first as! CMFormatDescription
+
+        // ── Step 1: Determine NAL unit header length ──
+        // Try the original format description; if hev1 has an hvcC box, it
+        // reports the length. Default to 4 (standard for MP4/MOV).
+        var nalHeaderLength: Int32 = 4
+        var paramSetCountFromFmt: Int = 0
+        let fmtQueryStatus = CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+            origDesc,
+            parameterSetIndex: 0,
+            parameterSetPointerOut: nil,
+            parameterSetSizeOut: nil,
+            parameterSetCountOut: &paramSetCountFromFmt,
+            nalUnitHeaderLengthOut: &nalHeaderLength
+        )
+        NSLog("VideoProcessor: hev1 fmt query status=%d paramSetCount=%d nalHeaderLength=%d",
+              fmtQueryStatus, paramSetCountFromFmt, nalHeaderLength)
+
+        // ── Step 2: Try extracting parameter sets from format description ──
+        var parameterSets: [Data] = []
+        if fmtQueryStatus == noErr && paramSetCountFromFmt > 0 {
+            for i in 0..<paramSetCountFromFmt {
+                var ptr: UnsafePointer<UInt8>?
+                var size: Int = 0
+                let s = CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                    origDesc,
+                    parameterSetIndex: i,
+                    parameterSetPointerOut: &ptr,
+                    parameterSetSizeOut: &size,
+                    parameterSetCountOut: nil,
+                    nalUnitHeaderLengthOut: nil
+                )
+                if s == noErr, let p = ptr, size > 0 {
+                    parameterSets.append(Data(bytes: p, count: size))
+                }
+            }
+            NSLog("VideoProcessor: extracted %d parameter sets from hev1 format description", parameterSets.count)
+        }
+
+        // ── Step 3: If format description didn't have them, parse bitstream ──
+        // We need to read compressed samples to find VPS (type 32), SPS (33), PPS (34)
+        let reader = try AVAssetReader(asset: asset)
+        let videoOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
+        videoOutput.alwaysCopiesSampleData = false
+        guard reader.canAdd(videoOutput) else { throw VideoProcessorError.exportFailed }
+        reader.add(videoOutput)
+
+        let audioTrack = try? await asset.loadTracks(withMediaType: .audio).first
+        var audioOutput: AVAssetReaderTrackOutput? = nil
+        if let aTrack = audioTrack {
+            let aOut = AVAssetReaderTrackOutput(track: aTrack, outputSettings: nil)
+            aOut.alwaysCopiesSampleData = false
+            if reader.canAdd(aOut) {
+                reader.add(aOut)
+                audioOutput = aOut
+            }
+        }
+
+        reader.startReading()
+        guard reader.status == .reading else {
+            let err = reader.error?.localizedDescription ?? "unknown"
+            NSLog("VideoProcessor: hev1 remux reader failed to start: %@", err)
+            throw VideoProcessorError.unsupportedFormat
+        }
+
+        // Collect initial samples and optionally parse parameter sets from them
+        var collectedVideoSamples: [CMSampleBuffer] = []
+
+        if parameterSets.isEmpty {
+            NSLog("VideoProcessor: no parameter sets in format description; parsing bitstream NAL units")
+            let nalLen = Int(nalHeaderLength)
+            var foundVPS: Data?
+            var foundSPS: Data?
+            var foundPPS: Data?
+
+            // Read up to 60 samples to find all parameter sets
+            for _ in 0..<60 {
+                guard let sample = videoOutput.copyNextSampleBuffer() else { break }
+                collectedVideoSamples.append(sample)
+
+                guard let dataBuffer = CMSampleBufferGetDataBuffer(sample) else { continue }
+                var lengthAtOffset: Int = 0
+                var totalLength: Int = 0
+                var bufPtr: UnsafeMutablePointer<Int8>?
+                let lockStatus = CMBlockBufferGetDataPointer(dataBuffer, atOffset: 0,
+                                                             lengthAtOffsetOut: &lengthAtOffset,
+                                                             totalLengthOut: &totalLength,
+                                                             dataPointerOut: &bufPtr)
+                guard lockStatus == noErr, let rawPtr = bufPtr else { continue }
+
+                let bytes = UnsafeRawBufferPointer(start: rawPtr, count: totalLength)
+                var offset = 0
+                while offset + nalLen < totalLength {
+                    // Read NAL unit length (big-endian)
+                    var nalUnitLength: UInt32 = 0
+                    for i in 0..<nalLen {
+                        nalUnitLength = (nalUnitLength << 8) | UInt32(bytes[offset + i])
+                    }
+                    offset += nalLen
+                    let nalSize = Int(nalUnitLength)
+                    guard nalSize > 0, offset + nalSize <= totalLength else { break }
+
+                    // HEVC NAL unit type: bits 1-6 of first byte
+                    let nalType = (bytes[offset] >> 1) & 0x3F
+                    let nalData = Data(bytes: bytes.baseAddress!.advanced(by: offset),
+                                       count: nalSize)
+                    switch nalType {
+                    case 32: foundVPS = nalData  // VPS
+                    case 33: foundSPS = nalData  // SPS
+                    case 34: foundPPS = nalData  // PPS
+                    default: break
+                    }
+
+                    offset += nalSize
+                }
+
+                if foundVPS != nil && foundSPS != nil && foundPPS != nil { break }
+            }
+
+            if let vps = foundVPS { parameterSets.append(vps) }
+            if let sps = foundSPS { parameterSets.append(sps) }
+            if let pps = foundPPS { parameterSets.append(pps) }
+            NSLog("VideoProcessor: parsed %d parameter sets from bitstream (VPS=%d SPS=%d PPS=%d)",
+                  parameterSets.count,
+                  foundVPS != nil ? 1 : 0,
+                  foundSPS != nil ? 1 : 0,
+                  foundPPS != nil ? 1 : 0)
+        }
+
+        guard parameterSets.count >= 3 else {
+            NSLog("VideoProcessor: insufficient parameter sets (%d) for hvc1 format", parameterSets.count)
+            throw VideoProcessorError.unsupportedFormat
+        }
+
+        // ── Step 4: Create proper hvc1 CMFormatDescription ──
+        // CMVideoFormatDescriptionCreateFromHEVCParameterSets requires C arrays
+        // of pointers and sizes. Build them from our Data objects.
+        var hvc1Fmt: CMFormatDescription!
+        do {
+            let count = parameterSets.count
+            // Use NSData to pin the bytes so pointers remain valid during the C API call.
+            let nsDatas = parameterSets.map { $0 as NSData }
+            var rawPointers: [UnsafePointer<UInt8>] = []
+            var sizes: [Int] = []
+            for ns in nsDatas {
+                rawPointers.append(ns.bytes.assumingMemoryBound(to: UInt8.self))
+                sizes.append(ns.length)
+            }
+
+            var fmt: CMFormatDescription?
+            let status = rawPointers.withUnsafeBufferPointer { ptrBuf in
+                sizes.withUnsafeBufferPointer { sizeBuf in
+                    CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                        allocator: nil,
+                        parameterSetCount: count,
+                        parameterSetPointers: ptrBuf.baseAddress!,
+                        parameterSetSizes: sizeBuf.baseAddress!,
+                        nalUnitHeaderLength: Int32(nalHeaderLength),
+                        extensions: CMFormatDescriptionGetExtensions(origDesc),
+                        formatDescriptionOut: &fmt
+                    )
+                }
+            }
+            guard status == noErr, let f = fmt else {
+                NSLog("VideoProcessor: CMVideoFormatDescriptionCreateFromHEVCParameterSets failed: %d", status)
+                throw VideoProcessorError.exportFailed
+            }
+            hvc1Fmt = f
+        }
+        NSLog("VideoProcessor: created hvc1 format description successfully")
+        let setupDone = CFAbsoluteTimeGetCurrent()
+        NSLog("VideoProcessor: remux setup took %.3f s", setupDone - remuxStart)
+
+        // ── Step 5: Set up writer ──
+        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
+
+        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil,
+                                            sourceFormatHint: hvc1Fmt)
+        videoInput.expectsMediaDataInRealTime = false
+        guard writer.canAdd(videoInput) else { throw VideoProcessorError.exportFailed }
+        writer.add(videoInput)
+
+        var audioInput: AVAssetWriterInput? = nil
+        if audioOutput != nil {
+            let aIn = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
+            aIn.expectsMediaDataInRealTime = false
+            if writer.canAdd(aIn) {
+                writer.add(aIn)
+                audioInput = aIn
+            }
+        }
+
+        writer.startWriting()
+        if writer.status != .writing {
+            let err = writer.error?.localizedDescription ?? "none"
+            NSLog("VideoProcessor: remux writer failed to start: status=%d error=%@", writer.status.rawValue, err)
+            throw VideoProcessorError.exportFailed
+        }
+        writer.startSession(atSourceTime: .zero)
+        NSLog("VideoProcessor: remux writer started successfully, status=%d", writer.status.rawValue)
+
+        let duration = try await asset.load(.duration)
+        let durationSeconds = duration.seconds
+
+        // Helper: rewrite a compressed CMSampleBuffer's format description
+        // from hev1 to hvc1 while keeping the same compressed data.
+        // This is critical — AVAssetWriterInput passthrough copies the sample's
+        // own format description, not the sourceFormatHint.
+        let rewriteFmt = hvc1Fmt  // capture for closure
+        func rewriteSampleWithHvc1(_ sample: CMSampleBuffer) -> CMSampleBuffer? {
+            // Ensure the sample data is ready (may be lazy-loaded for passthrough)
+            if !CMSampleBufferDataIsReady(sample) {
+                let makeReadyStatus = CMSampleBufferMakeDataReady(sample)
+                if makeReadyStatus != noErr {
+                    NSLog("VideoProcessor: CMSampleBufferMakeDataReady failed: %d", makeReadyStatus)
+                }
+            }
+            guard let dataBuffer = CMSampleBufferGetDataBuffer(sample) else {
+                let hasImageBuf = CMSampleBufferGetImageBuffer(sample) != nil
+                let totalSize = CMSampleBufferGetTotalSampleSize(sample)
+                let numS = CMSampleBufferGetNumSamples(sample)
+                let isValid = CMSampleBufferIsValid(sample)
+                let isReady = CMSampleBufferDataIsReady(sample)
+                NSLog("VideoProcessor: rewrite failed - no data buffer (hasImageBuf=%d totalSize=%d numSamples=%d valid=%d ready=%d)",
+                      hasImageBuf ? 1 : 0, totalSize, numS, isValid ? 1 : 0, isReady ? 1 : 0)
+                return nil
+            }
+            let numSamples = CMSampleBufferGetNumSamples(sample)
+
+            // Gather timing info for all samples
+            var timingEntries = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: numSamples)
+            let timingStatus = CMSampleBufferGetSampleTimingInfoArray(sample, entryCount: numSamples,
+                                                    arrayToFill: &timingEntries,
+                                                    entriesNeededOut: nil)
+            // Gather sizes for all samples
+            var sizeEntries = [Int](repeating: 0, count: numSamples)
+            let sizeStatus = CMSampleBufferGetSampleSizeArray(sample, entryCount: numSamples,
+                                              arrayToFill: &sizeEntries,
+                                              entriesNeededOut: nil)
+
+            var newSample: CMSampleBuffer?
+            let status = CMSampleBufferCreate(
+                allocator: nil,
+                dataBuffer: dataBuffer,
+                dataReady: true,
+                makeDataReadyCallback: nil,
+                refcon: nil,
+                formatDescription: rewriteFmt,  // hvc1 instead of hev1
+                sampleCount: numSamples,
+                sampleTimingEntryCount: numSamples,
+                sampleTimingArray: &timingEntries,
+                sampleSizeEntryCount: numSamples,
+                sampleSizeArray: &sizeEntries,
+                sampleBufferOut: &newSample
+            )
+            if status != noErr {
+                NSLog("VideoProcessor: CMSampleBufferCreate failed: %d (timing=%d size=%d numSamples=%d)",
+                      status, timingStatus, sizeStatus, numSamples)
+            }
+            return status == noErr ? newSample : nil
+        }
+
+        // ── Step 6: Write all samples with hvc1 format description ──
+        NSLog("VideoProcessor: remux step 6 - writing %d pre-collected + remaining samples (reader status=%d)",
+              collectedVideoSamples.count, reader.status.rawValue)
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                    var resumed = false
+                    let lock = DispatchQueue(label: "remux.cont.lock")
+                    func safeResume(_ block: @escaping () -> Void) {
+                        lock.sync { if !resumed { resumed = true; block() } }
+                    }
+
+                    // Use a mutable index to track which pre-collected samples
+                    // still need to be written. Write them inside
+                    // requestMediaDataWhenReady so we respect isReadyForMoreMediaData.
+                    var collectedIndex = 0
+                    let collectedCount = collectedVideoSamples.count
+                    var writtenCount = 0
+                    var skippedCount = 0
+
+                    videoInput.requestMediaDataWhenReady(on: DispatchQueue(label: "remux.video")) {
+                        while videoInput.isReadyForMoreMediaData {
+                            autoreleasepool {
+                            // First drain pre-collected samples
+                            if collectedIndex < collectedCount {
+                                let sample = collectedVideoSamples[collectedIndex]
+                                collectedIndex += 1
+                                // Skip empty format-change notification samples
+                                if CMSampleBufferGetNumSamples(sample) == 0 {
+                                    skippedCount += 1
+                                    return  // exits autoreleasepool closure → continues while loop
+                                }
+                                guard let rewritten = rewriteSampleWithHvc1(sample) else {
+                                    NSLog("VideoProcessor: remux rewrite failed for pre-collected sample %d", collectedIndex - 1)
+                                    videoInput.markAsFinished()
+                                    safeResume { cont.resume(throwing: VideoProcessorError.exportFailed) }
+                                    return
+                                }
+                                let ok = videoInput.append(rewritten)
+                                if !ok {
+                                    let writerErr = writer.error?.localizedDescription ?? "none"
+                                    NSLog("VideoProcessor: remux append failed for pre-collected sample, writer error=%@", writerErr)
+                                    videoInput.markAsFinished()
+                                    safeResume { cont.resume(throwing: VideoProcessorError.exportFailed) }
+                                    return
+                                }
+                                writtenCount += 1
+                                return  // exits autoreleasepool closure → continues while loop
+                            }
+
+                            // Then read remaining samples from reader
+                            guard let sample = videoOutput.copyNextSampleBuffer() else {
+                                NSLog("VideoProcessor: remux video done - written=%d skipped=%d readerStatus=%d",
+                                      writtenCount, skippedCount, reader.status.rawValue)
+                                if reader.status == .failed {
+                                    let rErr = reader.error?.localizedDescription ?? "none"
+                                    NSLog("VideoProcessor: reader failed during remux: %@", rErr)
+                                }
+                                videoInput.markAsFinished()
+                                safeResume { cont.resume() }
+                                return
+                            }
+                            // Skip empty format-change notification samples
+                            if CMSampleBufferGetNumSamples(sample) == 0 {
+                                skippedCount += 1
+                                return  // exits autoreleasepool closure → continues while loop
+                            }
+                            guard let rewritten = rewriteSampleWithHvc1(sample) else {
+                                NSLog("VideoProcessor: remux rewrite failed for streamed sample (reader status=%d)", reader.status.rawValue)
+                                videoInput.markAsFinished()
+                                safeResume { cont.resume(throwing: VideoProcessorError.exportFailed) }
+                                return
+                            }
+                            let ok = videoInput.append(rewritten)
+                            if !ok {
+                                let writerErr = writer.error?.localizedDescription ?? "none"
+                                NSLog("VideoProcessor: remux append failed, writer error=%@", writerErr)
+                                videoInput.markAsFinished()
+                                safeResume { cont.resume(throwing: VideoProcessorError.exportFailed) }
+                                return
+                            }
+                            writtenCount += 1
+                            if durationSeconds > 0 {
+                                let pts = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+                                let p = min(pts / durationSeconds, 0.99)
+                                Task { @MainActor in progressHandler(p) }
+                            }
+                            } // end autoreleasepool
+                        }
+                    }
+                }
+            }
+            if let aOut = audioOutput, let aIn = audioInput {
+                group.addTask {
+                    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                        var resumed = false
+                        let lock = DispatchQueue(label: "remux.audio.lock")
+                        func safeResume(_ block: @escaping () -> Void) {
+                            lock.sync { if !resumed { resumed = true; block() } }
+                        }
+                        aIn.requestMediaDataWhenReady(on: DispatchQueue(label: "remux.audio")) {
+                            while aIn.isReadyForMoreMediaData {
+                                guard let sample = aOut.copyNextSampleBuffer() else {
+                                    aIn.markAsFinished()
+                                    safeResume { cont.resume() }
+                                    return
+                                }
+                                aIn.append(sample)
+                            }
+                        }
+                    }
+                }
+            }
+            try await group.waitForAll()
+        }
+
+        let writeStart = CFAbsoluteTimeGetCurrent()
+        await writer.finishWriting()
+        if writer.status == .failed {
+            let err = writer.error?.localizedDescription ?? "none"
+            NSLog("VideoProcessor: remux writer.finishWriting failed: %@", err)
+            throw writer.error ?? VideoProcessorError.exportFailed
+        }
+        let remuxEnd = CFAbsoluteTimeGetCurrent()
+        NSLog("VideoProcessor: hev1 → hvc1 remux complete — total=%.3f s (setup=%.3f write=%.3f finalize=%.3f)",
+              remuxEnd - remuxStart,
+              setupDone - remuxStart,
+              writeStart - setupDone,
+              remuxEnd - writeStart)
+    }
     func convertToVertical(
         inputURL: URL,
         outputURL: URL,
@@ -185,15 +671,60 @@ actor VideoProcessor {
         smartFramingSettings: SmartFramingSettings,
         letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth,
         hdrConversionEnabled: Bool = false,
-        hdrTarget: CustomVideoCompositionInstruction.HDRTarget = .sRGB,
+        toneMappingMode: CustomVideoCompositionInstruction.ToneMappingMode = .natural,
         progressHandler: @escaping (Double, String) -> Void  // (progress, phaseLabel)
     ) async throws {
         // 既存の出力ファイルを削除
         if FileManager.default.fileExists(atPath: outputURL.path) {
             try FileManager.default.removeItem(at: outputURL)
         }
+
+        // ── hev1 入力の場合、hvc1 へリマックス（再エンコードなし、品質劣化なし）──
+        // AVFoundation の VideoComposition パイプラインは hev1 をデコードできないため、
+        // パラメータセットを抽出して正しい hvc1 フォーマット記述を持つ一時ファイルを作成。
+        var effectiveInputURL = inputURL
+        var tempRemuxURL: URL? = nil
+        let inputAssetForCheck = AVAsset(url: inputURL)
+
+        // ── DNxHR/DNxHD 入力チェック ──
+        // macOS は Avid コーデックパックなしでは DNxHD/DNxHR をデコードできない。
+        // 処理が途中で失敗する前に早期検知して分かりやすいエラーを返す。
+        if await VideoProcessor.isDNxCodec(asset: inputAssetForCheck) {
+            NSLog("VideoProcessor: DNxHR/DNxHD 入力を検出 — macOS は Avid コーデックパックなしでは復号不可。" +
+                  "Avid DNxHR QuickTime コンポーネントのインストールが必要です。")
+            throw VideoProcessorError.unsupportedFormat
+        }
+
+        // ── ProRes 入力ログ ──
+        // macOS は全 ProRes バリアントをネイティブにデコード可能。通常通り処理続行。
+        if await VideoProcessor.isProResCodec(asset: inputAssetForCheck) {
+            NSLog("VideoProcessor: ProRes 入力を検出 — macOS ネイティブデコードで処理します（正常）")
+        }
+
+        let needsHev1Transcode = await VideoProcessor.isHev1(asset: inputAssetForCheck)
+        if needsHev1Transcode {
+            NSLog("VideoProcessor: input is hev1; will remux to hvc1 before processing")
+            progressHandler(0.0, "Remuxing hev1 → hvc1...")
+            let tmpDir = FileManager.default.temporaryDirectory
+            let tmpFile = tmpDir.appendingPathComponent(UUID().uuidString + "_hvc1.mov")
+            try await remuxHev1ToHvc1(
+                inputURL: inputURL,
+                outputURL: tmpFile,
+                progressHandler: { p in
+                    progressHandler(p * 0.3, "Remuxing hev1 → hvc1...")
+                }
+            )
+            effectiveInputURL = tmpFile
+            tempRemuxURL = tmpFile
+        }
+        defer {
+            // Clean up temporary remuxed file
+            if let tmp = tempRemuxURL {
+                try? FileManager.default.removeItem(at: tmp)
+            }
+        }
         
-        let asset = AVAsset(url: inputURL)
+        let asset = AVAsset(url: effectiveInputURL)
 
         // 動画トラックを取得
         guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
@@ -214,6 +745,10 @@ actor VideoProcessor {
         let outputHeight: CGFloat = CGFloat(resH)
         
         // ── スマートフレーミング ONなら事前解析（第1パス）──
+        // hev1 トランスコードで 0.0〜0.3 を使用済みの場合、残りの進捗帯域を調整
+        let hev1Offset: Double = needsHev1Transcode ? 0.3 : 0.0
+        let remainingScale: Double = needsHev1Transcode ? 0.7 : 1.0
+
         var precomputedOffsets: [CGPoint]? = nil
         if smartFramingSettings.enabled {
             let analyzer = SmartFramingAnalyzer()
@@ -223,13 +758,16 @@ actor VideoProcessor {
                 inputSize: CGSize(width: width, height: height),
                 outputSize: CGSize(width: outputWidth, height: outputHeight),
                 followFactor: CGFloat(smartFramingSettings.smoothness.followFactor),
-                progressHandler: { p in progressHandler(p * 0.4, "Analyzing...") }
+                progressHandler: { p in
+                    progressHandler(hev1Offset + p * 0.4 * remainingScale, "Analyzing...")
+                }
             )
         }
         
         // ── コンポジション作成 + エクスポート（第2パス）──
-        let progressOffset = smartFramingSettings.enabled ? 0.4 : 0.0
-        let progressScale  = smartFramingSettings.enabled ? 0.6 : 1.0
+        let analysisShare = smartFramingSettings.enabled ? 0.4 : 0.0
+        let progressOffset = hev1Offset + analysisShare * remainingScale
+        let progressScale  = (1.0 - analysisShare) * remainingScale
         
         let (composition, videoComposition) = try await createComposition(
             asset: asset,
@@ -241,7 +779,7 @@ actor VideoProcessor {
             precomputedOffsets: precomputedOffsets,
             letterboxMode: letterboxMode
             , hdrConversionEnabled: hdrConversionEnabled,
-            hdrTarget: hdrTarget
+            toneMappingMode: toneMappingMode
         )
         
         // エクスポート
@@ -268,7 +806,7 @@ actor VideoProcessor {
         precomputedOffsets: [CGPoint]? = nil,
         letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth
         , hdrConversionEnabled: Bool = false,
-        hdrTarget: CustomVideoCompositionInstruction.HDRTarget = .sRGB
+        toneMappingMode: CustomVideoCompositionInstruction.ToneMappingMode = .natural
     ) async throws -> (AVMutableComposition, AVMutableVideoComposition) {
         let composition = AVMutableComposition()
         
@@ -317,6 +855,7 @@ actor VideoProcessor {
         VerticalVideoCompositor.staticTransferFunction = detTransfer
         VerticalVideoCompositor.staticColorPrimaries = detPrimaries
         VerticalVideoCompositor.staticYCbCrMatrix = detMatrix
+        VerticalVideoCompositor.staticToneMappingMode = toneMappingMode
         videoComposition.customVideoCompositorClass = VerticalVideoCompositor.self
         
         let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: compositionVideoTrack)
@@ -339,7 +878,7 @@ actor VideoProcessor {
         )
         instruction.letterboxMode = letterboxMode
         instruction.hdrConversionEnabled = hdrConversionEnabled
-        instruction.hdrTarget = hdrTarget
+        instruction.toneMappingMode = toneMappingMode
         
         videoComposition.instructions = [instruction]
         
@@ -387,7 +926,7 @@ actor VideoProcessor {
 
         // Determine whether composition requests HDR->SDR conversion and the target color space.
         let hdrConversionRequested = (videoComposition.instructions.first as? CustomVideoCompositionInstruction)?.hdrConversionEnabled ?? false
-        let hdrTarget = (videoComposition.instructions.first as? CustomVideoCompositionInstruction)?.hdrTarget ?? .sRGB
+        // SDR output always uses Rec.709 transfer function (sRGB removed as an option)
 
         // Detect input HDR characteristics from the composition track's format description.
         let (isHDRInput, detectedTransfer, detectedPrimaries, detectedMatrix) =
@@ -439,6 +978,7 @@ actor VideoProcessor {
 
         // AVAssetWriter セットアップ
         let fileType: AVFileType = (codec == .prores422VT) ? .mov : .mp4
+
         let writer: AVAssetWriter
         do {
             writer = try AVAssetWriter(outputURL: outputURL, fileType: fileType)
@@ -496,8 +1036,9 @@ actor VideoProcessor {
         // then append the compressed samples into AVAssetWriter as passthrough
         // compressed CMSampleBuffer objects.
         let useSoftwareVT: Bool = (codec == .h264 || codec == .h265)
-
-        
+        NSLog("VideoProcessor: encoder path = %@ (codec=%@)",
+              useSoftwareVT ? "SoftwareVT (VTCompressionSession)" : "HardwareVT (AVAssetWriter)",
+              codec.rawValue)
 
         var videoInput: AVAssetWriterInput? = nil
         var usingVTCompressionSession = false
@@ -528,16 +1069,8 @@ actor VideoProcessor {
             ]
             videoSettingsMutable[AVVideoColorPropertiesKey] = colorProps
         } else {
-            // SDR input passthrough / HDR→SDR: use the target transfer function.
-            // For HDR→SDR with sRGB target use "IEC_sRGB"; otherwise Rec.709.
-            let transferFunction: String
-            if hdrConversionRequested {
-                transferFunction = (hdrTarget == .sRGB)
-                    ? (kCVImageBufferTransferFunction_sRGB as String)
-                    : AVVideoTransferFunction_ITU_R_709_2
-            } else {
-                transferFunction = AVVideoTransferFunction_ITU_R_709_2
-            }
+            // SDR input passthrough / HDR→SDR: always use Rec.709 transfer.
+            let transferFunction = AVVideoTransferFunction_ITU_R_709_2
             let colorProps: [String: Any] = [
                 AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
                 AVVideoTransferFunctionKey: transferFunction,
@@ -552,6 +1085,7 @@ actor VideoProcessor {
             // we have a compressed sample to obtain its format description.
             videoInput = nil
         } else {
+            NSLog("VideoProcessor: using AVAssetWriter HW encoder path (codec=%@)", codec.rawValue)
             let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettingsMutable)
             vIn.expectsMediaDataInRealTime = false
             if !writer.canAdd(vIn) {
@@ -597,6 +1131,8 @@ actor VideoProcessor {
         let cancelToken = CancelToken()
 
         reader.startReading()
+        let readerStartErr = reader.error?.localizedDescription ?? "none"
+        NSLog("VideoProcessor: reader.startReading() status=%d error=%@", reader.status.rawValue, readerStartErr)
         // If not using software VT, start writer immediately. Otherwise we'll
         // start writer after receiving first compressed sample and adding inputs.
         if !useSoftwareVT {
@@ -628,6 +1164,9 @@ actor VideoProcessor {
                                 var encodingFinished: Bool = false
                                 var readingFinished: Bool = false
                                 var didResumeContinuation: Bool = false
+                                /// Number of leading compressed frames to silently discard
+                                /// (used by the VTB warm-up encode to drop the dummy frame).
+                                var warmupFramesToDiscard: Int = 0
                             }
                             let context = VTEncoderContext()
                             // captureable references for cancellation
@@ -653,20 +1192,27 @@ actor VideoProcessor {
                                 guard let ref = outputCallbackRefCon else { return }
                                 let ctx = Unmanaged<AnyObject>.fromOpaque(ref).takeUnretainedValue() as! VTEncoderContext
                                 guard status == noErr, let sbuf = sampleBuffer else {
+                                    NSLog("VideoProcessor: VT callback error: status=\(status)")
                                     ctx.bufferLock.async { ctx.encodingFinished = true }
                                     return
                                 }
                                 // Append sampleBuffer to buffer (Swift ARC manages retention)
                                 ctx.bufferLock.async {
+                                    // VTB warm-up: discard the dummy frame's output
+                                    if ctx.warmupFramesToDiscard > 0 {
+                                        ctx.warmupFramesToDiscard -= 1
+                                        NSLog("VideoProcessor: VT callback discarded warm-up frame")
+                                        return
+                                    }
                                     ctx.compressedBuffers.append(sbuf)
                                     ctx.compressedBuffersCount += 1
-                                    
                                 }
                             }
 
-                            // Encoder specification: request software encoder when possible
+                            // Encoder specification: force software-only encoder
                             let encoderSpec: CFDictionary = [
-                                kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String: kCFBooleanFalse
+                                kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String: kCFBooleanFalse,
+                                kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder as String: kCFBooleanFalse
                             ] as CFDictionary
 
                             var session: VTCompressionSession? = nil
@@ -703,6 +1249,8 @@ actor VideoProcessor {
                                 }
                                 // For HDR passthrough, embed color metadata into the compressed bitstream
                                 // so the passthrough AVAssetWriterInput picks up the correct colorimetry.
+                                // For HDR→SDR, the compositor outputs SDR content, so tag the session
+                                // with SDR colorimetry (Rec.709/sRGB) to match.
                                 if isHDRInput && !hdrConversionRequested {
                                     VTSessionSetProperty(compSession,
                                         key: kVTCompressionPropertyKey_ColorPrimaries,
@@ -714,6 +1262,22 @@ actor VideoProcessor {
                                         key: kVTCompressionPropertyKey_YCbCrMatrix,
                                         value: detectedMatrix as CFString)
                                     NSLog("VideoProcessor: VT color metadata set: primaries=\(detectedPrimaries) transfer=\(detectedTransfer)")
+                                } else if isHDRInput && hdrConversionRequested {
+                                    // HDR→SDR: compositor already tone-mapped to SDR.
+                                    // Tell VTCompressionSession the content is Rec.709
+                                    // so the encoder initializes its color pipeline for
+                                    // SDR from the very first frame.
+                                    let sdrTransfer: CFString = kCVImageBufferTransferFunction_ITU_R_709_2 as CFString
+                                    VTSessionSetProperty(compSession,
+                                        key: kVTCompressionPropertyKey_ColorPrimaries,
+                                        value: kCVImageBufferColorPrimaries_ITU_R_709_2 as CFString)
+                                    VTSessionSetProperty(compSession,
+                                        key: kVTCompressionPropertyKey_TransferFunction,
+                                        value: sdrTransfer)
+                                    VTSessionSetProperty(compSession,
+                                        key: kVTCompressionPropertyKey_YCbCrMatrix,
+                                        value: kCVImageBufferYCbCrMatrix_ITU_R_709_2 as CFString)
+                                    NSLog("VideoProcessor: VT color metadata set for HDR→SDR: Rec.709, transfer=\(sdrTransfer)")
                                 }
                                 // Register session so cancellation handler can invalidate it
                                 VTSessionRegistry.shared.add(session: compSession, refcon: refconPtr)
@@ -739,12 +1303,128 @@ actor VideoProcessor {
 
                             VTCompressionSessionPrepareToEncodeFrames(compSession)
 
+                            // ── Confirm actual HW/SW encoder selection ──
+                            var usingHWValue: CFTypeRef?
+                            let hwQueryStatus = VTSessionCopyProperty(
+                                compSession,
+                                key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                                allocator: nil,
+                                valueOut: &usingHWValue
+                            )
+                            let usingHW = (hwQueryStatus == noErr) && (usingHWValue as? Bool == true)
+                            // queryStatus=-12900 (kVTPropertyNotSupportedErr) means the SW
+                            // encoder doesn't implement this property at all → SW confirmed.
+                            // queryStatus=0 + usingHW=false → SW confirmed via property.
+                            // queryStatus=0 + usingHW=true  → HW encoder was selected.
+                            let encoderKind: String
+                            if hwQueryStatus == noErr {
+                                encoderKind = usingHW ? "HARDWARE" : "SOFTWARE"
+                            } else if hwQueryStatus == -12900 {
+                                encoderKind = "SOFTWARE (property unsupported = SW encoder)"
+                            } else {
+                                encoderKind = "UNKNOWN (queryStatus=\(hwQueryStatus))"
+                            }
+                            NSLog("VideoProcessor: VTCompressionSession created - encoder=%@ (codec=%@)",
+                                  encoderKind, codec.rawValue)
+                            // VTCompressionSession lazy-initializes its internal color
+                            // management pipeline on the first EncodeFrame call. For HDR
+                            // content this initialization can produce incorrect gamma on
+                            // the first real frame (a well-known VTB bug). We prime the
+                            // encoder by feeding a dummy pixel buffer with correct HDR
+                            // metadata, flushing it synchronously, and discarding the
+                            // compressed output. By the time the real frame 0 arrives the
+                            // encoder's color pipeline is fully initialized.
+                            if isHDRInput {
+                                // IOSurface + Metal 互換: 本番バッファと同じバッキング
+                                let warmupAttrs: [String: Any] = [
+                                    kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+                                    kCVPixelBufferMetalCompatibilityKey as String: true
+                                ]
+                                var warmupBuf: CVPixelBuffer?
+                                CVPixelBufferCreate(
+                                    kCFAllocatorDefault,
+                                    Int(renderSize.width), Int(renderSize.height),
+                                    preferredPixelFormat, warmupAttrs as CFDictionary, &warmupBuf)
+                                if let wb = warmupBuf {
+                                    // Fill with non-zero data so the encoder exercises
+                                    // its full color pipeline (zero data may trigger
+                                    // GPU fast-clear optimizations that skip processing).
+                                    CVPixelBufferLockBaseAddress(wb, [])
+                                    if let addr = CVPixelBufferGetBaseAddress(wb) {
+                                        let bpr = CVPixelBufferGetBytesPerRow(wb)
+                                        let h = CVPixelBufferGetHeight(wb)
+                                        if preferredPixelFormat == kCVPixelFormatType_64RGBAHalf {
+                                            let ptr = addr.assumingMemoryBound(to: UInt16.self)
+                                            let totalPixels = (bpr / 2) * h
+                                            for i in 0..<totalPixels { ptr[i] = 0x4000 } // 2.0 half-float
+                                        } else {
+                                            memset(addr, 0x80, bpr * h) // mid-gray
+                                        }
+                                    }
+                                    CVPixelBufferUnlockBaseAddress(wb, [])
+                                    // Stamp correct color metadata matching what
+                                    // the compositor will produce for real frames:
+                                    //  • HDR passthrough → HDR metadata
+                                    //  • HDR→SDR         → SDR metadata (Rec.709/sRGB)
+                                    if hdrConversionRequested {
+                                        let sdrTransfer: NSString = kCVImageBufferTransferFunction_ITU_R_709_2 as NSString
+                                        CVBufferSetAttachment(wb,
+                                            kCVImageBufferColorPrimariesKey as CFString,
+                                            kCVImageBufferColorPrimaries_ITU_R_709_2 as NSString, .shouldPropagate)
+                                        CVBufferSetAttachment(wb,
+                                            kCVImageBufferTransferFunctionKey as CFString,
+                                            sdrTransfer, .shouldPropagate)
+                                        CVBufferSetAttachment(wb,
+                                            kCVImageBufferYCbCrMatrixKey as CFString,
+                                            kCVImageBufferYCbCrMatrix_ITU_R_709_2 as NSString, .shouldPropagate)
+                                    } else {
+                                        CVBufferSetAttachment(wb,
+                                            kCVImageBufferColorPrimariesKey as CFString,
+                                            detectedPrimaries as NSString, .shouldPropagate)
+                                        CVBufferSetAttachment(wb,
+                                            kCVImageBufferTransferFunctionKey as CFString,
+                                            detectedTransfer as NSString, .shouldPropagate)
+                                        CVBufferSetAttachment(wb,
+                                            kCVImageBufferYCbCrMatrixKey as CFString,
+                                            detectedMatrix as NSString, .shouldPropagate)
+                                    }
+                                    context.bufferLock.sync { context.warmupFramesToDiscard = 1 }
+                                    let warmupPTS = CMTime(value: -1, timescale: 600)
+                                    var warmupFlags: VTEncodeInfoFlags = []
+                                    let ws = VTCompressionSessionEncodeFrame(
+                                        compSession, imageBuffer: wb,
+                                        presentationTimeStamp: warmupPTS,
+                                        duration: CMTime(value: 1, timescale: 30),
+                                        frameProperties: nil,
+                                        sourceFrameRefcon: nil,
+                                        infoFlagsOut: &warmupFlags)
+                                    if ws == noErr {
+                                        VTCompressionSessionCompleteFrames(
+                                            compSession,
+                                            untilPresentationTimeStamp: warmupPTS)
+                                        // Barrier: ensure the callback's async block
+                                        // on bufferLock has executed (discard logic).
+                                        context.bufferLock.sync { }
+                                        NSLog("VideoProcessor: VTB warm-up encode complete (dummy frame discarded)")
+                                    } else {
+                                        NSLog("VideoProcessor: VTB warm-up encode failed (status=%d), proceeding without warm-up", ws)
+                                        context.bufferLock.sync { context.warmupFramesToDiscard = 0 }
+                                    }
+                                }
+                            }
+
                             // Writer append loop will be created after the passthrough
                             // videoInput is instantiated (after receiving first compressed sample).
 
                             // Read frames, feed to encoder
                             encodeQueue.async {
                                 while true {
+                                    // autoreleasepool: CMSampleBuffer / CVPixelBuffer from
+                                    // copyNextSampleBuffer() are autoreleased. Without a
+                                    // pool, they accumulate for the entire video → multi-GB
+                                    // swap usage.
+                                    var loopBreak = false
+                                    autoreleasepool {
                                     if cancelToken.isCancelled() {
                                         // Best-effort: complete and invalidate local compression session immediately
                                         if let comp = localCompSession {
@@ -754,20 +1434,64 @@ actor VideoProcessor {
                                             // Also remove from shared registry if present
                                             if let ref = localRefconPtr { VTSessionRegistry.shared.remove(refcon: ref) }
                                         }
-                                        break
+                                        loopBreak = true
+                                        return
                                     }
                                     guard let sample = videoReadQueue.sync(execute: { videoOutput.copyNextSampleBuffer() }) else {
                                         // finished reading
                                         context.readingFinished = true
-                                        break
+                                        let readErr = reader.error?.localizedDescription ?? "none"
+                                        NSLog("VideoProcessor: copyNextSampleBuffer returned nil; reader.status=%d error=%@", reader.status.rawValue, readErr)
+                                        loopBreak = true
+                                        return
                                     }
-                                    guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { continue }
+                                    guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else {
+                                        NSLog("VideoProcessor: CMSampleBufferGetImageBuffer returned nil, skipping frame")
+                                        return  // continues the while loop
+                                    }
                                     let pts = CMSampleBufferGetPresentationTimeStamp(sample)
                                     // Prefer using the source sample duration if available
                                     var duration = CMSampleBufferGetDuration(sample)
                                     if duration == CMTime.invalid || duration == CMTime.zero {
                                         duration = videoComposition.frameDuration
                                     }
+
+                                    // ── VTB first-frame gamma workaround (per-frame) ──
+                                    // Stamp correct color metadata on every pixel buffer
+                                    // before encoding. This ensures VTCompressionSession reads
+                                    // consistent colorimetry even if the upstream compositor or
+                                    // decoder delivered a buffer with wrong/missing attachments.
+                                    //  • HDR passthrough → HDR metadata
+                                    //  • HDR→SDR         → SDR metadata (Rec.709/sRGB)
+                                    if isHDRInput && !hdrConversionRequested {
+                                        CVBufferSetAttachment(pixelBuffer,
+                                            kCVImageBufferColorPrimariesKey as CFString,
+                                            detectedPrimaries as NSString as CFTypeRef,
+                                            .shouldPropagate)
+                                        CVBufferSetAttachment(pixelBuffer,
+                                            kCVImageBufferTransferFunctionKey as CFString,
+                                            detectedTransfer as NSString as CFTypeRef,
+                                            .shouldPropagate)
+                                        CVBufferSetAttachment(pixelBuffer,
+                                            kCVImageBufferYCbCrMatrixKey as CFString,
+                                            detectedMatrix as NSString as CFTypeRef,
+                                            .shouldPropagate)
+                                    } else if isHDRInput && hdrConversionRequested {
+                                        let sdrTransfer: NSString = kCVImageBufferTransferFunction_ITU_R_709_2 as NSString
+                                        CVBufferSetAttachment(pixelBuffer,
+                                            kCVImageBufferColorPrimariesKey as CFString,
+                                            kCVImageBufferColorPrimaries_ITU_R_709_2 as NSString as CFTypeRef,
+                                            .shouldPropagate)
+                                        CVBufferSetAttachment(pixelBuffer,
+                                            kCVImageBufferTransferFunctionKey as CFString,
+                                            sdrTransfer as CFTypeRef,
+                                            .shouldPropagate)
+                                        CVBufferSetAttachment(pixelBuffer,
+                                            kCVImageBufferYCbCrMatrixKey as CFString,
+                                            kCVImageBufferYCbCrMatrix_ITU_R_709_2 as NSString as CFTypeRef,
+                                            .shouldPropagate)
+                                    }
+
                                     var flags: VTEncodeInfoFlags = []
                                     let encodeStatus = VTCompressionSessionEncodeFrame(compSession,
                                                                                       imageBuffer: pixelBuffer,
@@ -785,7 +1509,8 @@ actor VideoProcessor {
                                                 safeResume({ continuation.resume(throwing: VideoProcessorError.exportFailed) })
                                             }
                                         }
-                                        break
+                                        loopBreak = true
+                                        return
                                     }
 
                                     // progress update (based on input PTS)
@@ -795,13 +1520,25 @@ actor VideoProcessor {
                                         Task { @MainActor in progressHandler(p) }
                                     }
 
-                                    // Throttle if output buffer grows too large
-                                    var shouldThrottle = false
+                                    // Throttle if output buffer grows too large.
+                                    // Use a tighter threshold and longer sleep to
+                                    // prevent multi-GB memory bloat from queued
+                                    // compressed sample buffers.
+                                    var bufferCount = 0
                                     context.bufferLock.sync {
-                                        shouldThrottle = context.compressedBuffers.count > 120
+                                        bufferCount = context.compressedBuffers.count
                                     }
-                                    if shouldThrottle {
-                                        Thread.sleep(forTimeInterval: 0.01)
+                                    if bufferCount > 30 {
+                                        // Back-pressure: wait until writer drains
+                                        // the buffer below threshold
+                                        while true {
+                                            Thread.sleep(forTimeInterval: 0.02)
+                                            var current = 0
+                                            context.bufferLock.sync {
+                                                current = context.compressedBuffers.count
+                                            }
+                                            if current <= 15 || cancelToken.isCancelled() { break }
+                                        }
                                     }
 
                                     // If we haven't started the writer (software VT path),
@@ -927,14 +1664,127 @@ actor VideoProcessor {
                                             }
                                         }
                                     }
+                                    } // end autoreleasepool
+                                    if loopBreak { break }
                                 }
 
-                                // Finish encoding
+                                // Finish encoding — synchronous; all VT callbacks will
+                                // have fired by the time this returns.
                                 VTCompressionSessionCompleteFrames(compSession, untilPresentationTimeStamp: CMTime.invalid)
-                                // Wait until buffer is drained in writer loop; mark encodingFinished
-                                context.bufferLock.async {
-                                    context.encodingFinished = true
+
+                                // If the writer was never started during the encode
+                                // loop (race: VT callbacks arrived after each
+                                // writerStarted check), set it up now with the
+                                // freshly available compressed buffers.
+                                if !writerStarted {
+                                    NSLog("VideoProcessor: writer not started during encode loop; starting late")
+
+                                    // If the reader failed, propagate the error immediately.
+                                    if reader.status == .failed {
+                                        let failErr = reader.error?.localizedDescription ?? "unknown"
+                                        NSLog("VideoProcessor: reader failed: %@", failErr)
+                                        writerStarted = true  // unblock audio task
+                                        if !context.didResumeContinuation {
+                                            context.didResumeContinuation = true
+                                            safeResume({ continuation.resume(throwing: reader.error ?? VideoProcessorError.exportFailed) })
+                                        }
+                                        VTCompressionSessionInvalidate(compSession)
+                                        if let ref = localRefconPtr {
+                                            VTSessionRegistry.shared.remove(refcon: ref)
+                                        }
+                                        localRefconPtr = nil
+                                        localCompSession = nil
+                                        return
+                                    }
+
+                                    var firstSbuf: CMSampleBuffer? = nil
+                                    context.bufferLock.sync {
+                                        if !context.compressedBuffers.isEmpty {
+                                            firstSbuf = context.compressedBuffers.first
+                                        }
+                                    }
+                                    if let fs = firstSbuf, let fmt = CMSampleBufferGetFormatDescription(fs) {
+                                        let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: fmt)
+                                        vIn.expectsMediaDataInRealTime = false
+                                        NSLog("VideoProcessor: (late) canAdd video: \(writer.canAdd(vIn))")
+                                        if writer.canAdd(vIn) {
+                                            writer.add(vIn)
+                                            videoInput = vIn
+                                            if let aIn = audioInput {
+                                                if writer.canAdd(aIn) { writer.add(aIn) }
+                                            }
+                                            writer.startWriting()
+                                            writer.startSession(atSourceTime: .zero)
+                                            writerStarted = true
+
+                                            // All frames are already compressed; mark finished
+                                            // so the drain loop knows to stop after emptying buffers.
+                                            context.encodingFinished = true
+
+                                            vIn.requestMediaDataWhenReady(on: appendQueue) {
+                                                while vIn.isReadyForMoreMediaData {
+                                                    if cancelToken.isCancelled() {
+                                                        vIn.markAsFinished()
+                                                        context.bufferLock.async {
+                                                            if !context.didResumeContinuation {
+                                                                context.didResumeContinuation = true
+                                                                safeResume({ continuation.resume(throwing: VideoProcessorError.cancelled) })
+                                                            }
+                                                        }
+                                                        return
+                                                    }
+                                                    var next: CMSampleBuffer? = nil
+                                                    context.bufferLock.sync {
+                                                        if !context.compressedBuffers.isEmpty {
+                                                            next = context.compressedBuffers.removeFirst()
+                                                        }
+                                                    }
+                                                    if let sb = next {
+                                                        let appended = vIn.append(sb)
+                                                        if !appended {
+                                                            context.bufferLock.async {
+                                                                if !context.didResumeContinuation {
+                                                                    context.didResumeContinuation = true
+                                                                    safeResume({ continuation.resume(throwing: VideoProcessorError.exportFailed) })
+                                                                }
+                                                            }
+                                                            return
+                                                        }
+                                                    } else {
+                                                        // All buffers drained
+                                                        vIn.markAsFinished()
+                                                        if !context.didResumeContinuation {
+                                                            context.didResumeContinuation = true
+                                                            safeResume({ continuation.resume() })
+                                                        }
+                                                        return
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            // Cannot add input — fail
+                                            if !context.didResumeContinuation {
+                                                context.didResumeContinuation = true
+                                                safeResume({ continuation.resume(throwing: VideoProcessorError.exportFailed) })
+                                            }
+                                        }
+                                    } else {
+                                        // No compressed buffers at all (e.g. 0-frame video or VT error)
+                                        NSLog("VideoProcessor: (late) no compressed buffers; nothing to write. reader.status=\(reader.status.rawValue) encodedFrames=\(context.compressedBuffersCount)")
+                                        writerStarted = true  // unblock audio task
+                                        if !context.didResumeContinuation {
+                                            context.didResumeContinuation = true
+                                            safeResume({ continuation.resume(throwing: VideoProcessorError.exportFailed) })
+                                        }
+                                    }
+                                } else {
+                                    // Writer was already started during the encode loop;
+                                    // just signal the existing append loop to drain & finish.
+                                    context.bufferLock.async {
+                                        context.encodingFinished = true
+                                    }
                                 }
+
                                 // Invalidate session
                                 VTCompressionSessionInvalidate(compSession)
                                 // Release retained context via registry to avoid double-release
@@ -964,6 +1814,7 @@ actor VideoProcessor {
                             }
                             vIn.requestMediaDataWhenReady(on: DispatchQueue(label: "video.write")) {
                                 while vIn.isReadyForMoreMediaData {
+                                    autoreleasepool {
                                     if cancelToken.isCancelled() {
                                         vIn.markAsFinished()
                                         safeResume({ continuation.resume(throwing: VideoProcessorError.cancelled) })
@@ -996,6 +1847,7 @@ actor VideoProcessor {
                                         let p = min(pts / durationSeconds, 0.99)
                                         Task { @MainActor in progressHandler(p) }
                                     }
+                                    } // end autoreleasepool
                                 }
                             }
                         }
@@ -1021,6 +1873,13 @@ actor VideoProcessor {
                             while useSoftwareVT && !writerStarted {
                                 if cancelToken.isCancelled() { safeResume({ continuation.resume(throwing: VideoProcessorError.cancelled) }); return }
                                 Thread.sleep(forTimeInterval: 0.01)
+                            }
+                            // If writer was never properly started (e.g. reader failed),
+                            // do not attempt to use the audio input.
+                            if writer.status != .writing {
+                                NSLog("VideoProcessor: audio task: writer not in writing state (%d), skipping", writer.status.rawValue)
+                                safeResume({ continuation.resume(throwing: VideoProcessorError.exportFailed) })
+                                return
                             }
                             aIn.requestMediaDataWhenReady(on: DispatchQueue(label: "audio.write")) {
                                 while aIn.isReadyForMoreMediaData {
@@ -1057,13 +1916,21 @@ actor VideoProcessor {
                     Thread.sleep(forTimeInterval: 0.1)
 
                     // 3) Mark writer inputs finished (best-effort) before cancelling reader/writer
-                    NSLog("VideoProcessor: marking writer inputs finished (onCancel)")
-                    videoInput?.markAsFinished()
-                    audioInput?.markAsFinished()
+                    //    Only call markAsFinished if the writer was actually started (status > 0),
+                    //    otherwise AVAssetWriterInput throws an exception.
+                    if writer.status == .writing {
+                        NSLog("VideoProcessor: marking writer inputs finished (onCancel)")
+                        videoInput?.markAsFinished()
+                        audioInput?.markAsFinished()
+                    } else {
+                        NSLog("VideoProcessor: skipping markAsFinished (writer.status=\(writer.status.rawValue))")
+                    }
 
                     // 4) Stop reader and cancel writer
                     reader.cancelReading()
-                    writer.cancelWriting()
+                    if writer.status == .writing {
+                        writer.cancelWriting()
+                    }
 
                     // Diagnostic dump
                     NSLog("VideoProcessor: onCancel reader.status=\(reader.status.rawValue) writer.status=\(writer.status.rawValue)")
