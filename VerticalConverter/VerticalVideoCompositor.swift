@@ -172,27 +172,28 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     }
 
     override init() {
-        // Choose the CIContext working color space based on the pipeline mode.
+        // Choose the CIContext color management mode based on the pipeline:
         //
-        // HDR passthrough: use extendedLinearITUR_2020 so that BT.2020 content
-        // passes through without any gamut conversion (BT.2020→sRGB→BT.2020).
-        // This prevents the subtle color shifts that the round-trip introduces,
-        // especially through the blur operation.
+        // HDR passthrough: DISABLE color management entirely (NSNull).
+        // CIContext treats all pixel values as raw generic components.
+        // No OETF inversion, no gamut conversion, no round-trip error.
+        // The OETF-encoded HLG/PQ values pass through geometric transforms
+        // and Gaussian blur as-is, then go directly to the encoder.
+        // This is the ONLY reliable way to produce bit-accurate HDR output
+        // because ANY color-managed working space (even extendedLinearITUR_2020)
+        // causes CIContext's internal Metal pipeline to alter values.
         //
         // HDR→SDR / SDR: use extendedLinearSRGB so CoreImage can represent
         // HDR values (> 1.0) and tone-map them correctly into the sRGB gamut.
         let isHDRPassthrough = VerticalVideoCompositor.staticSourceIsHDR
             && !VerticalVideoCompositor.staticHDRConversionEnabled
-        let workingCS: CGColorSpace
         if isHDRPassthrough {
-            workingCS = CGColorSpace(name: CGColorSpace.extendedLinearITUR_2020)
-                ?? CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
-                ?? CGColorSpaceCreateDeviceRGB()
+            ciContext = CIContext(options: [.workingColorSpace: NSNull()])
         } else {
-            workingCS = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
+            let workingCS = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
                 ?? CGColorSpaceCreateDeviceRGB()
+            ciContext = CIContext(options: [.workingColorSpace: workingCS])
         }
-        ciContext = CIContext(options: [.workingColorSpace: workingCS])
         super.init()
     }
     
@@ -534,12 +535,24 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         // correct color metadata to frame 0. This inconsistency (frame 0 gets
         // Rec.709/nil, frame 1+ gets BT.2020) is the root cause of the
         // "first frame gamma mismatch" bug.
-        let sourceColorSpace: CGColorSpace
-        if VerticalVideoCompositor.staticSourceIsHDR {
-            // Use non-linear CS for tone mapping, linear for passthrough
-            sourceColorSpace = Self.resolvedHDRSourceColorSpace(
-                forToneMapping: hdrConversionEnabled
-            )
+        let sourceColorSpace: CGColorSpace?
+        let sourceImage: CIImage
+        let isHDRPassthrough = VerticalVideoCompositor.staticSourceIsHDR
+            && !hdrConversionEnabled
+
+        if isHDRPassthrough {
+            // HDR passthrough: CIContext has color management DISABLED (NSNull).
+            // Do NOT tag the source with any color space — CIContext will treat
+            // all values as raw generic components. The OETF-encoded HLG/PQ
+            // values pass through transforms and blur unchanged.
+            sourceImage = CIImage(cvPixelBuffer: sourcePixelBuffer)
+            sourceColorSpace = nil
+        } else if VerticalVideoCompositor.staticSourceIsHDR {
+            // HDR→SDR: tag with non-linear CS for proper OETF inversion
+            let cs = Self.resolvedHDRSourceColorSpace(forToneMapping: true)
+            sourceImage = CIImage(cvPixelBuffer: sourcePixelBuffer,
+                                  options: [.colorSpace: cs])
+            sourceColorSpace = cs
         } else {
             // SDR: Use sRGB consistently for ALL frames.
             // DO NOT use per-buffer CVImageBufferGetColorSpace — frame 0 may
@@ -548,11 +561,12 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             // power vs piecewise-linear), so mixing them through the
             // extendedLinearSRGB working space produces a visible contrast
             // difference on frame 0.
-            sourceColorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+            let cs = CGColorSpace(name: CGColorSpace.sRGB)
                 ?? CGColorSpaceCreateDeviceRGB()
+            sourceImage = CIImage(cvPixelBuffer: sourcePixelBuffer,
+                                  options: [.colorSpace: cs])
+            sourceColorSpace = cs
         }
-        let sourceImage = CIImage(cvPixelBuffer: sourcePixelBuffer,
-                                  options: [.colorSpace: sourceColorSpace])
         let sourceSize = sourceImage.extent.size
         let outputRect = CGRect(origin: .zero, size: renderSize)
 
@@ -666,8 +680,6 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         }
 
         // ── Render ──
-        // sourceColorSpace is ALWAYS determined from static metadata for HDR
-        // (never per-buffer), so this is perfectly consistent across all frames.
         if hdrConversionEnabled {
             // HDR→SDR: Apply tone mapping BEFORE the color-space conversion.
             // Without this step CIContext simply clips linear values > 1.0,
@@ -680,14 +692,12 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
 
             // Always render to Rec.709 for SDR output
             let targetCS: CGColorSpace = CGColorSpace(name: CGColorSpace.itur_709) ?? CGColorSpaceCreateDeviceRGB()
-            // bounds を outputRect（固定矩形）で指定することで、
-            // CIImage の論理 extent がフレームごとに変動しても
-            // 常に同じ領域に render される。
             ciContext.render(toneMapped, to: outputPixelBuffer, bounds: outputRect, colorSpace: targetCS)
         } else if VerticalVideoCompositor.staticSourceIsHDR {
-            // HDR passthrough: render to the SAME static-based HDR color space
-            // so no conversion happens. This avoids per-frame CS variation.
-            ciContext.render(imageToRender, to: outputPixelBuffer, bounds: outputRect, colorSpace: sourceColorSpace)
+            // HDR passthrough: CIContext has color management disabled (NSNull).
+            // Render with nil colorSpace → no color conversion at all.
+            // Raw OETF-encoded values pass through to the output buffer.
+            ciContext.render(imageToRender, to: outputPixelBuffer, bounds: outputRect, colorSpace: nil)
         } else {
             // SDR passthrough: render to sRGB (fixed, consistent across all frames).
             ciContext.render(imageToRender, to: outputPixelBuffer, bounds: outputRect, colorSpace: sourceColorSpace)
