@@ -856,6 +856,7 @@ actor VideoProcessor {
         VerticalVideoCompositor.staticColorPrimaries = detPrimaries
         VerticalVideoCompositor.staticYCbCrMatrix = detMatrix
         VerticalVideoCompositor.staticToneMappingMode = toneMappingMode
+        VerticalVideoCompositor.staticInputSize = inputSize
         videoComposition.customVideoCompositorClass = VerticalVideoCompositor.self
         
         let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: compositionVideoTrack)
@@ -977,7 +978,17 @@ actor VideoProcessor {
         }
 
         // AVAssetWriter セットアップ
-        let fileType: AVFileType = (codec == .prores422VT) ? .mov : .mp4
+        // Use .mov for HEVC and ProRes — .mov is the native Apple container
+        // and handles HEVC Main10/HDR metadata more reliably than .mp4.
+        // QuickLook and QuickTime X on macOS have known issues with HEVC
+        // (especially Main10 HDR from software encoders) in .mp4 containers.
+        let fileType: AVFileType
+        switch codec {
+        case .prores422VT, .h265, .h265VT:
+            fileType = .mov
+        default:
+            fileType = .mp4
+        }
 
         let writer: AVAssetWriter
         do {
@@ -1399,9 +1410,12 @@ actor VideoProcessor {
                                         sourceFrameRefcon: nil,
                                         infoFlagsOut: &warmupFlags)
                                     if ws == noErr {
+                                        // Use CMTime.invalid to force-flush ALL pending
+                                        // frames. A specific PTS can fail for HEVC
+                                        // encoders that reorder frames (B-frames).
                                         VTCompressionSessionCompleteFrames(
                                             compSession,
-                                            untilPresentationTimeStamp: warmupPTS)
+                                            untilPresentationTimeStamp: CMTime.invalid)
                                         // Barrier: ensure the callback's async block
                                         // on bufferLock has executed (discard logic).
                                         context.bufferLock.sync { }

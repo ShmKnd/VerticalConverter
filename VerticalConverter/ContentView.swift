@@ -1007,7 +1007,13 @@ class ContentViewModel: ObservableObject {
                 let isAccessing = inputURL.startAccessingSecurityScopedResource()
                 defer { if isAccessing { inputURL.stopAccessingSecurityScopedResource() } }
 
-                let outExt = (capturedExportSettings.codec == .prores422VT) ? "mov" : "mp4"
+                let outExt: String
+                switch capturedExportSettings.codec {
+                case .prores422VT, .h265, .h265VT:
+                    outExt = "mov"
+                default:
+                    outExt = "mp4"
+                }
                 let inputFilename = inputURL.deletingPathExtension().lastPathComponent
                 let outputURL = inputURL.deletingLastPathComponent()
                     .appendingPathComponent("\(inputFilename)_vertical")

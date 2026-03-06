@@ -30,6 +30,9 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     /// Used by primeCIContext() to warm up the exact same CIFilter/kernel chain
     /// that frame 0 will use.
     static var staticToneMappingMode: CustomVideoCompositionInstruction.ToneMappingMode = .natural
+    /// Input video size (used by primeCIContext to create correctly-sized warm-up
+    /// source buffers that exercise the same Metal rendering paths as real frames).
+    static var staticInputSize: CGSize = .zero
     private let renderQueue = DispatchQueue(label: "com.verticalconverter.renderqueue")
     private var renderContext: AVVideoCompositionRenderContext?
     private let ciContext: CIContext
@@ -169,9 +172,26 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     }
 
     override init() {
-        // Use extended linear sRGB as working color space so CoreImage can
-        // represent HDR values (> 1.0) without clipping during compositing.
-        let workingCS = CGColorSpace(name: CGColorSpace.extendedLinearSRGB) ?? CGColorSpaceCreateDeviceRGB()
+        // Choose the CIContext working color space based on the pipeline mode.
+        //
+        // HDR passthrough: use extendedLinearITUR_2020 so that BT.2020 content
+        // passes through without any gamut conversion (BT.2020→sRGB→BT.2020).
+        // This prevents the subtle color shifts that the round-trip introduces,
+        // especially through the blur operation.
+        //
+        // HDR→SDR / SDR: use extendedLinearSRGB so CoreImage can represent
+        // HDR values (> 1.0) and tone-map them correctly into the sRGB gamut.
+        let isHDRPassthrough = VerticalVideoCompositor.staticSourceIsHDR
+            && !VerticalVideoCompositor.staticHDRConversionEnabled
+        let workingCS: CGColorSpace
+        if isHDRPassthrough {
+            workingCS = CGColorSpace(name: CGColorSpace.extendedLinearITUR_2020)
+                ?? CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
+                ?? CGColorSpaceCreateDeviceRGB()
+        } else {
+            workingCS = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
+                ?? CGColorSpaceCreateDeviceRGB()
+        }
         ciContext = CIContext(options: [.workingColorSpace: workingCS])
         super.init()
     }
@@ -285,8 +305,19 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         }
 
         // ソースバッファ: IOSurface + Metal 互換で生成
+        // CRITICAL: Use staticInputSize (actual input video dimensions) instead
+        // of renderSize. CIContext / Metal internally selects different texture
+        // allocation and shader paths depending on the source image size.
+        // A 1080×1920 (output-sized) warm-up source exercises a different Metal
+        // path than the real 3840×2160 (or 1920×1080) source, which caused
+        // frame 0 to render with a different gamma/color because the lazy Metal
+        // initialisation happened on two different code paths.
+        let srcW = VerticalVideoCompositor.staticInputSize.width > 0
+            ? Int(VerticalVideoCompositor.staticInputSize.width) : width
+        let srcH = VerticalVideoCompositor.staticInputSize.height > 0
+            ? Int(VerticalVideoCompositor.staticInputSize.height) : height
         var dummySrc: CVPixelBuffer?
-        CVPixelBufferCreate(kCFAllocatorDefault, width, height, srcFormat,
+        CVPixelBufferCreate(kCFAllocatorDefault, srcW, srcH, srcFormat,
                             ioSurfaceAttrs as CFDictionary, &dummySrc)
         guard let srcBuf = dummySrc else { return }
 
@@ -299,16 +330,16 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             let bytesPerRow = CVPixelBufferGetBytesPerRow(srcBuf)
             if srcFormat == kCVPixelFormatType_64RGBAHalf {
                 // Half-float 2.0 = 0x4000 — typical HLG bright pixel
-                for row in 0..<height {
+                for row in 0..<srcH {
                     let rowPtr = baseAddr.advanced(by: row * bytesPerRow)
                         .assumingMemoryBound(to: UInt16.self)
-                    for i in 0..<(width * 4) {
+                    for i in 0..<(srcW * 4) {
                         rowPtr[i] = 0x4000
                     }
                 }
             } else {
                 // 32BGRA: mid-gray (128)
-                memset(baseAddr, 0x80, bytesPerRow * height)
+                memset(baseAddr, 0x80, bytesPerRow * srcH)
             }
         }
         CVPixelBufferUnlockBaseAddress(srcBuf, [])
