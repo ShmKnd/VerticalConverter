@@ -70,4 +70,32 @@ struct VideoExportSettings {
         case h265VT = "H.265 (VT)"
         case prores422VT = "ProRes422 (VT)"
     }
+
+    // MARK: - Container Format
+
+    /// Output container format.
+    /// `.mov` is the Apple-native container with reliable HEVC Main10 / HDR
+    /// metadata support. `.mp4` offers better cross-platform compatibility
+    /// but may cause playback issues with HDR HEVC in macOS QuickLook/QTX.
+    /// ProRes always uses `.mov` regardless of this setting.
+    enum ContainerFormat: String, CaseIterable, Hashable {
+        case mov = "MOV"
+        case mp4 = "MP4"
+    }
+
+    var containerFormat: ContainerFormat = .mov
+
+    /// Resolved file extension for the current codec + container combination.
+    /// ProRes always produces `.mov`. H.264 always produces `.mp4`.
+    /// HEVC respects the user's `containerFormat` choice.
+    var resolvedFileExtension: String {
+        switch codec {
+        case .prores422VT:
+            return "mov"
+        case .h265, .h265VT:
+            return containerFormat == .mp4 ? "mp4" : "mov"
+        default:
+            return "mp4"
+        }
+    }
 }

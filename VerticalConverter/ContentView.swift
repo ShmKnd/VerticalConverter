@@ -374,6 +374,20 @@ struct ContentView: View {
                 )
             }
             panelDivider
+            settingRow(label: "Container", icon: "doc.zipper") {
+                SlidingPicker(
+                    labels: VideoExportSettings.ContainerFormat.allCases.map { $0.rawValue },
+                    values: VideoExportSettings.ContainerFormat.allCases,
+                    selection: $viewModel.exportSettings.containerFormat,
+                    isEnabled: { _ in
+                        // Container choice only applies to HEVC codecs.
+                        // H.264 is always .mp4, ProRes is always .mov.
+                        let codec = viewModel.exportSettings.codec
+                        return codec == .h265 || codec == .h265VT
+                    }
+                )
+            }
+            panelDivider
             settingRow(label: "Bitrate", icon: "dial.min.fill") {
                 SlidingPicker(
                     labels: [8, 10, 12].map { "\($0) Mbps" },
@@ -1007,13 +1021,7 @@ class ContentViewModel: ObservableObject {
                 let isAccessing = inputURL.startAccessingSecurityScopedResource()
                 defer { if isAccessing { inputURL.stopAccessingSecurityScopedResource() } }
 
-                let outExt: String
-                switch capturedExportSettings.codec {
-                case .prores422VT, .h265, .h265VT:
-                    outExt = "mov"
-                default:
-                    outExt = "mp4"
-                }
+                let outExt = capturedExportSettings.resolvedFileExtension
                 let inputFilename = inputURL.deletingPathExtension().lastPathComponent
                 let outputURL = inputURL.deletingLastPathComponent()
                     .appendingPathComponent("\(inputFilename)_vertical")

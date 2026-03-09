@@ -33,6 +33,11 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     /// Input video size (used by primeCIContext to create correctly-sized warm-up
     /// source buffers that exercise the same Metal rendering paths as real frames).
     static var staticInputSize: CGSize = .zero
+    /// Whether the output codec is HEVC (H.265). Used to select the correct
+    /// output pixel format for HDR passthrough: HEVC's HDR-aware encoding
+    /// pipeline applies OETF to float input, so we must output integer format
+    /// to avoid double-OETF.
+    static var staticIsHEVCOutput: Bool = false
     private let renderQueue = DispatchQueue(label: "com.verticalconverter.renderqueue")
     private var renderContext: AVVideoCompositionRenderContext?
     private let ciContext: CIContext
@@ -148,47 +153,60 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     ///   Apple-standard neutral result. Falls back to Reinhard kernel.
     ///
     /// - **Cinematic**: ACES filmic curve for a graded, film-like look.
-    ///   On macOS 15+ uses `CIToneMapHeadroom` as primary (its rendering
-    ///   is already quite cinematic), with ACES kernel as legacy fallback.
+    ///   On macOS 15+ uses `CIToneMapHeadroom` as primary, with ACES
+    ///   kernel as legacy fallback on macOS 14 and below.
     private func applyToneMapping(to image: CIImage) -> CIImage {
         let tLower = VerticalVideoCompositor.staticTransferFunction.lowercased()
+        let isPQ = tLower.contains("pq") || tLower.contains("2084")
 
+        // macOS 15+ / iOS 18+: use Apple's CIToneMapHeadroom for both modes.
+        // BT.2390-compliant tone mapping with proper gamut mapping built-in.
+        if #available(macOS 15.0, iOS 18.0, *) {
+            let sourceHeadroom: Float = isPQ ? 16.0 : 4.0
+            return image.applyingFilter("CIToneMapHeadroom", parameters: [
+                "inputSourceHeadroom": sourceHeadroom,
+                "inputTargetHeadroom": Float(1.0)
+            ])
+        }
+
+        // macOS 14 and below: fall back to custom CIColorKernel
         switch toneMappingMode {
         case .cinematic:
-            // Cinematic: prefer Apple Headroom, fall back to ACES
-            if #available(macOS 15.0, iOS 18.0, *) {
-                let sourceHeadroom: Float = (tLower.contains("pq") || tLower.contains("2084")) ? 16.0 : 4.0
-                return image.applyingFilter("CIToneMapHeadroom", parameters: [
-                    "inputSourceHeadroom": sourceHeadroom,
-                    "inputTargetHeadroom": Float(1.0)
-                ])
-            }
             return applyACESToneMap(to: image)
-
         case .natural:
-            // Natural: gentle Reinhard – faithful to Rec.709/sRGB
             return applyNaturalToneMap(to: image)
         }
     }
 
     override init() {
-        // Choose the CIContext color management mode based on the pipeline:
+        // Choose the CIContext working color space based on the pipeline:
         //
-        // HDR passthrough: DISABLE color management entirely (NSNull).
-        // CIContext treats all pixel values as raw generic components.
-        // No OETF inversion, no gamut conversion, no round-trip error.
-        // The OETF-encoded HLG/PQ values pass through geometric transforms
-        // and Gaussian blur as-is, then go directly to the encoder.
-        // This is the ONLY reliable way to produce bit-accurate HDR output
-        // because ANY color-managed working space (even extendedLinearITUR_2020)
-        // causes CIContext's internal Metal pipeline to alter values.
+        // HDR passthrough:
+        //   DISABLE color management entirely (NSNull). CIContext treats
+        //   all pixel values as raw generic components. No OETF inversion,
+        //   no gamut conversion. The OETF-encoded HLG/PQ values pass
+        //   through geometric transforms and blur as-is, then go directly
+        //   to the encoder. Combined with videoComposition.colorPrimaries
+        //   / colorTransferFunction / colorYCbCrMatrix being set to the
+        //   source's native HDR properties, AVFoundation no longer applies
+        //   implicit BT.709 color conversion on the compositor output.
         //
-        // HDR→SDR / SDR: use extendedLinearSRGB so CoreImage can represent
-        // HDR values (> 1.0) and tone-map them correctly into the sRGB gamut.
+        // HDR→SDR:
+        //   Use extendedLinearITUR_2020 to keep BT.2020 content in native
+        //   gamut during processing. CIToneMapHeadroom operates on linear
+        //   BT.2020 values. Final BT.2020→Rec.709 gamut conversion happens
+        //   at the render step.
+        //
+        // SDR: extendedLinearSRGB (standard).
         let isHDRPassthrough = VerticalVideoCompositor.staticSourceIsHDR
             && !VerticalVideoCompositor.staticHDRConversionEnabled
         if isHDRPassthrough {
             ciContext = CIContext(options: [.workingColorSpace: NSNull()])
+        } else if VerticalVideoCompositor.staticSourceIsHDR {
+            let workingCS = CGColorSpace(name: CGColorSpace.extendedLinearITUR_2020)
+                ?? CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
+                ?? CGColorSpaceCreateDeviceRGB()
+            ciContext = CIContext(options: [.workingColorSpace: workingCS])
         } else {
             let workingCS = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
                 ?? CGColorSpaceCreateDeviceRGB()
@@ -228,12 +246,20 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         // conversion between compositor output and reader output, which may
         // initialize lazily and cause frame-0 gamma/color inconsistency.
         //
-        //  • HDR passthrough → 64RGBAHalf (preserve HDR values)
-        //  • HDR→SDR         → 32BGRA (SDR output)
-        //  • SDR             → 32BGRA (SDR output)
+        //  • HDR passthrough (non-HEVC) → 64RGBAHalf (preserve HDR values)
+        //  • HDR passthrough (HEVC)     → 32BGRA (integer prevents double-OETF)
+        //  • HDR→SDR                    → 32BGRA (SDR output)
+        //  • SDR                        → 32BGRA (SDR output)
+        //
+        // HEVC encoders (both SW and HW) interpret 64RGBAHalf as scene-linear
+        // and apply OETF when TransferFunction is HLG/PQ. Since the values
+        // from NSNull CIContext are already OETF-encoded, this causes double-
+        // OETF and produces dark/SDR-tone output. Using 32BGRA (integer)
+        // avoids this because encoders treat integer data as display-referred.
+        // H264 and ProRes do not have HDR-aware pipelines, so float is fine.
         let isHDRPassthrough = VerticalVideoCompositor.staticSourceIsHDR
             && !VerticalVideoCompositor.staticHDRConversionEnabled
-        if isHDRPassthrough {
+        if isHDRPassthrough && !VerticalVideoCompositor.staticIsHEVCOutput {
             return [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_64RGBAHalf,
                 kCVPixelBufferOpenGLCompatibilityKey as String: true
@@ -274,9 +300,15 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     private func primeCIContext(renderSize: CGSize) {
         let isHDRPassthrough = VerticalVideoCompositor.staticSourceIsHDR
             && !VerticalVideoCompositor.staticHDRConversionEnabled
-        let outputFormat: OSType = isHDRPassthrough
-            ? kCVPixelFormatType_64RGBAHalf
-            : kCVPixelFormatType_32BGRA
+        // Match requiredPixelBufferAttributesForRenderContext format:
+        // HEVC HDR passthrough → 32BGRA (integer to avoid double-OETF)
+        // Non-HEVC HDR passthrough → 64RGBAHalf
+        let outputFormat: OSType
+        if isHDRPassthrough && !VerticalVideoCompositor.staticIsHEVCOutput {
+            outputFormat = kCVPixelFormatType_64RGBAHalf
+        } else {
+            outputFormat = kCVPixelFormatType_32BGRA
+        }
         let srcFormat: OSType = VerticalVideoCompositor.staticSourceIsHDR
             ? kCVPixelFormatType_64RGBAHalf
             : kCVPixelFormatType_32BGRA
@@ -630,8 +662,12 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             }
 
             if VerticalVideoCompositor.staticSourceIsHDR {
-                // ── HDR: force-write the three critical colorimetry keys
-                //    from track-level static metadata ──
+                // ── HDR passthrough: stamp all three colorimetry keys ──
+                // The output buffer format is now integer (32BGRA) for HEVC
+                // output, so stamping TransferFunction is safe — HEVC encoders
+                // treat integer data as display-referred and do NOT apply OETF.
+                // For non-HEVC (64RGBAHalf), the encoder doesn't have an HDR
+                // pipeline so the stamp is also safe.
                 let tf = VerticalVideoCompositor.staticTransferFunction
                 let pr = VerticalVideoCompositor.staticColorPrimaries
                 let mx = VerticalVideoCompositor.staticYCbCrMatrix

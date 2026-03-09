@@ -779,7 +779,8 @@ actor VideoProcessor {
             precomputedOffsets: precomputedOffsets,
             letterboxMode: letterboxMode
             , hdrConversionEnabled: hdrConversionEnabled,
-            toneMappingMode: toneMappingMode
+            toneMappingMode: toneMappingMode,
+            codec: exportSettings.codec
         )
         
         // エクスポート
@@ -790,6 +791,7 @@ actor VideoProcessor {
             bitrate: exportSettings.bitrate,
             encodingMode: exportSettings.encodingMode,
             codec: exportSettings.codec,
+            containerFormat: exportSettings.containerFormat,
             progressHandler: { p in
                 progressHandler(progressOffset + p * progressScale, "Converting...")
             }
@@ -806,7 +808,8 @@ actor VideoProcessor {
         precomputedOffsets: [CGPoint]? = nil,
         letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth
         , hdrConversionEnabled: Bool = false,
-        toneMappingMode: CustomVideoCompositionInstruction.ToneMappingMode = .natural
+        toneMappingMode: CustomVideoCompositionInstruction.ToneMappingMode = .natural,
+        codec: VideoExportSettings.Codec = .h264
     ) async throws -> (AVMutableComposition, AVMutableVideoComposition) {
         let composition = AVMutableComposition()
         
@@ -857,7 +860,32 @@ actor VideoProcessor {
         VerticalVideoCompositor.staticYCbCrMatrix = detMatrix
         VerticalVideoCompositor.staticToneMappingMode = toneMappingMode
         VerticalVideoCompositor.staticInputSize = inputSize
+        VerticalVideoCompositor.staticIsHEVCOutput = (codec == .h265 || codec == .h265VT)
         videoComposition.customVideoCompositorClass = VerticalVideoCompositor.self
+
+        // ── Critical: Declare the composition pipeline's color space ──
+        // These properties tell AVFoundation what color space to use when
+        // delivering decoded frames to the custom compositor. If unset,
+        // AVFoundation defaults to BT.709 and silently converts BT.2020 HDR
+        // sources, causing saturation shifts even with trivial scale+crop.
+        //
+        // For ALL HDR inputs (passthrough AND HDR→SDR), declare the source's
+        // native HDR color properties so AVFoundation delivers un-converted
+        // BT.2020/HLG/PQ frames to the compositor. The compositor handles
+        // any necessary color conversion internally (e.g. tone mapping for
+        // HDR→SDR). Setting Rec.709 here for HDR→SDR would cause AVFoundation
+        // to apply a premature BT.2020→BT.709 conversion BEFORE the
+        // compositor sees the frames, resulting in double conversion.
+        if isHDR {
+            videoComposition.colorPrimaries = detPrimaries
+            videoComposition.colorTransferFunction = detTransfer
+            videoComposition.colorYCbCrMatrix = detMatrix
+        } else {
+            // SDR passthrough
+            videoComposition.colorPrimaries = AVVideoColorPrimaries_ITU_R_709_2
+            videoComposition.colorTransferFunction = AVVideoTransferFunction_ITU_R_709_2
+            videoComposition.colorYCbCrMatrix = AVVideoYCbCrMatrix_ITU_R_709_2
+        }
         
         let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: compositionVideoTrack)
         
@@ -912,6 +940,7 @@ actor VideoProcessor {
         bitrate: Int,
         encodingMode: VideoExportSettings.EncodingMode,
         codec: VideoExportSettings.Codec,
+        containerFormat: VideoExportSettings.ContainerFormat = .mov,
         progressHandler: @escaping (Double) -> Void
     ) async throws {
 
@@ -944,11 +973,18 @@ actor VideoProcessor {
         //  • HDR パススルー → 64RGBAHalf (HDR 値を保持)
         //  • HDR→SDR       → 32BGRA (SDR 出力)
         //  • SDR            → 32BGRA (SDR 出力)
-        // ProRes VT は float RGBA を受け付けないため HDR でも BGRA を使用
-        let isHDRPassthrough = isHDRInput && !hdrConversionRequested && codec != .prores422VT
-        let preferredPixelFormat: OSType = isHDRPassthrough
-            ? kCVPixelFormatType_64RGBAHalf
-            : kCVPixelFormatType_32BGRA
+        // HEVC encoders apply OETF to float input (64RGBAHalf) when HLG/PQ
+        // transfer function is set, causing double-OETF. Use 32BGRA (integer)
+        // for HEVC HDR passthrough so the encoder treats values as display-
+        // referred. H264/ProRes don't have HDR-aware pipelines, so float is OK.
+        let isHEVC = (codec == .h265 || codec == .h265VT)
+        let isHDRPassthrough = isHDRInput && !hdrConversionRequested
+        let preferredPixelFormat: OSType
+        if isHDRPassthrough && !isHEVC && codec != .prores422VT {
+            preferredPixelFormat = kCVPixelFormatType_64RGBAHalf
+        } else {
+            preferredPixelFormat = kCVPixelFormatType_32BGRA
+        }
         let videoOutput = AVAssetReaderVideoCompositionOutput(
             videoTracks: composition.tracks(withMediaType: .video),
             videoSettings: [
@@ -978,14 +1014,15 @@ actor VideoProcessor {
         }
 
         // AVAssetWriter セットアップ
-        // Use .mov for HEVC and ProRes — .mov is the native Apple container
-        // and handles HEVC Main10/HDR metadata more reliably than .mp4.
-        // QuickLook and QuickTime X on macOS have known issues with HEVC
-        // (especially Main10 HDR from software encoders) in .mp4 containers.
+        // ProRes always requires .mov. HEVC respects the user's container
+        // choice (default .mov for HDR reliability, .mp4 for compatibility).
+        // H.264 always uses .mp4.
         let fileType: AVFileType
         switch codec {
-        case .prores422VT, .h265, .h265VT:
+        case .prores422VT:
             fileType = .mov
+        case .h265, .h265VT:
+            fileType = containerFormat == .mp4 ? .mp4 : .mov
         default:
             fileType = .mp4
         }
@@ -1300,6 +1337,33 @@ actor VideoProcessor {
                                 status = VTSessionSetProperty(compSession, key: kVTCompressionPropertyKey_AverageBitRate, value: cfNum)
                                 _ = (status != noErr)
                             }
+
+                            // ── HEVC SW compatibility fix ──
+                            // macOS's software HEVC encoder can produce bitstreams
+                            // that QuickTime X and Finder QuickLook cannot decode.
+                            // The primary cause is B-frame reordering: the SW encoder
+                            // generates temporal sub-layers that these players don't
+                            // handle correctly. Disabling frame reordering forces a
+                            // strict I/P-only structure that all Apple decoders accept.
+                            // Also set a reasonable keyframe interval for seeking.
+                            if codec == .h265 {
+                                VTSessionSetProperty(compSession,
+                                    key: kVTCompressionPropertyKey_AllowFrameReordering,
+                                    value: kCFBooleanFalse)
+                                VTSessionSetProperty(compSession,
+                                    key: kVTCompressionPropertyKey_AllowTemporalCompression,
+                                    value: kCFBooleanTrue)
+                                var maxKeyInterval = Int32(30)
+                                VTSessionSetProperty(compSession,
+                                    key: kVTCompressionPropertyKey_MaxKeyFrameInterval,
+                                    value: CFNumberCreate(nil, .sInt32Type, &maxKeyInterval))
+                                var maxKeyDuration = Float64(2.0)
+                                VTSessionSetProperty(compSession,
+                                    key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
+                                    value: CFNumberCreate(nil, .float64Type, &maxKeyDuration))
+                                NSLog("VideoProcessor: HEVC SW - disabled frame reordering for QTX compatibility")
+                            }
+
                             // set expected frame rate if ABR specified
                             if encodingMode == .abr {
                                 var fr = Int32(30)
@@ -1478,6 +1542,11 @@ actor VideoProcessor {
                                     //  • HDR passthrough → HDR metadata
                                     //  • HDR→SDR         → SDR metadata (Rec.709/sRGB)
                                     if isHDRInput && !hdrConversionRequested {
+                                        // Stamp all three colorimetry keys.
+                                        // The compositor now outputs 32BGRA (integer) for
+                                        // HEVC HDR passthrough. HEVC encoders treat integer
+                                        // data as display-referred and do NOT apply OETF,
+                                        // so stamping TransferFunction is safe.
                                         CVBufferSetAttachment(pixelBuffer,
                                             kCVImageBufferColorPrimariesKey as CFString,
                                             detectedPrimaries as NSString as CFTypeRef,
