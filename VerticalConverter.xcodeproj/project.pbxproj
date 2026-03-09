@@ -7,31 +7,31 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		E7BA2EE0A9AF43FFAE5675BBF5249666 /* VerticalConverterApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1678A1255E84E4594163CADAEF457FE /* VerticalConverterApp.swift */; };
-		CE01A6894AE34EA59114450622883CF4 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18A7848F5EE64184AE4AF67EA7860945 /* ContentView.swift */; };
-		3C6B5B52570244DF85CF3C2B0022A189 /* VideoProcessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5C87F0C42E94A2B93761F3837875108 /* VideoProcessor.swift */; };
-		DE08328251F84B72A44F0B9F63D895AC /* VerticalVideoCompositor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D5730ED405F414AA6ABA96AC2BEAD44 /* VerticalVideoCompositor.swift */; };
-		62C15C98B1294DEFA5E48F83A3B18273 /* SmartFramingSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = D9C0F43211F74D91B1882EC1E7FD59EF /* SmartFramingSettings.swift */; };
-		C9A8B7C6D5E44F78A9B8C7D6E5F4A3B2 /* VideoExportSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8C7B6A5F4E34D78B9C8D7E6F5A4B3C2 /* VideoExportSettings.swift */; };
-		4A8F3C1B92E34F56A7D8E92F44B62A11 /* CustomVideoCompositionInstruction.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F2D8E3A43C94A67B9E1F4C36D2A7E89 /* CustomVideoCompositionInstruction.swift */; };
-		B3D92F1A4C5E4A78B6E2D8F3A71C4B55 /* DockProgress.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7E41F2B83D94B56AE3F17D2B94A6C33 /* DockProgress.swift */; };
-		A1F2C3D4E5F64A78B9C0D1E2F3A4B5C6 /* SmartFramingAnalyzer.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6E5D4C3B2A14F78E9D8C7B6A5F4E3D2 /* SmartFramingAnalyzer.swift */; };
 		2B277AFF2D18448C8D05EA1AE683A82E /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 69D7A89B4FCE49AF849BE45027E5DF2F /* Assets.xcassets */; };
+		3C6B5B52570244DF85CF3C2B0022A189 /* VideoProcessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5C87F0C42E94A2B93761F3837875108 /* VideoProcessor.swift */; };
+		4A8F3C1B92E34F56A7D8E92F44B62A11 /* CustomVideoCompositionInstruction.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F2D8E3A43C94A67B9E1F4C36D2A7E89 /* CustomVideoCompositionInstruction.swift */; };
+		62C15C98B1294DEFA5E48F83A3B18273 /* SmartFramingSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = D9C0F43211F74D91B1882EC1E7FD59EF /* SmartFramingSettings.swift */; };
+		A1F2C3D4E5F64A78B9C0D1E2F3A4B5C6 /* SmartFramingAnalyzer.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6E5D4C3B2A14F78E9D8C7B6A5F4E3D2 /* SmartFramingAnalyzer.swift */; };
+		B3D92F1A4C5E4A78B6E2D8F3A71C4B55 /* DockProgress.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7E41F2B83D94B56AE3F17D2B94A6C33 /* DockProgress.swift */; };
+		C9A8B7C6D5E44F78A9B8C7D6E5F4A3B2 /* VideoExportSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8C7B6A5F4E34D78B9C8D7E6F5A4B3C2 /* VideoExportSettings.swift */; };
+		CE01A6894AE34EA59114450622883CF4 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18A7848F5EE64184AE4AF67EA7860945 /* ContentView.swift */; };
+		DE08328251F84B72A44F0B9F63D895AC /* VerticalVideoCompositor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D5730ED405F414AA6ABA96AC2BEAD44 /* VerticalVideoCompositor.swift */; };
+		E7BA2EE0A9AF43FFAE5675BBF5249666 /* VerticalConverterApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1678A1255E84E4594163CADAEF457FE /* VerticalConverterApp.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		18A7848F5EE64184AE4AF67EA7860945 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		5F2D8E3A43C94A67B9E1F4C36D2A7E89 /* CustomVideoCompositionInstruction.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomVideoCompositionInstruction.swift; sourceTree = "<group>"; };
+		69D7A89B4FCE49AF849BE45027E5DF2F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		8D5730ED405F414AA6ABA96AC2BEAD44 /* VerticalVideoCompositor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VerticalVideoCompositor.swift; sourceTree = "<group>"; };
+		9E7AAF932FBA4CA2856A59AC40BA4F4B /* VerticalConverter.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = VerticalConverter.entitlements; sourceTree = "<group>"; };
 		A6507A409D844C6284A6B999CD5E7FFF /* VerticalConverter.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = VerticalConverter.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B1678A1255E84E4594163CADAEF457FE /* VerticalConverterApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VerticalConverterApp.swift; sourceTree = "<group>"; };
-		18A7848F5EE64184AE4AF67EA7860945 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		B5C87F0C42E94A2B93761F3837875108 /* VideoProcessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoProcessor.swift; sourceTree = "<group>"; };
-		8D5730ED405F414AA6ABA96AC2BEAD44 /* VerticalVideoCompositor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VerticalVideoCompositor.swift; sourceTree = "<group>"; };
-		D9C0F43211F74D91B1882EC1E7FD59EF /* SmartFramingSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SmartFramingSettings.swift; sourceTree = "<group>"; };
-		D8C7B6A5F4E34D78B9C8D7E6F5A4B3C2 /* VideoExportSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoExportSettings.swift; sourceTree = "<group>"; };
-		5F2D8E3A43C94A67B9E1F4C36D2A7E89 /* CustomVideoCompositionInstruction.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomVideoCompositionInstruction.swift; sourceTree = "<group>"; };
 		C7E41F2B83D94B56AE3F17D2B94A6C33 /* DockProgress.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DockProgress.swift; sourceTree = "<group>"; };
+		D8C7B6A5F4E34D78B9C8D7E6F5A4B3C2 /* VideoExportSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoExportSettings.swift; sourceTree = "<group>"; };
+		D9C0F43211F74D91B1882EC1E7FD59EF /* SmartFramingSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SmartFramingSettings.swift; sourceTree = "<group>"; };
 		F6E5D4C3B2A14F78E9D8C7B6A5F4E3D2 /* SmartFramingAnalyzer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SmartFramingAnalyzer.swift; sourceTree = "<group>"; };
-		69D7A89B4FCE49AF849BE45027E5DF2F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		9E7AAF932FBA4CA2856A59AC40BA4F4B /* VerticalConverter.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = VerticalConverter.entitlements; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -45,6 +45,14 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		0611BA6C0FE948F99F38C7A106C40BAD /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A6507A409D844C6284A6B999CD5E7FFF /* VerticalConverter.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
 		06F4A9CDFD4F43058801AFF1AB9084D3 = {
 			isa = PBXGroup;
 			children = (
@@ -60,21 +68,15 @@
 				18A7848F5EE64184AE4AF67EA7860945 /* ContentView.swift */,
 				B5C87F0C42E94A2B93761F3837875108 /* VideoProcessor.swift */,
 				8D5730ED405F414AA6ABA96AC2BEAD44 /* VerticalVideoCompositor.swift */,
-				D9C0F43211F74D91B1882EC1E7FD59EF /* SmartFramingSettings.swift */,					D8C7B6A5F4E34D78B9C8D7E6F5A4B3C2 /* VideoExportSettings.swift */,				5F2D8E3A43C94A67B9E1F4C36D2A7E89 /* CustomVideoCompositionInstruction.swift */,
+				D9C0F43211F74D91B1882EC1E7FD59EF /* SmartFramingSettings.swift */,
+				D8C7B6A5F4E34D78B9C8D7E6F5A4B3C2 /* VideoExportSettings.swift */,
+				5F2D8E3A43C94A67B9E1F4C36D2A7E89 /* CustomVideoCompositionInstruction.swift */,
 				C7E41F2B83D94B56AE3F17D2B94A6C33 /* DockProgress.swift */,
 				F6E5D4C3B2A14F78E9D8C7B6A5F4E3D2 /* SmartFramingAnalyzer.swift */,
 				69D7A89B4FCE49AF849BE45027E5DF2F /* Assets.xcassets */,
 				9E7AAF932FBA4CA2856A59AC40BA4F4B /* VerticalConverter.entitlements */,
 			);
 			path = VerticalConverter;
-			sourceTree = "<group>";
-		};
-		0611BA6C0FE948F99F38C7A106C40BAD /* Products */ = {
-			isa = PBXGroup;
-			children = (
-				A6507A409D844C6284A6B999CD5E7FFF /* VerticalConverter.app */,
-			);
-			name = Products;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -149,7 +151,9 @@
 				CE01A6894AE34EA59114450622883CF4 /* ContentView.swift in Sources */,
 				DE08328251F84B72A44F0B9F63D895AC /* VerticalVideoCompositor.swift in Sources */,
 				3C6B5B52570244DF85CF3C2B0022A189 /* VideoProcessor.swift in Sources */,
-				62C15C98B1294DEFA5E48F83A3B18273 /* SmartFramingSettings.swift in Sources */,					C9A8B7C6D5E44F78A9B8C7D6E5F4A3B2 /* VideoExportSettings.swift in Sources */,				4A8F3C1B92E34F56A7D8E92F44B62A11 /* CustomVideoCompositionInstruction.swift in Sources */,
+				62C15C98B1294DEFA5E48F83A3B18273 /* SmartFramingSettings.swift in Sources */,
+				C9A8B7C6D5E44F78A9B8C7D6E5F4A3B2 /* VideoExportSettings.swift in Sources */,
+				4A8F3C1B92E34F56A7D8E92F44B62A11 /* CustomVideoCompositionInstruction.swift in Sources */,
 				B3D92F1A4C5E4A78B6E2D8F3A71C4B55 /* DockProgress.swift in Sources */,
 				A1F2C3D4E5F64A78B9C0D1E2F3A4B5C6 /* SmartFramingAnalyzer.swift in Sources */,
 				E7BA2EE0A9AF43FFAE5675BBF5249666 /* VerticalConverterApp.swift in Sources */,
@@ -159,6 +163,35 @@
 /* End PBXSourcesBuildPhase section */
 
 /* Begin XCBuildConfiguration section */
+		09226286707A471792774E72BAD80296 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = VerticalConverter/VerticalConverter.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.video";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.6;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.verticalconverter.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
 		6B8BB86965E944F6A778387E87C56E64 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -222,6 +255,35 @@
 			};
 			name = Debug;
 		};
+		88EAC6D7BB1D4EA99D3B851EEEE0203F /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = VerticalConverter/VerticalConverter.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.video";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.6;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.verticalconverter.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
 		B1C68CA754424A3B90AB28357198DC41 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -274,60 +336,6 @@
 				MTL_FAST_MATH = YES;
 				SDKROOT = macosx;
 				SWIFT_COMPILATION_MODE = wholemodule;
-			};
-			name = Release;
-		};
-		88EAC6D7BB1D4EA99D3B851EEEE0203F /* Debug */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				CODE_SIGN_ENTITLEMENTS = VerticalConverter/VerticalConverter.entitlements;
-				CODE_SIGN_STYLE = Automatic;
-				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
-				ENABLE_HARDENED_RUNTIME = YES;
-				ENABLE_PREVIEWS = YES;
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.video";
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/../Frameworks",
-				);
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.verticalconverter.app;
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				SWIFT_EMIT_LOC_STRINGS = YES;
-				SWIFT_VERSION = 5.0;
-			};
-			name = Debug;
-		};
-		09226286707A471792774E72BAD80296 /* Release */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				CODE_SIGN_ENTITLEMENTS = VerticalConverter/VerticalConverter.entitlements;
-				CODE_SIGN_STYLE = Automatic;
-				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
-				ENABLE_HARDENED_RUNTIME = YES;
-				ENABLE_PREVIEWS = YES;
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.video";
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/../Frameworks",
-				);
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.verticalconverter.app;
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				SWIFT_EMIT_LOC_STRINGS = YES;
-				SWIFT_VERSION = 5.0;
 			};
 			name = Release;
 		};
