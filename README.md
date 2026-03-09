@@ -20,6 +20,10 @@ v<h1 align="center">Vertical Converter</h1>
   <a href="https://youtu.be/TacC07xiaG8">
     <img src="https://img.shields.io/badge/▶_YouTube-解説動画を見る-red?style=for-the-badge&logo=youtube&logoColor=white" alt="YouTube 解説動画">
   </a>
+  &nbsp;
+  <a href="https://ko-fi.com/ShmKnd">
+    <img src="https://img.shields.io/badge/☕_Ko--fi-Support-ff5e5b?style=for-the-badge&logo=ko-fi&logoColor=white" alt="Ko-fi">
+  </a>
 </p>
 
 ---
