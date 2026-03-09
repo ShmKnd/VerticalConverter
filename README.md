@@ -15,8 +15,10 @@
 | **Y方向ヘッドルーム制御** | 上半身・ダンス等でも頭の余白を自動確保 |
 | **クロップモード** | Fit W / Fit H / Square / 4:3 / 3:4 の5種類から選択 |
 | **クロッププレビュー** | サムネイル時刻シークつきのプレビューシートでクロップ結果を事前確認 |
-| **HDR→SDR変換** | Natural（Reinhard）/ Cinematic（ACES）トーンマッピングで HDR を SDR に変換 |
+| **HDR→SDR変換** | Natural / Cinematic トーンマッピング（macOS 15+: CIToneMapHeadroom、macOS 14: Reinhard/ACES フォールバック） |
+| **HDR パススルー** | HDR メタデータ（HLG/PQ/BT.2020）を保持したまま縦変換。HEVC エンコーダ向け整数フォーマット最適化あり |
 | コーデック選択 | H.264 / H.265 / H.264 (VT) / H.265 (VT) / ProRes422 (VT) |
+| **コンテナ選択** | HEVC 出力時に MOV / MP4 を選択可能（H.264 は MP4 固定、ProRes は MOV 固定） |
 | 解像度選択 | 720p (720×1280) / 1080p (1080×1920) |
 | フレームレート選択 | 24 / 29.97 DF / 30 / 60 fps |
 | ビットレート選択 | 8 / 10 / 12 Mbps |
@@ -34,7 +36,7 @@
 - **言語**: Swift / SwiftUI
 - **フレームワーク**: AVFoundation, Vision, Core Image, VideoToolbox
 - **処理方式**: 2パス（解析→変換）、スマートフレーミングOFF時は1パス
-- **出力形式**: MP4（H.264/H.265 + AAC 192kbps）またはMOV（ProRes422）
+- **出力形式**: MP4（H.264 + AAC 192kbps）、MOV または MP4（H.265 + AAC 192kbps）、MOV（ProRes422）
 - **出力解像度**: 720×1280 または 1080×1920（9:16）
 
 ---
@@ -68,7 +70,7 @@ VerticalConverter/
 ├── VerticalConverterApp.swift              # エントリーポイント
 ├── ContentView.swift                       # メインUI + ContentViewModel（バッチ対応）
 ├── VideoProcessor.swift                    # 変換オーケストレーション（hev1 リマックス + 2パス）
-├── VideoExportSettings.swift               # エクスポート設定（解像度・FPS・コーデック・モード）
+├── VideoExportSettings.swift               # エクスポート設定（解像度・FPS・コーデック・コンテナ・モード）
 ├── SmartFramingSettings.swift              # スマートフレーミング設定
 ├── SmartFramingAnalyzer.swift              # 第1パス: Vision解析 + IOUトラッキング
 ├── VerticalVideoCompositor.swift           # 第2パス: カスタムフレーム合成 + HDRトーンマッピング
@@ -104,7 +106,7 @@ VerticalConverter/
   フレームごとに precomputedOffsets[i] を参照
     → scale × (offsetX, offsetY) を適用してクロップ
     → スマートフレーミングOFFの場合はレターボックス（選択クロップモード）+ブラー背景
-    → HDR→SDR ON の場合はトーンマッピング適用（Natural: Reinhard / Cinematic: ACES）
+    → HDR→SDR ON の場合はトーンマッピング適用（macOS 15+: CIToneMapHeadroom / macOS 14: Natural: Reinhard / Cinematic: ACES）
 
 [エンコード]
   H.264 / H.265（非VT）→ VTCompressionSession によるソフトウェアエンコード
@@ -184,20 +186,37 @@ minHoldFrames = fps × 0.5秒
 
 | モード | 説明 |
 |---|---|
-| **Natural** | Reinhard extended + ハイライト彩度抑制。Rec.709/sRGB に忠実な自然な色味。 |
-| **Cinematic** | macOS 15+ では `CIToneMapHeadroom`、フォールバックで ACES filmic カーブ。コントラスト高めのフィルムライクな仕上がり。 |
+| **Natural** | macOS 15+: `CIToneMapHeadroom`。macOS 14: Reinhard extended + ハイライト彩度抑制。Rec.709/sRGB に忠実な自然な色味。 |
+| **Cinematic** | macOS 15+: `CIToneMapHeadroom`。macOS 14: ACES filmic カーブ。コントラスト高めのフィルムライクな仕上がり。 |
 
 ### 技術的な処理フロー
 
 1. 入力トラックのフォーマット記述から TransferFunction / ColorPrimaries / YCbCrMatrix を検出
-2. `VerticalVideoCompositor` の static プロパティに HDR メタデータを設定
-3. ソースピクセルバッファを非線形 HLG/PQ カラースペースでタグ付け → CIContext が逆 OETF を適用して線形値に変換
-4. トーンマッピングカーネル（CIColorKernel）で HDR 値を [0, 1] に圧縮
-5. Rec.709 カラースペースで SDR 出力にレンダリング
+2. `AVMutableVideoComposition` に検出した色空間プロパティを設定（AVFoundation の暗黙変換を防止）
+3. `VerticalVideoCompositor` の static プロパティに HDR メタデータを設定
+4. ソースピクセルバッファを非線形 HLG/PQ カラースペースでタグ付け → CIContext が逆 OETF を適用して線形値に変換
+5. トーンマッピング（macOS 15+: `CIToneMapHeadroom`、macOS 14: CIColorKernel）で HDR 値を [0, 1] に圧縮
+6. Rec.709 カラースペースで SDR 出力にレンダリング
+
+### HDR パススルー
+
+HDR→SDR 変換を無効にした場合、HDR メタデータ（HLG/PQ/BT.2020）を保持したまま縦変換を行う。
+
+- `CIContext` に `NSNull()` workingColorSpace を設定し、カラーマネジメントを完全無効化
+- HEVC エンコーダへの入力は `32BGRA`（8bit 整数）フォーマット（float 入力での二重 OETF を回避）
+- H.264 / ProRes は `64RGBAHalf`（16bit float）で HDR 値の精度を最大化
 
 ### CIContext のウォームアップ（Frame 0 問題の解決）
 
 `renderContextChanged` で本番の `ciContext` を使って dummy バッファに対し `composeFrame` を2回実行し、Metal シェーダーコンパイル・テクスチャキャッシュ・IOSurface バッキングを事前に初期化。これにより frame 0 でのガンマ/色ずれを防止。
+
+### AVMutableVideoComposition の色空間プロパティ
+
+`videoComposition.colorPrimaries` / `colorTransferFunction` / `colorYCbCrMatrix` をソース HDR メタデータに合わせて設定。未設定の場合、AVFoundation がデフォルト BT.709 を想定し、BT.2020 HDR フレームに暗黙の色空間変換を適用してコンポジターに渡すため、彩度が変化する。全 HDR 入力（パススルー・HDR→SDR 問わず）に対してソースプロパティを設定することで、AVFoundation が未変換のフレームを直接コンポジターに渡す。
+
+### HEVC HDR パススルーのピクセルフォーマット最適化
+
+Apple の HEVC エンコーダ（SW/HW 両方）は `64RGBAHalf`（float）入力を scene-linear と解釈し、HLG/PQ 転送関数がセットされていると OETF を適用する。NSNull CIContext からの値は既に OETF エンコード済みのため、二重適用でダイナミックレンジが圧縮される。HEVC HDR パススルー時はコンポジター出力を `32BGRA`（8bit 整数）にすることで、エンコーダが display-referred として扱い OETF を適用しない。H.264 / ProRes は HDR 対応パイプラインを持たないため float のまま。
 
 ---
 
@@ -222,6 +241,8 @@ minHoldFrames = fps × 0.5秒
 - H.264 (VT) / H.265 (VT) は `AVAssetWriter` によるハードウェアエンコード。
 - ProRes422 (VT) はハードウェアエンコーダの有無を `VTCopyVideoEncoderList` で事前チェック。
 - HDR パススルー時は HEVC Main10 プロファイルを使用。
+- HEVC SW エンコーダは B フレーム無効化（`AllowFrameReordering = false`）で QTX/Finder 互換を確保。
+- HEVC HDR パススルーはコンポジター出力を 32BGRA（整数）にし、エンコーダの二重 OETF を回避。
 
 ### キャンセル処理
 
@@ -239,6 +260,7 @@ minHoldFrames = fps × 0.5秒
 | Resolution | `720p` (720×1280) / `1080p` (1080×1920) |
 | FrameRate | `24` / `29.97 DF` / `30` / `60` fps |
 | Codec | `H.264` / `H.265` / `H.264 (VT)` / `H.265 (VT)` / `ProRes422 (VT)` |
+| Container | `MOV` / `MP4`（HEVC のみ選択可。H.264 は MP4 固定、ProRes は MOV 固定） |
 | Bitrate | `8` / `10` / `12` Mbps（ProRes選択時は無効） |
 | EncodingMode | `VBR` / `CBR`（フレーム順序固定＋最大1フレームIフレーム） / `ABR`（ProRes選択時は無効） |
 | Crop | `Fit W` / `Fit H` / `Square` / `4:3` / `3:4`（スマートフレーミングON時は無効） |
@@ -259,7 +281,7 @@ minHoldFrames = fps × 0.5秒
 | 設定 | 説明 |
 |---|---|
 | enabled | HDR→SDR変換ON/OFF |
-| Tone Map | **Natural**（Reinhard extended + ハイライト彩度抑制） / **Cinematic**（CIToneMapHeadroom or ACES filmic） |
+| Tone Map | **Natural** / **Cinematic**（macOS 15+: 両方 CIToneMapHeadroom、macOS 14: Reinhard / ACES フォールバック） |
 
 ---
 
