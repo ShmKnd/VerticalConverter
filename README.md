@@ -7,6 +7,7 @@ v<h1 align="center">Vertical Converter</h1>
 
 <p align="center">
   <img src="https://img.shields.io/badge/platform-macOS%2014%2B-blue?style=flat-square" alt="macOS 14+">
+  <img src="https://img.shields.io/badge/arch-Apple%20Silicon-black?style=flat-square&logo=apple&logoColor=white" alt="Apple Silicon">
   <img src="https://img.shields.io/badge/Swift-SwiftUI-orange?style=flat-square&logo=swift&logoColor=white" alt="Swift">
   <img src="https://img.shields.io/badge/license-MIT%20%2B%20Commons%20Clause-green?style=flat-square" alt="License">
 </p>
@@ -76,7 +77,7 @@ v<h1 align="center">Vertical Converter</h1>
 
 | 項目 | 内容 |
 |:--|:--|
-| 対応 OS | macOS 14.0 以降 |
+| 対応 OS | macOS 14.0 以降（Apple Silicon 専用） |
 | 言語 | Swift / SwiftUI |
 | フレームワーク | AVFoundation, Vision, Core Image, VideoToolbox |
 | 処理方式 | 2パス（解析 → 変換）。スマートフレーミング OFF 時は 1パス |
