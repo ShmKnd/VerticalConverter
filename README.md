@@ -1,4 +1,4 @@
-v<h1 align="center">Vertical Converter</h1>
+<h1 align="center">Vertical Converter</h1>
 
 <p align="center">
   <b>16:9 横長動画 → 9:16 縦型動画に変換する macOS ネイティブアプリ</b><br>
