@@ -24,9 +24,19 @@ struct ContentView: View {
             VStack(spacing: 12) {
                 // ヘッダー
                 VStack(spacing: 4) {
-                    Text("Vertical Converter")
-                        .font(.title.bold())
-                        .foregroundStyle(.primary)
+                    HStack(spacing: 6) {
+                        Text("Vertical Converter")
+                            .font(.title.bold())
+                            .foregroundStyle(.primary)
+                        #if EDITION_DEMO
+                        Text("DEMO")
+                            .font(.caption2.bold())
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.orange, in: Capsule())
+                        #endif
+                    }
                     Text("Convert 16:9 → 9:16")
                         .font(.subheadline)
                         .foregroundStyle(Color.primary.opacity(0.75))

@@ -6,7 +6,9 @@
 //
 
 @preconcurrency import AVFoundation
+import AppKit
 import CoreImage
+import CoreText
 import CoreVideo
 import VideoToolbox
 import Vision
@@ -620,7 +622,12 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             )
         }
 
-        let imageToRender = finalImage
+        let imageToRender: CIImage
+        if BuildEdition.current.showsWatermark {
+            imageToRender = Self.overlayWatermark(on: finalImage, renderSize: renderSize)
+        } else {
+            imageToRender = finalImage
+        }
 
         if hdrConversionEnabled {
             // HDR->SDR: CoreImage color space conversion handles the EOTF mapping
@@ -969,6 +976,54 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         }
     }
 
+    // MARK: - Watermark (Demo edition)
+
+    /// デモ版用：斜めに繰り返す半透明ウォーターマークを合成する
+    private static func overlayWatermark(on image: CIImage, renderSize: CGSize) -> CIImage {
+        let text = "DEMO"
+        let fontSize: CGFloat = renderSize.height * 0.06
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.boldSystemFont(ofSize: fontSize),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.35)
+        ]
+        let nsStr = NSAttributedString(string: text, attributes: attrs)
+        let line = CTLineCreateWithAttributedString(nsStr)
+        let bounds = CTLineGetBoundsWithOptions(line, .useOpticalBounds)
+
+        // タイル間のスペース
+        let tileW = bounds.width + fontSize * 2.5
+        let tileH = bounds.height + fontSize * 4.0
+
+        // NSImage に 1 タイルを描画
+        let tileSize = NSSize(width: tileW, height: tileH)
+        let tileImage = NSImage(size: tileSize)
+        tileImage.lockFocus()
+        let ctx = NSGraphicsContext.current!.cgContext
+        ctx.saveGState()
+        // 中央に配置 + 回転 (-30°)
+        ctx.translateBy(x: tileW / 2, y: tileH / 2)
+        ctx.rotate(by: -.pi / 6)
+        ctx.textPosition = CGPoint(x: -bounds.width / 2, y: -bounds.height / 2)
+        CTLineDraw(line, ctx)
+        ctx.restoreGState()
+        tileImage.unlockFocus()
+
+        guard let tileData = tileImage.tiffRepresentation,
+              let tileBitmap = NSBitmapImageRep(data: tileData),
+              let tileCG = tileBitmap.cgImage else {
+            return image
+        }
+
+        // CIImage のタイルパターンを作成
+        let tileCIImage = CIImage(cgImage: tileCG)
+        // タイルを画面全体に敷き詰め、出力サイズにクロップ
+        let tiled = tileCIImage
+            .tiled(outputSize: renderSize)
+        let outputRect = CGRect(origin: .zero, size: renderSize)
+        let croppedTile = tiled.cropped(to: outputRect)
+        return croppedTile.composited(over: image)
+    }
+
     func cancelAllPendingVideoCompositionRequests() {
         // フレーム合成を中止する要求が来たら保留中の全リクエストを finishCancelledRequest() で終了する
         renderQueue.sync {
@@ -1009,4 +1064,27 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         return 0
     }
 
+}
+
+// MARK: - CIImage tiling helper
+
+private extension CIImage {
+    /// タイルパターンとして画面全体に敷き詰める
+    func tiled(outputSize: CGSize) -> CIImage {
+        let tileW = extent.width
+        let tileH = extent.height
+        guard tileW > 0, tileH > 0 else { return self }
+        var composite = CIImage.empty()
+        var y: CGFloat = 0
+        while y < outputSize.height {
+            var x: CGFloat = 0
+            while x < outputSize.width {
+                let shifted = self.transformed(by: CGAffineTransform(translationX: x, y: y))
+                composite = shifted.composited(over: composite)
+                x += tileW
+            }
+            y += tileH
+        }
+        return composite
+    }
 }
