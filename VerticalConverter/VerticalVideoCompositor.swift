@@ -40,6 +40,9 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     /// pipeline applies OETF to float input, so we must output integer format
     /// to avoid double-OETF.
     static var staticIsHEVCOutput: Bool = false
+    /// エクスポート開始時に確定したウォーターマーク表示フラグ。
+    /// エクスポート中に状態が変わっても一貫した結果になるよう、事前にキャプチャする。
+    static var staticShowsWatermark: Bool = false
     private let renderQueue = DispatchQueue(label: "com.verticalconverter.renderqueue")
     private var renderContext: AVVideoCompositionRenderContext?
     private let ciContext: CIContext
@@ -57,10 +60,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     private let missThreshold: Int = 5              // 何回連続で未検出なら「いない」と判断するか（8フレーム×5=約40フレーム≒1.3秒）
     private var isFirstSmartFrame: Bool = true      // 初回フレーム判定
     // カットベース: 人物がフレーム中央からこの割合以上ずれたらカット（例: 0.25 = 25%）
-    private let cutThreshold: CGFloat = 0.25
-    // Vision リクエストを再利用（フレームごとの alloc を回避）
-    private let cachedBodyRequest = VNDetectHumanBodyPoseRequest()
-    private let cachedFaceRequest = VNDetectFaceRectanglesRequest()    /// 事前解析済みオフセット（nil = リアルタイムフォールバック）
+    private let cutThreshold: CGFloat = 0.25    /// 事前解析済みオフセット（nil = リアルタイムフォールバック）
     private var currentPrecomputedOffsets: [CGPoint]? = nil    
     // レターボックスモード
     private var letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth
@@ -634,7 +634,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         }
 
         let imageToRender: CIImage
-        if BuildEdition.current.showsWatermark {
+        if Self.staticShowsWatermark {
             imageToRender = Self.overlayWatermark(on: finalImage, renderSize: renderSize)
         } else {
             imageToRender = finalImage
@@ -929,13 +929,15 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     // MARK: - 人物検出（Visionは間引いて実行）
 
     private func detectPersonNormalizedX(in pixelBuffer: CVPixelBuffer) {
+        let bodyRequest = VNDetectHumanBodyPoseRequest()
+        let faceRequest = VNDetectFaceRectanglesRequest()
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
-        do { try handler.perform([cachedBodyRequest, cachedFaceRequest]) } catch { return }
+        do { try handler.perform([bodyRequest, faceRequest]) } catch { return }
 
         var allPersonsX: [CGFloat] = []
 
         // 人体ポーズ検出（優先）
-        if let bodyResults = cachedBodyRequest.results, !bodyResults.isEmpty {
+        if let bodyResults = bodyRequest.results, !bodyResults.isEmpty {
             for observation in bodyResults {
                 if let points = try? observation.recognizedPoints(.all) {
                     let upperPoints = [
@@ -951,7 +953,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         }
 
         // 顔検出（フォールバック）
-        if allPersonsX.isEmpty, let faceResults = cachedFaceRequest.results, !faceResults.isEmpty {
+        if allPersonsX.isEmpty, let faceResults = faceRequest.results, !faceResults.isEmpty {
             for face in faceResults {
                 allPersonsX.append(face.boundingBox.midX)
             }

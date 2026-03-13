@@ -290,10 +290,6 @@ struct SmartFramingAnalyzer {
         let tracker = PersonTracker()
         tracker.lifespanTarget = CGFloat(fps * 1.5)     // 1.5秒で主役と判定
 
-        // Vision リクエストを事前に生成して再利用（フレームごとの alloc を回避）
-        let bodyRequest = VNDetectHumanBodyPoseRequest()
-        let faceRequest = VNDetectFaceRectanglesRequest()
-
         // ③ 適応的検出間隔: 動き大 → 4フレーム毎、安定 → 8フレーム毎
         var detectionInterval = 8
         var lastWeightedCenter: CGPoint? = nil
@@ -326,7 +322,7 @@ struct SmartFramingAnalyzer {
                    frameIndex < totalFrames,
                    let pixelBuffer = CMSampleBufferGetImageBuffer(sample) {
 
-                    let rawPersons = detectRawPersons(in: pixelBuffer, bodyRequest: bodyRequest, faceRequest: faceRequest)
+                    let rawPersons = detectRawPersons(in: pixelBuffer)
                     let center = tracker.update(with: rawPersons)
 
                     // Fill any frames between lastFilledIndex and this sample with the
@@ -370,12 +366,9 @@ struct SmartFramingAnalyzer {
     }
 
     /// 1フレームから全ての人物を検出して返す（トラッカーに渡す生データ）
-    /// bodyRequest / faceRequest は呼び出し元で生成・再利用し、フレームごとの alloc コストを削減。
-    private func detectRawPersons(
-        in pixelBuffer: CVPixelBuffer,
-        bodyRequest: VNDetectHumanBodyPoseRequest,
-        faceRequest: VNDetectFaceRectanglesRequest
-    ) -> [RawPerson] {
+    private func detectRawPersons(in pixelBuffer: CVPixelBuffer) -> [RawPerson] {
+        let bodyRequest = VNDetectHumanBodyPoseRequest()
+        let faceRequest = VNDetectFaceRectanglesRequest()
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
         do { try handler.perform([bodyRequest, faceRequest]) } catch { return [] }
 

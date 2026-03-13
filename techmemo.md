@@ -405,6 +405,27 @@ AppStore Scheme でエンコード実行時、`AVAssetWriter` が `startWriting(
 - About ウィンドウにライセンス情報追加
 - README に English / 日本語 切り替えナビゲーション追加
 
+### Phase 16: macOS 13 対応 + Demo トライアル + About ウィンドウ刷新（03-13）
+
+**macOS 13 対応**:
+- `MACOSX_DEPLOYMENT_TARGET` を全 12 構成で `14.0` / `14.6` → **`13.0`** に変更
+- macOS 14+ 専用 API（`.symbolEffect(.pulse)`, HDR 関連 API）を `#available` / `#unavailable` でガード
+- HDR パネルを macOS 13 では「macOS 14+」ラベル付きでグレーアウト表示（非表示ではなく `.opacity(0.5)` + `.allowsHitTesting(false)`）
+- HDR 動画入力時は `hdrNotSupported` エラーで明確に拒否
+- `onChange` の新旧シンタックスを `if #available(macOS 14.0, *)` で分岐
+
+**Demo 版トライアルシステム**:
+- `DemoUsageTracker` クラスを `BuildEdition.swift` に追加。`UserDefaults` ベースで `DemoWindowStartDate` / `DemoEncodeCount` を管理
+- 24 時間ローリングウィンドウで 5 回のフリーエンコード（フル品質）。超過後はウォーターマーク付き
+- `showsWatermark` を静的 `true` → `DemoUsageTracker.shared.hasRemainingFreeEncodes` の動的判定に変更
+- `VerticalVideoCompositor.staticShowsWatermark` でエクスポート開始時にキャプチャし、エクスポート中のウォーターマーク一貫性を保証
+- UI にデモステータスラベル（残りエンコード回数 / Trial expired）を表示
+
+**About ウィンドウ刷新**:
+- `orderFrontStandardAboutPanel` をカスタムボーダーレス `NSWindow` に置換
+- `titlebarAppearsTransparent` + `fullSizeContentView` + `isMovableByWindowBackground`
+- アプリアイコン・タグライン（"The smart landscape-to-portrait video converter."）・バージョン・GitHub リポジトリリンク・X リンク・スクロール可能な LICENSE 全文を表示
+
 ---
 
 ## 技術的詳細
@@ -624,3 +645,220 @@ CommandGroup(replacing: .appInfo) {
 - 全セクション（Features / Technical Specs / Build / Usage / Project Structure / Architecture / Details / Notes / Roadmap / Changelog / License）を英訳
 - 各言語セクション末尾に「⬆ Back to top / ⬆ トップへ戻る」リンクで自セクション先頭に戻るナビゲーション
 - `<details>` 折りたたみ内の Smart Framing / HDR / Implementation Notes も完全英訳
+
+### 18. macOS 13 デプロイメントターゲット引き下げ（Phase 16）
+
+**対象**: `project.pbxproj`
+
+全 12 箇所の `MACOSX_DEPLOYMENT_TARGET` を `13.0` に統一。
+
+```bash
+# 一括変更コマンド
+sed -i '' 's/MACOSX_DEPLOYMENT_TARGET = 14\.[06];/MACOSX_DEPLOYMENT_TARGET = 13.0;/g' project.pbxproj
+```
+
+**対象**: `ContentView.swift`
+
+macOS 14+ 専用 API の `#available` ガード:
+
+```swift
+// .symbolEffect(.pulse) — macOS 14+ のみ
+struct PulseEffectModifier: ViewModifier {
+    var isActive: Bool
+    func body(content: Content) -> some View {
+        if #available(macOS 14.0, *) {
+            content.symbolEffect(.pulse, isActive: isActive)
+        } else {
+            content
+        }
+    }
+}
+
+// onChange — macOS 14 で新シンタックスに対応
+if #available(macOS 14.0, *) {
+    content.onChange(of: value) { oldValue, newValue in ... }
+} else {
+    content.onChange(of: value) { newValue in ... }
+}
+
+// HDR パネルグレーアウト
+private var isHDRAvailable: Bool {
+    if #available(macOS 14.0, *) { return true }
+    return false
+}
+// .opacity(isHDRAvailable ? 1 : 0.5)
+// .allowsHitTesting(isHDRAvailable)
+// 無効時「macOS 14+」ラベル表示
+```
+
+**対象**: `VideoProcessor.swift`
+
+HDR 動画入力の macOS 13 拒否:
+
+```swift
+case hdrNotSupported
+
+// startConversion() 内
+if #unavailable(macOS 14.0) {
+    let tempComp = AVMutableVideoComposition(propertiesOf: asset)
+    let hdrInfo = detectHDRInfo(from: tempComp)
+    if hdrInfo.isHDR {
+        throw ConversionError.hdrNotSupported
+    }
+}
+```
+
+### 19. DemoUsageTracker — 24 時間ローリングトライアル（Phase 16）
+
+**対象**: `BuildEdition.swift`
+
+```swift
+final class DemoUsageTracker {
+    static let shared = DemoUsageTracker()
+    private let defaults = UserDefaults.standard
+    private let windowStartKey = "DemoWindowStartDate"
+    private let encodeCountKey = "DemoEncodeCount"
+    private let maxFreeEncodes = 5
+    private let windowDuration: TimeInterval = 24 * 60 * 60
+
+    private func resetWindowIfNeeded() {
+        guard let start = defaults.object(forKey: windowStartKey) as? Date else {
+            defaults.set(Date(), forKey: windowStartKey)
+            defaults.set(0, forKey: encodeCountKey)
+            return
+        }
+        if Date().timeIntervalSince(start) >= windowDuration {
+            defaults.set(Date(), forKey: windowStartKey)
+            defaults.set(0, forKey: encodeCountKey)
+        }
+    }
+
+    var hasRemainingFreeEncodes: Bool {
+        resetWindowIfNeeded()
+        return defaults.integer(forKey: encodeCountKey) < maxFreeEncodes
+    }
+
+    func recordEncode() {
+        resetWindowIfNeeded()
+        defaults.set(defaults.integer(forKey: encodeCountKey) + 1, forKey: encodeCountKey)
+    }
+
+    var remainingFreeEncodes: Int {
+        resetWindowIfNeeded()
+        return max(0, maxFreeEncodes - defaults.integer(forKey: encodeCountKey))
+    }
+}
+```
+
+`showsWatermark` の変更:
+
+```swift
+// 変更前
+static var showsWatermark: Bool { current == .demo }
+
+// 変更後
+static var showsWatermark: Bool {
+    switch current {
+    case .demo:
+        return !DemoUsageTracker.shared.hasRemainingFreeEncodes
+    default:
+        return false
+    }
+}
+```
+
+**ウォーターマークのエクスポート時キャプチャ**:
+
+```swift
+// VerticalVideoCompositor.swift
+static var staticShowsWatermark: Bool = false
+
+// VideoProcessor.swift — エクスポート開始前に設定
+VerticalVideoCompositor.staticShowsWatermark = BuildEdition.showsWatermark
+```
+
+**開発者向けリセット**:
+
+```bash
+defaults delete com.verticalconverter.app.demo DemoWindowStartDate
+defaults delete com.verticalconverter.app.demo DemoEncodeCount
+```
+
+### 20. About ウィンドウ刷新（Phase 16）
+
+**対象**: `VerticalConverterApp.swift`
+
+`orderFrontStandardAboutPanel` を完全カスタムの `AboutWindowController` + `AboutView` (SwiftUI) に置換。
+
+```swift
+final class AboutWindowController: NSWindowController {
+    convenience init() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 360, height: 460),
+            styleMask: [.titled, .closable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.isMovableByWindowBackground = true
+        window.center()
+        window.contentView = NSHostingView(rootView: AboutView())
+        self.init(window: window)
+    }
+}
+```
+
+`AboutView` の主要構成:
+- アプリアイコン (128×128)
+- タグライン: "The smart landscape-to-portrait video converter."
+- バージョン: `CFBundleShortVersionString` + `CFBundleVersion`
+- GitHub リポジトリリンク: `https://github.com/ShmKnd/VerticalConverter`
+- X リンク: `https://x.com/ShmKnd`
+- スクロール可能な LICENSE 全文 (Bundle から読み込み、フォールバック用ハードコード付き)
+
+### 21. Demo ステータス UI（Phase 16）
+
+**対象**: `ContentView.swift`
+
+Demo エディション時に表示されるステータスラベル:
+
+```swift
+@ViewBuilder
+private var demoStatusLabel: some View {
+    if BuildEdition.current == .demo {
+        let tracker = DemoUsageTracker.shared
+        if tracker.hasRemainingFreeEncodes {
+            Label("\(tracker.remainingFreeEncodes) free encodes left", systemImage: "gift")
+                .foregroundStyle(.secondary)
+        } else {
+            Label("Trial expired – watermark active", systemImage: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+        }
+    }
+}
+```
+
+エンコード成功後のカウント:
+
+```swift
+// convertSingle() / processBatch() の成功時
+DemoUsageTracker.shared.recordEncode()
+```
+
+### 22. Vision リクエストキャッシュ最適化のリバート（Phase 17, 03-13）
+
+**対象**: `SmartFramingAnalyzer.swift`, `VerticalVideoCompositor.swift`
+
+**経緯**: Phase 15 で `VNDetectHumanBodyPoseRequest` / `VNDetectFaceRectanglesRequest` をフレームごとに生成する代わりに、ループ外で一度だけ生成して再利用する最適化を実装した。メモリ消費・CPU 負荷の軽減が目的だった。
+
+**問題**: ユーザーテストで Smart Framing の検出精度が低下（「挙動が甘くなった」）。人物追従の精度が目に見えて悪化した。
+
+**原因**: `VNRequest` サブクラス（`VNDetectHumanBodyPoseRequest` / `VNDetectFaceRectanglesRequest`）は内部に CoreML モデルセッション状態を保持する。フレーム間でインスタンスを再利用すると、前フレームの内部バッファが次フレームの検出精度に干渉する。Apple のドキュメントではリクエストの再利用について明確な禁止はないが、実際にはフレームごとの fresh な `VNRequest` 生成が想定された使い方である。
+
+**修正**: 両ファイルを最適化前の状態に完全リバート。
+
+- `SmartFramingAnalyzer.detectRawPersons(in:)`: パラメータから `bodyRequest` / `faceRequest` を削除し、メソッド内でフレームごとに `VNRequest` を新規生成するように復元
+- `VerticalVideoCompositor`: `cachedBodyRequest` / `cachedFaceRequest` インスタンスプロパティを削除。`detectPersonNormalizedX(in:)` 内でフレームごとに `VNRequest` を新規生成するように復元
+
+**教訓**: Vision の `VNRequest` は軽量オブジェクトではなく、内部に CoreML 推論セッション・中間バッファを持つ。パフォーマンス最適化としてのインスタンス再利用は検出品質を犠牲にするリスクがある。Apple の Vision フレームワークではリクエストのフレームごと生成がベストプラクティス。
