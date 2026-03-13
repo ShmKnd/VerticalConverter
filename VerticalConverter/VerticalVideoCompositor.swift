@@ -57,7 +57,10 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     private let missThreshold: Int = 5              // 何回連続で未検出なら「いない」と判断するか（8フレーム×5=約40フレーム≒1.3秒）
     private var isFirstSmartFrame: Bool = true      // 初回フレーム判定
     // カットベース: 人物がフレーム中央からこの割合以上ずれたらカット（例: 0.25 = 25%）
-    private let cutThreshold: CGFloat = 0.25    /// 事前解析済みオフセット（nil = リアルタイムフォールバック）
+    private let cutThreshold: CGFloat = 0.25
+    // Vision リクエストを再利用（フレームごとの alloc を回避）
+    private let cachedBodyRequest = VNDetectHumanBodyPoseRequest()
+    private let cachedFaceRequest = VNDetectFaceRectanglesRequest()    /// 事前解析済みオフセット（nil = リアルタイムフォールバック）
     private var currentPrecomputedOffsets: [CGPoint]? = nil    
     // レターボックスモード
     private var letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth
@@ -475,10 +478,11 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             // for a long video means gigabytes of unreleased memory.
             autoreleasepool {
             guard let self = self else {
+                NSLog("VerticalVideoCompositor: FAILED - self is nil (compositor deallocated)")
                 asyncVideoCompositionRequest.finish(with: NSError(
                     domain: "VerticalVideoCompositor",
                     code: -1,
-                    userInfo: nil
+                    userInfo: [NSLocalizedDescriptionKey: "self is nil"]
                 ))
                 return
             }
@@ -492,20 +496,22 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             }
             
             guard let instruction = asyncVideoCompositionRequest.videoCompositionInstruction as? CustomVideoCompositionInstruction else {
+                NSLog("VerticalVideoCompositor: FAILED - instruction cast failed (type=%@)", String(describing: type(of: asyncVideoCompositionRequest.videoCompositionInstruction)))
                 asyncVideoCompositionRequest.finish(with: NSError(
                     domain: "VerticalVideoCompositor",
                     code: -1,
-                    userInfo: nil
+                    userInfo: [NSLocalizedDescriptionKey: "instruction cast failed"]
                 ))
                 removePending()
                 return
             }
             
             guard let layerInstruction = instruction.layerInstructions.first as? AVVideoCompositionLayerInstruction else {
+                NSLog("VerticalVideoCompositor: FAILED - layerInstruction cast failed (count=%d)", instruction.layerInstructions.count)
                 asyncVideoCompositionRequest.finish(with: NSError(
                     domain: "VerticalVideoCompositor",
                     code: -1,
-                    userInfo: nil
+                    userInfo: [NSLocalizedDescriptionKey: "layerInstruction cast failed"]
                 ))
                 removePending()
                 return
@@ -523,10 +529,14 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             self.toneMappingMode = instruction.toneMappingMode
 
             guard let sourcePixelBuffer = asyncVideoCompositionRequest.sourceFrame(byTrackID: layerInstruction.trackID) else {
+                NSLog("VerticalVideoCompositor: FAILED - sourceFrame is nil for trackID=%d, requiredSourceTrackIDs=%@, sourceTrackIDs=%@",
+                      layerInstruction.trackID,
+                      String(describing: asyncVideoCompositionRequest.videoCompositionInstruction.requiredSourceTrackIDs),
+                      String(describing: asyncVideoCompositionRequest.sourceTrackIDs))
                 asyncVideoCompositionRequest.finish(with: NSError(
                     domain: "VerticalVideoCompositor",
                     code: -1,
-                    userInfo: nil
+                    userInfo: [NSLocalizedDescriptionKey: "sourceFrame nil for trackID=\(layerInstruction.trackID)"]
                 ))
                 removePending()
                 return
@@ -535,10 +545,11 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             // 出力バッファを作成
             guard let renderContext = self.renderContext,
                   let outputPixelBuffer = renderContext.newPixelBuffer() else {
+                NSLog("VerticalVideoCompositor: FAILED - renderContext=%@, newPixelBuffer=nil", String(describing: self.renderContext))
                 asyncVideoCompositionRequest.finish(with: NSError(
                     domain: "VerticalVideoCompositor",
                     code: -1,
-                    userInfo: nil
+                    userInfo: [NSLocalizedDescriptionKey: "renderContext or outputPixelBuffer nil"]
                 ))
                 removePending()
                 return
@@ -918,15 +929,13 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     // MARK: - 人物検出（Visionは間引いて実行）
 
     private func detectPersonNormalizedX(in pixelBuffer: CVPixelBuffer) {
-        let bodyRequest = VNDetectHumanBodyPoseRequest()
-        let faceRequest = VNDetectFaceRectanglesRequest()
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
-        do { try handler.perform([bodyRequest, faceRequest]) } catch { return }
+        do { try handler.perform([cachedBodyRequest, cachedFaceRequest]) } catch { return }
 
         var allPersonsX: [CGFloat] = []
 
         // 人体ポーズ検出（優先）
-        if let bodyResults = bodyRequest.results, !bodyResults.isEmpty {
+        if let bodyResults = cachedBodyRequest.results, !bodyResults.isEmpty {
             for observation in bodyResults {
                 if let points = try? observation.recognizedPoints(.all) {
                     let upperPoints = [
@@ -942,7 +951,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         }
 
         // 顔検出（フォールバック）
-        if allPersonsX.isEmpty, let faceResults = faceRequest.results, !faceResults.isEmpty {
+        if allPersonsX.isEmpty, let faceResults = cachedFaceRequest.results, !faceResults.isEmpty {
             for face in faceResults {
                 allPersonsX.append(face.boundingBox.midX)
             }

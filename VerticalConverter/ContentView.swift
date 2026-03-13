@@ -40,17 +40,24 @@ struct ContentView: View {
                     Text("Convert 16:9 → 9:16")
                         .font(.subheadline)
                         .foregroundStyle(Color.primary.opacity(0.75))
+                    Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
                 .padding(.top, 22)
 
                 dropZone
                     .frame(maxWidth: .infinity)
+                    .disabled(viewModel.isProcessing)
                 settingsPanel
                     .frame(maxWidth: .infinity)
+                    .disabled(viewModel.isProcessing)
                 smartFramingPanel
                     .frame(maxWidth: .infinity)
+                    .disabled(viewModel.isProcessing)
                 hdrPanel
                     .frame(maxWidth: .infinity)
+                    .disabled(viewModel.isProcessing)
                 actionPanel
                     .frame(maxWidth: .infinity)
 
@@ -59,7 +66,7 @@ struct ContentView: View {
             .padding(.horizontal, 20)
             .padding(.bottom, 20)
         }
-        .frame(width: 560, height: 900)
+        .frame(width: 560, height: 940)
         .sheet(isPresented: $showingCropPreview) {
             VStack(spacing: 0) {
                 // ── ヘッダー ──
@@ -351,7 +358,7 @@ struct ContentView: View {
 
     private var settingsPanel: some View {
         VStack(spacing: 0) {
-            settingRow(label: "Resolution", icon: "aspectratio") {
+            settingRow(label: "Resolution", icon: "aspectratio", tooltip: "Output resolution. 720p = 720×1280, 1080p = 1080×1920.") {
                 SlidingPicker(
                     labels: VideoExportSettings.Resolution.allCases.map { $0.rawValue },
                     values: VideoExportSettings.Resolution.allCases,
@@ -359,7 +366,7 @@ struct ContentView: View {
                 )
             }
             panelDivider
-            settingRow(label: "FPS", icon: "film.stack") {
+            settingRow(label: "FPS", icon: "film.stack", tooltip: "Output frame rate. 'Src' preserves the original frame rate.") {
                 SlidingPicker(
                     labels: VideoExportSettings.FrameRate.allCases.map { $0.displayLabel },
                     values: VideoExportSettings.FrameRate.allCases,
@@ -367,7 +374,7 @@ struct ContentView: View {
                 )
             }
             panelDivider
-            settingRow(label: "Codec", icon: "cpu") {
+            settingRow(label: "Codec", icon: "cpu", tooltip: "Video compression codec. VT variants use hardware acceleration.") {
                 SlidingPicker(
                     labels: VideoExportSettings.Codec.allCases.map { $0.rawValue },
                     values: VideoExportSettings.Codec.allCases,
@@ -384,7 +391,7 @@ struct ContentView: View {
                 )
             }
             panelDivider
-            settingRow(label: "Container", icon: "doc.zipper") {
+            settingRow(label: "Container", icon: "doc.zipper", tooltip: "Output container format. Applies to HEVC only; H.264 is always MP4, ProRes always MOV.") {
                 SlidingPicker(
                     labels: VideoExportSettings.ContainerFormat.allCases.map { $0.rawValue },
                     values: VideoExportSettings.ContainerFormat.allCases,
@@ -398,7 +405,7 @@ struct ContentView: View {
                 )
             }
             panelDivider
-            settingRow(label: "Bitrate", icon: "dial.min.fill") {
+            settingRow(label: "Bitrate", icon: "dial.min.fill", tooltip: "Target video bitrate in Mbps. Disabled for ProRes.") {
                 SlidingPicker(
                     labels: [8, 10, 12].map { "\($0) Mbps" },
                     values: [8, 10, 12],
@@ -410,7 +417,7 @@ struct ContentView: View {
                 )
             }
             panelDivider
-            settingRow(label: "Bitrate Mode", icon: "slider.horizontal.3") {
+            settingRow(label: "Bitrate Mode", icon: "slider.horizontal.3", tooltip: "VBR: variable bitrate, CBR: constant bitrate, ABR: average bitrate.") {
                 SlidingPicker(
                     labels: VideoExportSettings.EncodingMode.allCases.map { $0.rawValue },
                     values: VideoExportSettings.EncodingMode.allCases,
@@ -422,7 +429,7 @@ struct ContentView: View {
                 )
             }
             panelDivider
-            settingRow(label: "Crop", icon: "crop") {
+            settingRow(label: "Crop", icon: "crop", tooltip: "Crop region to fill the 9:16 frame from the 16:9 source.") {
                 SlidingPicker(
                     labels: CustomVideoCompositionInstruction.LetterboxMode.allCases.map { $0.displayName },
                     values: CustomVideoCompositionInstruction.LetterboxMode.allCases,
@@ -434,6 +441,45 @@ struct ContentView: View {
             // Visually de-emphasize and disable interaction to make that clear.
             .opacity(viewModel.smartFramingEnabled ? 0.35 : 1.0)
             .allowsHitTesting(!viewModel.smartFramingEnabled)
+
+            panelDivider
+            HStack(spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: "folder")
+                        .font(.system(size: 16))
+                        .frame(width: 20, alignment: .center)
+                    Text("Output")
+                        .font(.subheadline.weight(.medium))
+                }
+                .foregroundStyle(.primary)
+                .frame(width: 115, alignment: .leading)
+
+                Button {
+                    viewModel.selectOutputDirectory()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "folder.badge.plus")
+                            .font(.caption)
+                        Text(viewModel.outputDirectoryURL?.lastPathComponent ?? "Same as Input")
+                            .font(.caption)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 4)
+                }
+                .buttonStyle(.bordered)
+                if viewModel.outputDirectoryURL != nil {
+                    Button {
+                        viewModel.outputDirectoryURL = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.body)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -457,7 +503,7 @@ struct ContentView: View {
             }
             panelDivider
             // Follow Speed: always visible. When OFF, dim (no height change)
-            settingRow(label: "Follow Speed", icon: "arrow.left.and.right") {
+            settingRow(label: "Follow Speed", icon: "arrow.left.and.right", tooltip: "How quickly auto-framing follows subject movement.") {
                 SlidingPicker(
                     labels: SmartFramingSettings.Smoothness.allCases.map { $0.rawValue },
                     values: SmartFramingSettings.Smoothness.allCases,
@@ -488,7 +534,7 @@ struct ContentView: View {
                     .labelsHidden()
             }
             panelDivider
-            settingRow(label: "Tone Map", icon: "camera.filters") {
+            settingRow(label: "Tone Map", icon: "camera.filters", tooltip: "HDR-to-SDR tone mapping style. Natural = neutral, Cinematic = high contrast.") {
                 SlidingPicker(
                     labels: ["Natural", "Cinematic"],
                     values: [CustomVideoCompositionInstruction.ToneMappingMode.natural, CustomVideoCompositionInstruction.ToneMappingMode.cinematic],
@@ -542,6 +588,7 @@ struct ContentView: View {
             }
 
             // プログレス（常に表示。非処理時は淡く表示）
+            VStack(spacing: 2) {
             VStack(spacing: 6) {
                 HStack(spacing: 8) {
                     if viewModel.isProcessing {
@@ -577,6 +624,7 @@ struct ContentView: View {
                 .multilineTextAlignment(.center)
                 .lineLimit(2)
                 .frame(height: 36) // 固定高さを確保して UI のジャンプを防止
+            } // end progress + status VStack
         }
         .padding(EdgeInsets(top: 16, leading: 16, bottom: 4, trailing: 16))
         .background(.thinMaterial)
@@ -595,6 +643,7 @@ struct ContentView: View {
 
     private func settingRow<Content: View>(
         label: String, icon: String,
+        tooltip: String = "",
         @ViewBuilder picker: () -> Content
     ) -> some View {
         HStack(spacing: 10) {
@@ -610,6 +659,7 @@ struct ContentView: View {
 
             picker()
         }
+        .help(tooltip)
     }
 
     /// 秒数を "M:SS.t" 形式の文字列に変換するヒルパー
@@ -860,6 +910,8 @@ class ContentViewModel: ObservableObject {
     @Published var phaseLabel: String = ""
     @Published var statusMessage: String = ""
     @Published var hasError: Bool = false
+    /// サンドボックス環境で使用する出力先ディレクトリ（ユーザーが明示的に選択）
+    @Published var outputDirectoryURL: URL? = nil
 
     private let videoProcessor = VideoProcessor()
     private var conversionTask: Task<Void, Never>?
@@ -876,6 +928,26 @@ class ContentViewModel: ObservableObject {
         if panel.runModal() == .OK, !panel.urls.isEmpty {
             self.selectedVideoURLs = panel.urls
             self.hasConverted = false
+        }
+    }
+
+    /// 出力先ディレクトリをユーザーに選択させる（サンドボックス環境で書き込み権限を取得するため）
+    func selectOutputDirectory() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Select Output Folder"
+        panel.message = "Choose a folder to save converted videos"
+
+        // 入力ファイルの親ディレクトリをデフォルトに
+        if let firstInput = selectedVideoURLs.first {
+            panel.directoryURL = firstInput.deletingLastPathComponent()
+        }
+
+        if panel.runModal() == .OK, let url = panel.url {
+            self.outputDirectoryURL = url
         }
     }
 
@@ -1005,6 +1077,12 @@ class ContentViewModel: ObservableObject {
     func convertVideo() {
         guard !selectedVideoURLs.isEmpty else { return }
 
+        // 出力先ディレクトリが未選択なら選択パネルを表示
+        if outputDirectoryURL == nil {
+            selectOutputDirectory()
+            guard outputDirectoryURL != nil else { return }
+        }
+
         self.hasConverted = false
         isProcessing = true
         hasError = false
@@ -1020,7 +1098,12 @@ class ContentViewModel: ObservableObject {
         let toneMode = toneMappingMode
         let total = urlsToProcess.count
 
+        // サンドボックス環境では出力ディレクトリのセキュリティスコープを取得
+        let outputDir = self.outputDirectoryURL
+        let isAccessingOutputDir = outputDir?.startAccessingSecurityScopedResource() ?? false
+
         conversionTask = Task {
+            defer { if isAccessingOutputDir, let dir = outputDir { dir.stopAccessingSecurityScopedResource() } }
             var completedCount = 0
             var lastOutputURL: URL? = nil
 
@@ -1033,7 +1116,8 @@ class ContentViewModel: ObservableObject {
 
                 let outExt = capturedExportSettings.resolvedFileExtension
                 let inputFilename = inputURL.deletingPathExtension().lastPathComponent
-                let outputURL = inputURL.deletingLastPathComponent()
+                let baseDir = outputDir ?? inputURL.deletingLastPathComponent()
+                let outputURL = baseDir
                     .appendingPathComponent("\(inputFilename)_vertical")
                     .appendingPathExtension(outExt)
 
@@ -1065,6 +1149,7 @@ class ContentViewModel: ObservableObject {
                         self.statusMessage = "Conversion complete!\nSaved to: \(outputURL.path)"
                         self.hasConverted = true
                         NSWorkspace.shared.activateFileViewerSelecting([outputURL])
+                        NSSound(named: .init("Glass"))?.play()
                     } else {
                         self.statusMessage = "[\(completedCount)/\(total)] Converted: \(inputURL.lastPathComponent)"
                         self.progress = Double(completedCount) / Double(total)
@@ -1092,6 +1177,7 @@ class ContentViewModel: ObservableObject {
                 if let lastURL = lastOutputURL {
                     NSWorkspace.shared.activateFileViewerSelecting([lastURL])
                 }
+                NSSound(named: .init("Glass"))?.play()
             }
 
             self.phaseLabel = ""

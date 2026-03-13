@@ -356,3 +356,271 @@ libplacebo のトーンマッピングアルゴリズム（BT.2390 EETF / Hable 
 ### 優先度
 
 **選択肢 1 → 選択肢 2** の順で進めるのが妥当。選択肢 1 は最小コストで Apple 標準品質が得られるため先にフィードバックを取り、それで品質が不十分な場合に選択肢 2 で自前実装する。
+
+---
+---
+
+# v1.0.1 機能追加・バグ修正メモ
+
+**日付**: 2026-03-12 〜 2026-03-13
+
+---
+
+## セッション経緯
+
+### Phase 11: AppStore サンドボックス書き込みエラー修正（03-12）
+
+AppStore Scheme でエンコード実行時、`AVAssetWriter` が `startWriting()` で status=3（failed）、エラー「The file couldn't be saved because you don't have permission.」を返す問題。
+
+**原因**: App Sandbox 有効時、ソース動画と同じディレクトリに書き込む処理がセキュリティスコープ外で失敗。`NSOpenPanel` の `canChooseFiles` で選択したファイルの **親ディレクトリ** にしかアクセス権がなく、任意の出力を作成できなかった。
+
+**修正**:
+- `NSOpenPanel` で `canChooseDirectories = true` の出力フォルダ選択ダイアログを追加
+- `ContentViewModel` に `outputDirectoryURL: URL?` と `selectOutputDirectory()` メソッドを追加
+- settingsPanel に全エディション共通の出力フォルダ行（リセット × ボタン付き）を追加
+
+### Phase 12: 6 つの UI 改善（03-12）
+
+1. **出力フォルダリセットボタン** — × ボタンで `outputDirectoryURL = nil`（入力と同じディレクトリに戻す）
+2. **About ウィンドウ** — `CommandGroup(replacing: .appInfo)` で HTML credits 付きの About パネルを表示
+3. **バージョン表示** — `CFBundleShortVersionString` でヘッダーにバージョン番号表示
+4. **v1.0.1 更新** — `project.pbxproj` 全 6 構成の `MARKETING_VERSION = 1.0.1` / `CURRENT_PROJECT_VERSION = 2`
+5. **エンコード中 GUI ロック** — `.disabled(viewModel.isProcessing)` で dropZone / settingsPanel / smartFramingPanel / hdrPanel を無効化
+6. **完了サウンド** — `NSSound(named: .init("Glass"))?.play()` を単体・バッチ変換完了時に再生
+
+### Phase 13: FPS Src モード + Crop ラベル修正 + ツールチップ（03-12〜13）
+
+- FPS に「ソース維持」モードを追加
+- Crop の 4:3/3:4 ラベルが逆だった問題を修正
+- 全設定行にツールチップを追加
+
+### Phase 14: フレームレート変換が実際に適用されない問題（03-13）
+
+- `containsTweening = false` → `true` に変更しフレームレート変換を有効化
+- `AVVideoExpectedSourceFrameRateKey` / `kVTCompressionPropertyKey_ExpectedFrameRate` を動的化
+
+### Phase 15: UI 微調整・ドキュメント（03-13）
+
+- プログレスバーとステータステキスト間のスペーシング縮小
+- About ウィンドウにライセンス情報追加
+- README に English / 日本語 切り替えナビゲーション追加
+
+---
+
+## 技術的詳細
+
+### 10. FPS「Src」ソース維持モード（Phase 13）
+
+**対象**: `VideoExportSettings.swift`, `VideoProcessor.swift`
+
+`FrameRate` enum に `.source` ケースを追加。ソース動画本来のフレームレートを維持する。
+
+```swift
+// VideoExportSettings.swift
+enum FrameRate: Hashable, CaseIterable {
+    case source      // ← 追加
+    case fps24
+    case fps2997
+    case fps30
+    case fps60
+
+    var frameDuration: CMTime {
+        switch self {
+        case .source: return .invalid   // sentinel 値
+        // ...
+        }
+    }
+}
+```
+
+**VideoProcessor.swift での解決ロジック**:
+
+`exportVideo()` 内で `.source` の場合に `videoTrack.load(.nominalFrameRate)` を非同期ロードし、実際の frameDuration を算出:
+
+```swift
+let resolvedFrameDuration: CMTime
+if settings.frameRate == .source {
+    let nominalFPS = try await videoTrack.load(.nominalFrameRate)
+    let fps = nominalFPS > 0 ? nominalFPS : 30.0
+    // NTSC ドロップフレーム対応
+    switch fps {
+    case 23.9...24.0:   resolvedFrameDuration = CMTime(value: 1001, timescale: 24000)
+    case 29.9...30.0:   resolvedFrameDuration = CMTime(value: 1001, timescale: 30000)
+    case 59.9...60.0:   resolvedFrameDuration = CMTime(value: 1001, timescale: 60000)
+    default:            resolvedFrameDuration = CMTimeMake(value: 1, timescale: Int32(fps.rounded()))
+    }
+} else {
+    resolvedFrameDuration = settings.frameRate.frameDuration
+}
+```
+
+**NTSC 対応**: `nominalFrameRate` が 23.976 / 29.97 / 59.94 の場合は `1001/24000` / `1001/30000` / `1001/60000` を使用し、非 NTSC は `1/round(fps)` にフォールバック。
+
+---
+
+### 11. `containsTweening = true` — フレームレート変換の致命的修正（Phase 14）
+
+**対象**: `CustomVideoCompositionInstruction.swift`
+
+**症状**: FPS を 30fps に設定しても出力が 23.976fps のまま。ログで `resolvedFrameDuration = 1/30`、`videoComposition.frameDuration = 1/30` と正しく設定されているにもかかわらず、出力 FPS が変わらない。
+
+**根本原因**: `AVVideoCompositionInstructionProtocol` の `containsTweening` プロパティが `false` だった。
+
+```swift
+// 変更前
+var containsTweening: Bool { false }
+
+// 変更後
+var containsTweening: Bool { true }
+```
+
+**技術的背景**:
+
+- `containsTweening = false` の場合、AVFoundation は「このインストラクションはソースフレームの 1:1 パススルーであり、フレーム間補間は不要」と解釈する
+- この場合の最適化として、AVFoundation は `videoComposition.frameDuration` を**無視**し、ソースフレームのタイムスタンプでのみコンポジターを呼び出す
+- `containsTweening = true` にすることで、AVFoundation は `frameDuration` 間隔でコンポジターを呼び出し、フレームレート変換が正しく動作する
+
+**補足 — フレーム補間は発生しない**:
+
+`containsTweening = true` でも実際の光学フロー補間は行われない。AVFoundation は最近傍フレーム（nearest-neighbor）を使う:
+- ソースより高い fps 設定 → 同一フレームが繰り返される（フレームリピート）
+- ソースより低い fps 設定 → フレームがスキップされる
+
+これはフレームレート変換としては標準的な挙動であり、品質上の懸念はない。
+
+---
+
+### 12. 動的 ExpectedSourceFrameRate（Phase 14）
+
+**対象**: `VideoProcessor.swift`
+
+`AVVideoExpectedSourceFrameRateKey`（HW エンコードパス）と `kVTCompressionPropertyKey_ExpectedFrameRate`（SW VT パス）が以前はハードコード 30 だったのを、実際の出力 FPS に連動するよう変更。
+
+```swift
+let outputFPS = 1.0 / resolvedFrameDuration.seconds
+
+// HW パス (AVAssetWriter)
+videoSettings[AVVideoExpectedSourceFrameRateKey] = outputFPS
+
+// SW パス (VTCompressionSession) — ABR 時のみ
+VTSessionSetProperty(compSession,
+    key: kVTCompressionPropertyKey_ExpectedFrameRate,
+    value: NSNumber(value: outputFPS))
+```
+
+**影響**: エンコーダの内部バッファ管理とビットレート制御が実際の FPS に最適化される。24fps 入力を 24fps で維持する場合、ExpectedFrameRate=30 だとビットレート配分が不正確になっていた。
+
+---
+
+### 13. Crop ラベル 4:3/3:4 反転修正（Phase 13）
+
+**対象**: `CustomVideoCompositionInstruction.swift`
+
+```swift
+// 変更前（誤）
+case centerPortrait4x3: return "4:3"   // 実際は被写体を 3:4 でクロップ
+case centerPortrait3x4: return "3:4"   // 実際は被写体を 4:3 でクロップ
+
+// 変更後（正）
+case centerPortrait4x3: return "3:4"
+case centerPortrait3x4: return "4:3"
+```
+
+`centerPortrait4x3` は 4:3 **ソースを** 3:4 **ポートレートにクロップ**するため、UI上の表示は "3:4" が正しい。
+
+---
+
+### 14. 設定行ツールチップ（Phase 13）
+
+**対象**: `ContentView.swift`
+
+`settingRow()` ヘルパーに `tooltip: String = ""` パラメータを追加し、外側の HStack に `.help(tooltip)` を適用。
+
+```swift
+private func settingRow<Content: View>(
+    _ label: String,
+    tooltip: String = "",
+    @ViewBuilder content: () -> Content
+) -> some View {
+    HStack {
+        // ...
+    }
+    .help(tooltip)
+}
+```
+
+**`.help()` の配置**: 当初は内側のラベル HStack（115pt 幅）に配置していたが、ヒットエリアが狭くホバーが困難だったため、外側の行全体の HStack に移動。行のどこにマウスを置いてもツールチップが表示される。
+
+追加したツールチップ（全 9 行、英語）:
+
+| 設定行 | ツールチップ |
+|--------|------------|
+| Resolution | Output vertical resolution |
+| FPS | Output frame rate (Src = keep source) |
+| Codec | Video codec and encoder type |
+| Container | Output file container format |
+| Bitrate | Target video bitrate |
+| Bitrate Mode | VBR / CBR / ABR encoding strategy |
+| Crop | How the 16:9 source is cropped to 9:16 |
+| Follow Speed | Smart Framing camera follow speed |
+| Tone Map | HDR→SDR tone mapping algorithm |
+
+---
+
+### 15. プログレスバー UI スペーシング（Phase 15）
+
+**対象**: `ContentView.swift`
+
+プログレスバーとステータステキスト間の余白を縮小。外側 `VStack(spacing: 14)` 内でプログレスバーとテキストを `VStack(spacing: 2)` でラップ。
+
+```swift
+VStack(spacing: 14) {
+    // ... other content ...
+    VStack(spacing: 2) {
+        ProgressView(value: viewModel.progress)
+        Text(viewModel.statusText)
+    }
+}
+```
+
+---
+
+### 16. About ウィンドウ（Phase 12, 15）
+
+**対象**: `VerticalConverterApp.swift`
+
+`CommandGroup(replacing: .appInfo)` で標準 About メニューを置き換え。HTML credits で GitHub / X リンクとライセンス情報を表示。
+
+```swift
+CommandGroup(replacing: .appInfo) {
+    Button("About Vertical Converter") {
+        let credits = NSAttributedString(
+            html: Data("""
+            <div style="...">
+                <a href="https://github.com/YOURNAME/VerticalConverter">GitHub</a> · <a href="https://x.com/YOURHANDLE">X</a>
+                <br><br>
+                MIT License + Commons Clause © 2026 shoma<br>
+                This software may not be sold.<br>
+                See LICENSE for details.
+            </div>
+            """.utf8),
+            documentAttributes: nil
+        )
+        NSApplication.shared.orderFrontStandardAboutPanel(options: [
+            .credits: credits as Any
+        ])
+    }
+}
+```
+
+---
+
+### 17. README 多言語ナビゲーション（Phase 15）
+
+**対象**: `README.md`
+
+冒頭に `📖 English | 📖 日本語` リンクを追加。HTML アンカー (`<h2 id="english">`, `<h2 id="日本語">`) でジャンプ。
+
+- 全セクション（Features / Technical Specs / Build / Usage / Project Structure / Architecture / Details / Notes / Roadmap / Changelog / License）を英訳
+- 各言語セクション末尾に「⬆ Back to top / ⬆ トップへ戻る」リンクで自セクション先頭に戻るナビゲーション
+- `<details>` 折りたたみ内の Smart Framing / HDR / Implementation Notes も完全英訳
