@@ -10,7 +10,7 @@
 class CustomVideoCompositionInstruction: NSObject, AVVideoCompositionInstructionProtocol {
     var timeRange: CMTimeRange
     var enablePostProcessing: Bool = false
-    var containsTweening: Bool = true
+    var containsTweening: Bool = false
     var requiredSourceTrackIDs: [NSValue]?
     var passthroughTrackID: CMPersistentTrackID = kCMPersistentTrackID_Invalid
     
