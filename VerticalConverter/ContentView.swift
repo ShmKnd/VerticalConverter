@@ -10,6 +10,19 @@ import UniformTypeIdentifiers
 import AppKit
 @preconcurrency import AVFoundation
 
+/// macOS 14+: `.symbolEffect(.pulse)` を適用し、macOS 13 では何もしない。
+private struct PulseEffectModifier: ViewModifier {
+    var isActive: Bool
+
+    func body(content: Content) -> some View {
+        if #available(macOS 14.0, *) {
+            content.symbolEffect(.pulse, isActive: isActive)
+        } else {
+            content
+        }
+    }
+}
+
 struct ContentView: View {
     @StateObject private var viewModel = ContentViewModel()
     @State private var isTargeted = false
@@ -43,6 +56,9 @@ struct ContentView: View {
                     Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+                    #if EDITION_DEMO
+                    demoStatusLabel
+                    #endif
                 }
                 .padding(.top, 22)
 
@@ -130,6 +146,26 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Demo Status Label
+
+    #if EDITION_DEMO
+    private var demoStatusLabel: some View {
+        let tracker = DemoUsageTracker.shared
+        let remaining = tracker.remainingFreeEncodes
+        return Group {
+            if remaining > 0 {
+                Text("Full quality: \(remaining) encodes remaining")
+                    .font(.caption2)
+                    .foregroundStyle(.green.opacity(0.85))
+            } else {
+                Text("Trial expired — watermark applied")
+                    .font(.caption2)
+                    .foregroundStyle(.orange.opacity(0.85))
+            }
+        }
+    }
+    #endif
+
     // MARK: - Drop Zone
 
     private var dropZone: some View {
@@ -153,7 +189,7 @@ struct ContentView: View {
                     Image(systemName: "video.badge.plus")
                         .font(.system(size: 52))
                         .foregroundStyle(.primary)
-                        .symbolEffect(.pulse, isActive: isTargeted)
+                        .modifier(PulseEffectModifier(isActive: isTargeted))
                     Text("Drag & Drop")
                         .font(.headline)
                         .foregroundStyle(.primary)
@@ -274,7 +310,7 @@ struct ContentView: View {
                     Image(systemName: "video.badge.plus")
                         .font(.system(size: 52))
                         .foregroundStyle(.primary)
-                        .symbolEffect(.pulse, isActive: isTargeted)
+                        .modifier(PulseEffectModifier(isActive: isTargeted))
                     Text("Drag & Drop")
                         .font(.headline)
                         .foregroundStyle(.primary)
@@ -522,6 +558,11 @@ struct ContentView: View {
 
     // MARK: - HDR -> SDR Panel
 
+    private var isHDRAvailable: Bool {
+        if #available(macOS 14.0, *) { return true }
+        return false
+    }
+
     private var hdrPanel: some View {
         VStack(spacing: 0) {
             HStack {
@@ -529,9 +570,15 @@ struct ContentView: View {
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.primary)
                 Spacer()
+                if !isHDRAvailable {
+                    Text("macOS 14+")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
                 Toggle("", isOn: $viewModel.hdrConversionEnabled)
                     .toggleStyle(.switch)
                     .labelsHidden()
+                    .disabled(!isHDRAvailable)
             }
             panelDivider
             settingRow(label: "Tone Map", icon: "camera.filters", tooltip: "HDR-to-SDR tone mapping style. Natural = neutral, Cinematic = high contrast.") {
@@ -548,6 +595,8 @@ struct ContentView: View {
         .padding(.vertical, 10)
         .background(.thinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 20))
+        .opacity(isHDRAvailable ? 1.0 : 0.5)
+        .allowsHitTesting(isHDRAvailable)
     }
 
     // MARK: - アクションパネル
@@ -752,7 +801,7 @@ private struct CropPreviewView: View {
                         GeometryReader { geo in
                             Color.clear
                                 .onAppear { itemWidth = geo.size.width }
-                                .onChange(of: geo.size.width) { itemWidth = $0 }
+                                .onChange(of: geo.size.width) { newValue in itemWidth = newValue }
                         }
                     )
                 modeButton(.centerPortrait4x3)
@@ -1144,6 +1193,11 @@ class ContentViewModel: ObservableObject {
                     )
                     completedCount += 1
                     lastOutputURL = outputURL
+
+                    // デモ版: エンコード成功をカウント
+                    if BuildEdition.current == .demo {
+                        DemoUsageTracker.shared.recordEncode()
+                    }
 
                     if total == 1 {
                         self.statusMessage = "Conversion complete!\nSaved to: \(outputURL.path)"

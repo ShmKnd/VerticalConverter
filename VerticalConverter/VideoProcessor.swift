@@ -70,6 +70,7 @@ enum VideoProcessorError: LocalizedError {
     case exportFailed
     case unsupportedFormat
     case cancelled
+    case hdrNotSupported
     
     var errorDescription: String? {
         switch self {
@@ -83,6 +84,8 @@ enum VideoProcessorError: LocalizedError {
             return "Unsupported video format"
         case .cancelled:
             return "Conversion cancelled"
+        case .hdrNotSupported:
+            return "HDR videos are not supported on macOS 13. Please update to macOS 14 or later."
         }
     }
 }
@@ -701,6 +704,24 @@ actor VideoProcessor {
             NSLog("VideoProcessor: ProRes 入力を検出 — macOS ネイティブデコードで処理します（正常）")
         }
 
+        // ── macOS 13: HDR 入力を拒否 ──
+        // HDR パイプライン（64RGBAHalf/BT.2020/トーンマッピング）は macOS 14+ が前提。
+        // macOS 13 では HDR 動画を処理不可としてエラーを返す。
+        if #unavailable(macOS 14.0) {
+            let tmpComp = AVMutableComposition()
+            if let vt = try? await inputAssetForCheck.loadTracks(withMediaType: .video).first {
+                let dur = try await inputAssetForCheck.load(.duration)
+                if let ct = tmpComp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) {
+                    try? ct.insertTimeRange(CMTimeRange(start: .zero, duration: dur), of: vt, at: .zero)
+                }
+            }
+            let (isHDR, _, _, _) = VideoProcessor.detectHDRInfo(from: tmpComp)
+            if isHDR {
+                NSLog("VideoProcessor: HDR 入力検出 — macOS 13 では HDR 動画は非対応です")
+                throw VideoProcessorError.hdrNotSupported
+            }
+        }
+
         let needsHev1Transcode = await VideoProcessor.isHev1(asset: inputAssetForCheck)
         if needsHev1Transcode {
             NSLog("VideoProcessor: input is hev1; will remux to hvc1 before processing")
@@ -892,6 +913,7 @@ actor VideoProcessor {
         VerticalVideoCompositor.staticToneMappingMode = toneMappingMode
         VerticalVideoCompositor.staticInputSize = inputSize
         VerticalVideoCompositor.staticIsHEVCOutput = (codec == .h265 || codec == .h265VT)
+        VerticalVideoCompositor.staticShowsWatermark = BuildEdition.current.showsWatermark
         videoComposition.customVideoCompositorClass = VerticalVideoCompositor.self
 
         // ── Critical: Declare the composition pipeline's color space ──
