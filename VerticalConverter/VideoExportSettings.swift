@@ -9,7 +9,7 @@ struct VideoExportSettings {
     var bitrate: Int = 10          // Mbps
     var encodingMode: EncodingMode = .vbr
     var resolution: Resolution     = .fullHD
-    var frameRate: FrameRate       = .fps30
+    var frameRate: FrameRate       = .source
     var codec: Codec = .h264
 
     // MARK: - Encoding Mode
@@ -87,7 +87,7 @@ struct VideoExportSettings {
         case mp4 = "MP4"
     }
 
-    var containerFormat: ContainerFormat = .mov
+    var containerFormat: ContainerFormat = .mp4
 
     /// Resolved file extension for the current codec + container combination.
     /// ProRes always produces `.mov`. H.264 always produces `.mp4`.
