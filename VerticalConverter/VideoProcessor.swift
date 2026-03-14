@@ -70,6 +70,7 @@ enum VideoProcessorError: LocalizedError {
     case exportFailed
     case unsupportedFormat
     case cancelled
+    case hdrNotSupported
     
     var errorDescription: String? {
         switch self {
@@ -83,6 +84,8 @@ enum VideoProcessorError: LocalizedError {
             return "Unsupported video format"
         case .cancelled:
             return "Conversion cancelled"
+        case .hdrNotSupported:
+            return "HDR videos are not supported on macOS 13. Please update to macOS 14 or later."
         }
     }
 }
@@ -701,6 +704,24 @@ actor VideoProcessor {
             NSLog("VideoProcessor: ProRes 入力を検出 — macOS ネイティブデコードで処理します（正常）")
         }
 
+        // ── macOS 13: HDR 入力を拒否 ──
+        // HDR パイプライン（64RGBAHalf/BT.2020/トーンマッピング）は macOS 14+ が前提。
+        // macOS 13 では HDR 動画を処理不可としてエラーを返す。
+        if #unavailable(macOS 14.0) {
+            let tmpComp = AVMutableComposition()
+            if let vt = try? await inputAssetForCheck.loadTracks(withMediaType: .video).first {
+                let dur = try await inputAssetForCheck.load(.duration)
+                if let ct = tmpComp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) {
+                    try? ct.insertTimeRange(CMTimeRange(start: .zero, duration: dur), of: vt, at: .zero)
+                }
+            }
+            let (isHDR, _, _, _) = VideoProcessor.detectHDRInfo(from: tmpComp)
+            if isHDR {
+                NSLog("VideoProcessor: HDR 入力検出 — macOS 13 では HDR 動画は非対応です")
+                throw VideoProcessorError.hdrNotSupported
+            }
+        }
+
         let needsHev1Transcode = await VideoProcessor.isHev1(asset: inputAssetForCheck)
         if needsHev1Transcode {
             NSLog("VideoProcessor: input is hev1; will remux to hvc1 before processing")
@@ -768,13 +789,38 @@ actor VideoProcessor {
         let analysisShare = smartFramingSettings.enabled ? 0.4 : 0.0
         let progressOffset = hev1Offset + analysisShare * remainingScale
         let progressScale  = (1.0 - analysisShare) * remainingScale
-        
+
+        // .source = pass-through: derive frame duration from the source video track
+        let resolvedFrameDuration: CMTime
+        if exportSettings.frameRate == .source {
+            let nominalFPS = try await videoTrack.load(.nominalFrameRate)
+            NSLog("VideoProcessor: source nominalFrameRate = %.3f", nominalFPS)
+            if nominalFPS <= 0 {
+                // Fallback: use minFrameDuration if available, else default to 30fps
+                let minDur = try await videoTrack.load(.minFrameDuration)
+                resolvedFrameDuration = (minDur.seconds > 0) ? minDur : CMTime(value: 1, timescale: 30)
+            } else if abs(nominalFPS - 23.976) < 0.1 {
+                resolvedFrameDuration = CMTime(value: 1001, timescale: 24024)
+            } else if abs(nominalFPS - 29.97) < 0.1 {
+                resolvedFrameDuration = CMTime(value: 1001, timescale: 30000)
+            } else if abs(nominalFPS - 59.94) < 0.1 {
+                resolvedFrameDuration = CMTime(value: 1001, timescale: 60000)
+            } else {
+                resolvedFrameDuration = CMTime(value: 1, timescale: CMTimeScale(nominalFPS.rounded()))
+            }
+        } else {
+            resolvedFrameDuration = exportSettings.frameRate.frameDuration
+        }
+        NSLog("VideoProcessor: resolvedFrameDuration = %lld/%d (%.4f fps)",
+              resolvedFrameDuration.value, resolvedFrameDuration.timescale,
+              resolvedFrameDuration.seconds > 0 ? 1.0 / resolvedFrameDuration.seconds : 0)
+
         let (composition, videoComposition) = try await createComposition(
             asset: asset,
             videoTrack: videoTrack,
             inputSize: CGSize(width: width, height: height),
             outputSize: CGSize(width: outputWidth, height: outputHeight),
-            frameDuration: exportSettings.frameRate.frameDuration,
+            frameDuration: resolvedFrameDuration,
             smartFramingSettings: smartFramingSettings,
             precomputedOffsets: precomputedOffsets,
             letterboxMode: letterboxMode
@@ -784,6 +830,8 @@ actor VideoProcessor {
         )
         
         // エクスポート
+        // Compute nominal FPS from the resolved frame duration for encoder hints.
+        let nominalFPS: Double = resolvedFrameDuration.seconds > 0 ? 1.0 / resolvedFrameDuration.seconds : 30.0
         try await exportVideo(
             composition: composition,
             videoComposition: videoComposition,
@@ -792,6 +840,7 @@ actor VideoProcessor {
             encodingMode: exportSettings.encodingMode,
             codec: exportSettings.codec,
             containerFormat: exportSettings.containerFormat,
+            outputFPS: nominalFPS,
             progressHandler: { p in
                 progressHandler(progressOffset + p * progressScale, "Converting...")
             }
@@ -842,6 +891,9 @@ actor VideoProcessor {
         let videoComposition = AVMutableVideoComposition()
         videoComposition.renderSize = outputSize
         videoComposition.frameDuration = frameDuration
+        NSLog("VideoProcessor: videoComposition.frameDuration = %d/%d (%.3f fps)",
+              frameDuration.value, frameDuration.timescale,
+              frameDuration.seconds > 0 ? 1.0 / frameDuration.seconds : 0)
         
         // カスタムコンポジターを使用
         // Detect HDR characteristics from the composition track's format description
@@ -861,6 +913,7 @@ actor VideoProcessor {
         VerticalVideoCompositor.staticToneMappingMode = toneMappingMode
         VerticalVideoCompositor.staticInputSize = inputSize
         VerticalVideoCompositor.staticIsHEVCOutput = (codec == .h265 || codec == .h265VT)
+        VerticalVideoCompositor.staticShowsWatermark = BuildEdition.current.showsWatermark
         videoComposition.customVideoCompositorClass = VerticalVideoCompositor.self
 
         // ── Critical: Declare the composition pipeline's color space ──
@@ -941,6 +994,7 @@ actor VideoProcessor {
         encodingMode: VideoExportSettings.EncodingMode,
         codec: VideoExportSettings.Codec,
         containerFormat: VideoExportSettings.ContainerFormat = .mov,
+        outputFPS: Double = 30.0,
         progressHandler: @escaping (Double) -> Void
     ) async throws {
 
@@ -1031,8 +1085,10 @@ actor VideoProcessor {
         do {
             writer = try AVAssetWriter(outputURL: outputURL, fileType: fileType)
         } catch {
+            NSLog("VideoProcessor: AVAssetWriter creation failed for URL=%@, error=%@", outputURL.path, error.localizedDescription)
             throw VideoProcessorError.exportFailed
         }
+        NSLog("VideoProcessor: AVAssetWriter created for outputURL=%@, fileType=%@", outputURL.path, fileType.rawValue)
         writer.shouldOptimizeForNetworkUse = true
 
         // Safety: if ProRes was requested but no ProRes encoder is available, fail early
@@ -1069,7 +1125,7 @@ actor VideoProcessor {
             compressionProps[AVVideoAllowFrameReorderingKey]  = false
             compressionProps[AVVideoMaxKeyFrameIntervalKey]   = 1
         case .abr:
-            compressionProps[AVVideoExpectedSourceFrameRateKey] = 30
+            compressionProps[AVVideoExpectedSourceFrameRateKey] = Int(outputFPS.rounded())
         case .vbr:
             break
         }
@@ -1366,7 +1422,7 @@ actor VideoProcessor {
 
                             // set expected frame rate if ABR specified
                             if encodingMode == .abr {
-                                var fr = Int32(30)
+                                var fr = Int32(outputFPS.rounded())
                                 _ = VTSessionSetProperty(compSession, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: CFNumberCreate(nil, .sInt32Type, &fr))
                             }
                             if encodingMode == .cbr {
@@ -1680,7 +1736,10 @@ actor VideoProcessor {
                                                     }
                                                 }
                                                 // Start writer session now
-                                                writer.startWriting()
+                                                let writeOK = writer.startWriting()
+                                                NSLog("VideoProcessor: writer.startWriting() returned %d, status=%d, error=%@",
+                                                      writeOK ? 1 : 0, writer.status.rawValue,
+                                                      writer.error?.localizedDescription ?? "none")
                                                 writer.startSession(atSourceTime: .zero)
                                                 writerStarted = true
 
@@ -1882,6 +1941,7 @@ actor VideoProcessor {
                         try await withCheckedThrowingContinuation { continuation in
                             let contLock = DispatchQueue(label: "cont.lock.video")
                             var didResume = false
+                            var hwFrameCount = 0
                             func safeResume(_ resumeBlock: @escaping () -> Void) {
                                 contLock.sync {
                                     if !didResume {
@@ -1910,6 +1970,18 @@ actor VideoProcessor {
                                         return
                                     }
                                     let appended = vIn.append(sample)
+
+                                    // Log first few frame PTS for frame rate debugging
+                                    hwFrameCount += 1
+                                    if hwFrameCount <= 5 {
+                                        let samplePTS = CMSampleBufferGetPresentationTimeStamp(sample)
+                                        let sampleDur = CMSampleBufferGetDuration(sample)
+                                        NSLog("VideoProcessor: HW frame #%d PTS=%lld/%d (%.4fs) dur=%lld/%d",
+                                              hwFrameCount,
+                                              samplePTS.value, samplePTS.timescale, samplePTS.seconds,
+                                              sampleDur.value, sampleDur.timescale)
+                                    }
+
                                     if !appended {
                                         // Append failed — likely writer was cancelled or failed
                                         safeResume({

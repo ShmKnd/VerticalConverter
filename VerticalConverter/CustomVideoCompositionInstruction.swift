@@ -39,8 +39,8 @@ class CustomVideoCompositionInstruction: NSObject, AVVideoCompositionInstruction
             case .fitWidth: return "Fit W"
             case .fitHeight: return "Fit H"
             case .centerSquare: return "Square"
-            case .centerPortrait4x3: return "4:3"
-            case .centerPortrait3x4: return "3:4"
+            case .centerPortrait4x3: return "3:4"
+            case .centerPortrait3x4: return "4:3"
             }
         }
     }

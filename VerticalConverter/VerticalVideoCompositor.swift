@@ -40,6 +40,9 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     /// pipeline applies OETF to float input, so we must output integer format
     /// to avoid double-OETF.
     static var staticIsHEVCOutput: Bool = false
+    /// エクスポート開始時に確定したウォーターマーク表示フラグ。
+    /// エクスポート中に状態が変わっても一貫した結果になるよう、事前にキャプチャする。
+    static var staticShowsWatermark: Bool = false
     private let renderQueue = DispatchQueue(label: "com.verticalconverter.renderqueue")
     private var renderContext: AVVideoCompositionRenderContext?
     private let ciContext: CIContext
@@ -475,10 +478,11 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             // for a long video means gigabytes of unreleased memory.
             autoreleasepool {
             guard let self = self else {
+                NSLog("VerticalVideoCompositor: FAILED - self is nil (compositor deallocated)")
                 asyncVideoCompositionRequest.finish(with: NSError(
                     domain: "VerticalVideoCompositor",
                     code: -1,
-                    userInfo: nil
+                    userInfo: [NSLocalizedDescriptionKey: "self is nil"]
                 ))
                 return
             }
@@ -492,20 +496,22 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             }
             
             guard let instruction = asyncVideoCompositionRequest.videoCompositionInstruction as? CustomVideoCompositionInstruction else {
+                NSLog("VerticalVideoCompositor: FAILED - instruction cast failed (type=%@)", String(describing: type(of: asyncVideoCompositionRequest.videoCompositionInstruction)))
                 asyncVideoCompositionRequest.finish(with: NSError(
                     domain: "VerticalVideoCompositor",
                     code: -1,
-                    userInfo: nil
+                    userInfo: [NSLocalizedDescriptionKey: "instruction cast failed"]
                 ))
                 removePending()
                 return
             }
             
             guard let layerInstruction = instruction.layerInstructions.first as? AVVideoCompositionLayerInstruction else {
+                NSLog("VerticalVideoCompositor: FAILED - layerInstruction cast failed (count=%d)", instruction.layerInstructions.count)
                 asyncVideoCompositionRequest.finish(with: NSError(
                     domain: "VerticalVideoCompositor",
                     code: -1,
-                    userInfo: nil
+                    userInfo: [NSLocalizedDescriptionKey: "layerInstruction cast failed"]
                 ))
                 removePending()
                 return
@@ -523,10 +529,14 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             self.toneMappingMode = instruction.toneMappingMode
 
             guard let sourcePixelBuffer = asyncVideoCompositionRequest.sourceFrame(byTrackID: layerInstruction.trackID) else {
+                NSLog("VerticalVideoCompositor: FAILED - sourceFrame is nil for trackID=%d, requiredSourceTrackIDs=%@, sourceTrackIDs=%@",
+                      layerInstruction.trackID,
+                      String(describing: asyncVideoCompositionRequest.videoCompositionInstruction.requiredSourceTrackIDs),
+                      String(describing: asyncVideoCompositionRequest.sourceTrackIDs))
                 asyncVideoCompositionRequest.finish(with: NSError(
                     domain: "VerticalVideoCompositor",
                     code: -1,
-                    userInfo: nil
+                    userInfo: [NSLocalizedDescriptionKey: "sourceFrame nil for trackID=\(layerInstruction.trackID)"]
                 ))
                 removePending()
                 return
@@ -535,10 +545,11 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             // 出力バッファを作成
             guard let renderContext = self.renderContext,
                   let outputPixelBuffer = renderContext.newPixelBuffer() else {
+                NSLog("VerticalVideoCompositor: FAILED - renderContext=%@, newPixelBuffer=nil", String(describing: self.renderContext))
                 asyncVideoCompositionRequest.finish(with: NSError(
                     domain: "VerticalVideoCompositor",
                     code: -1,
-                    userInfo: nil
+                    userInfo: [NSLocalizedDescriptionKey: "renderContext or outputPixelBuffer nil"]
                 ))
                 removePending()
                 return
@@ -623,7 +634,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         }
 
         let imageToRender: CIImage
-        if BuildEdition.current.showsWatermark {
+        if Self.staticShowsWatermark {
             imageToRender = Self.overlayWatermark(on: finalImage, renderSize: renderSize)
         } else {
             imageToRender = finalImage

@@ -9,7 +9,7 @@ struct VideoExportSettings {
     var bitrate: Int = 10          // Mbps
     var encodingMode: EncodingMode = .vbr
     var resolution: Resolution     = .fullHD
-    var frameRate: FrameRate       = .fps30
+    var frameRate: FrameRate       = .source
     var codec: Codec = .h264
 
     // MARK: - Encoding Mode
@@ -37,6 +37,7 @@ struct VideoExportSettings {
     // MARK: - Frame Rate
 
     enum FrameRate: String, CaseIterable {
+        case source  = "Src"    // pass-through: preserve source frame rate
         case fps24   = "24"
         case fps2997 = "29.97"
         case fps30   = "30"
@@ -45,14 +46,17 @@ struct VideoExportSettings {
         /// セグメントに表示するラベル（29.97は DF をサブラベルで表示する用）
         var displayLabel: String {
             switch self {
+            case .source:  return "Src"
             case .fps2997: return "29.97 DF"
             default:       return rawValue
             }
         }
 
         /// AVMutableVideoComposition.frameDuration 用
+        /// Note: .source returns .invalid — caller must resolve using the source track's nominal FPS.
         var frameDuration: CMTime {
             switch self {
+            case .source:  return .invalid
             case .fps24:   return CMTime(value: 1,    timescale: 24)
             case .fps2997: return CMTime(value: 1001, timescale: 30000)   // Drop Frame
             case .fps30:   return CMTime(value: 1,    timescale: 30)
@@ -83,7 +87,7 @@ struct VideoExportSettings {
         case mp4 = "MP4"
     }
 
-    var containerFormat: ContainerFormat = .mov
+    var containerFormat: ContainerFormat = .mp4
 
     /// Resolved file extension for the current codec + container combination.
     /// ProRes always produces `.mov`. H.264 always produces `.mp4`.
