@@ -29,8 +29,10 @@ private struct WindowWidthConstrainer: NSViewRepresentable {
         weak var originalDelegate: NSWindowDelegate?
 
         func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
-            // 幅を 560 に固定し、高さだけユーザーのリサイズを許可
-            return NSSize(width: 560, height: frameSize.height)
+            let screenHeight = NSScreen.main?.visibleFrame.height ?? 960
+            let maxHeight = min(1040, screenHeight - 28)
+            let clampedHeight = min(frameSize.height, maxHeight)
+            return NSSize(width: 560, height: clampedHeight)
         }
 
         // 元のデリゲートへ他のメソッドを転送
@@ -57,7 +59,7 @@ private struct WindowWidthConstrainer: NSViewRepresentable {
             objc_setAssociatedObject(window, "WindowDelegateProxy", proxy, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
             window.delegate = proxy
             window.minSize = NSSize(width: 560, height: 600)
-            window.maxSize = NSSize(width: 560, height: NSScreen.main?.visibleFrame.height ?? 960)
+            window.maxSize = NSSize(width: 560, height: min(1040, (NSScreen.main?.visibleFrame.height ?? 960) - 28))
         }
         return view
     }
@@ -129,8 +131,8 @@ struct ContentView: View {
         .frame(
             minWidth: 560, idealWidth: 560, maxWidth: 560,
             minHeight: 600,
-            idealHeight: min(960, (NSScreen.main?.visibleFrame.height ?? 960) - 28),
-            maxHeight: .infinity
+            idealHeight: min(1040, (NSScreen.main?.visibleFrame.height ?? 960) - 28),
+            maxHeight: min(1040, (NSScreen.main?.visibleFrame.height ?? 960) - 28)
         )
         .sheet(isPresented: $showingCropPreview) {
             VStack(spacing: 0) {
