@@ -23,6 +23,48 @@ private struct PulseEffectModifier: ViewModifier {
     }
 }
 
+/// ウィンドウの横幅を固定しつつ縦方向のリサイズだけ許可する
+private struct WindowWidthConstrainer: NSViewRepresentable {
+    private class WindowDelegateProxy: NSObject, NSWindowDelegate {
+        weak var originalDelegate: NSWindowDelegate?
+
+        func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
+            // 幅を 560 に固定し、高さだけユーザーのリサイズを許可
+            return NSSize(width: 560, height: frameSize.height)
+        }
+
+        // 元のデリゲートへ他のメソッドを転送
+        override func responds(to aSelector: Selector!) -> Bool {
+            if super.responds(to: aSelector) { return true }
+            return originalDelegate?.responds(to: aSelector) ?? false
+        }
+
+        override func forwardingTarget(for aSelector: Selector!) -> Any? {
+            if let original = originalDelegate, original.responds(to: aSelector) {
+                return original
+            }
+            return super.forwardingTarget(for: aSelector)
+        }
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async {
+            guard let window = view.window else { return }
+            let proxy = WindowDelegateProxy()
+            proxy.originalDelegate = window.delegate
+            // proxy を window に retain させる
+            objc_setAssociatedObject(window, "WindowDelegateProxy", proxy, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            window.delegate = proxy
+            window.minSize = NSSize(width: 560, height: 600)
+            window.maxSize = NSSize(width: 560, height: NSScreen.main?.visibleFrame.height ?? 960)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
+
 struct ContentView: View {
     @StateObject private var viewModel = ContentViewModel()
     @State private var isTargeted = false
@@ -34,55 +76,62 @@ struct ContentView: View {
             Color(nsColor: NSColor.windowBackgroundColor)
             .ignoresSafeArea()
 
-            VStack(spacing: 12) {
-                // ヘッダー
-                VStack(spacing: 4) {
-                    HStack(spacing: 6) {
-                        Text("Vertical Converter")
-                            .font(.title.bold())
-                            .foregroundStyle(.primary)
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(spacing: 12) {
+                    // ヘッダー
+                    VStack(spacing: 4) {
+                        HStack(spacing: 6) {
+                            Text("Vertical Converter")
+                                .font(.title.bold())
+                                .foregroundStyle(.primary)
+                            #if EDITION_DEMO
+                            Text("DEMO")
+                                .font(.caption2.bold())
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.orange, in: Capsule())
+                            #endif
+                        }
+                        Text("Convert 16:9 → 9:16")
+                            .font(.subheadline)
+                            .foregroundStyle(Color.primary.opacity(0.75))
+                        Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                         #if EDITION_DEMO
-                        Text("DEMO")
-                            .font(.caption2.bold())
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.orange, in: Capsule())
+                        demoStatusLabel
                         #endif
                     }
-                    Text("Convert 16:9 → 9:16")
-                        .font(.subheadline)
-                        .foregroundStyle(Color.primary.opacity(0.75))
-                    Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    #if EDITION_DEMO
-                    demoStatusLabel
-                    #endif
+                    .padding(.top, 22)
+
+                    dropZone
+                        .frame(maxWidth: .infinity)
+                        .disabled(viewModel.isProcessing)
+                    settingsPanel
+                        .frame(maxWidth: .infinity)
+                        .disabled(viewModel.isProcessing)
+                    smartFramingPanel
+                        .frame(maxWidth: .infinity)
+                        .disabled(viewModel.isProcessing)
+                    hdrPanel
+                        .frame(maxWidth: .infinity)
+                        .disabled(viewModel.isProcessing)
+                    actionPanel
+                        .frame(maxWidth: .infinity)
                 }
-                .padding(.top, 22)
-
-                dropZone
-                    .frame(maxWidth: .infinity)
-                    .disabled(viewModel.isProcessing)
-                settingsPanel
-                    .frame(maxWidth: .infinity)
-                    .disabled(viewModel.isProcessing)
-                smartFramingPanel
-                    .frame(maxWidth: .infinity)
-                    .disabled(viewModel.isProcessing)
-                hdrPanel
-                    .frame(maxWidth: .infinity)
-                    .disabled(viewModel.isProcessing)
-                actionPanel
-                    .frame(maxWidth: .infinity)
-
-                // Spacer removed to avoid large empty area below panels
+                .padding(.horizontal, 20)
+                .padding(.bottom, 36)
+                .frame(width: 560)
             }
-            .padding(.horizontal, 20)
-            .padding(.bottom, 36)
         }
-        .frame(width: 560, height: 960)
+        .background(WindowWidthConstrainer())
+        .frame(
+            minWidth: 560, idealWidth: 560, maxWidth: 560,
+            minHeight: 600,
+            idealHeight: min(960, (NSScreen.main?.visibleFrame.height ?? 960) - 28),
+            maxHeight: .infinity
+        )
         .sheet(isPresented: $showingCropPreview) {
             VStack(spacing: 0) {
                 // ── ヘッダー ──

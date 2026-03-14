@@ -17,7 +17,7 @@ struct VerticalConverterApp: App {
             ContentView()
         }
         .windowStyle(.hiddenTitleBar)
-        .windowResizability(.contentSize)
+        .windowResizability(.automatic)
         .commands {
             CommandGroup(replacing: .appInfo) {
                 Button("About Vertical Converter") {

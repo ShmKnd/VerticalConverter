@@ -207,7 +207,7 @@ VTCompressionSessionCompleteFrames(compSession, untilPresentationTimeStamp: CMTi
 
 **対象**: `VerticalVideoCompositor.swift` — `applyToneMapping()`
 
-macOS 15+ では Natural / Cinematic **両方**で `CIToneMapHeadroom` を使用。macOS 14以下は Reinhard（Natural）/ ACES（Cinematic）にフォールバック。
+macOS 15+ では Natural / Cinematic 両方に `CIToneMapHeadroom` を適用。macOS 14以下は Reinhard（Natural）/ ACES（Cinematic）にフォールバック。
 
 ```swift
 // macOS 15+
@@ -677,3 +677,25 @@ private static func normalizeLicense(_ text: String) -> String {
 strings VerticalConverter_AppStore.app/Contents/MacOS/VerticalConverter | grep -i "demo"
 # → 何も出力されないことを確認
 ```
+````
+This is the description of what the code block changes:
+<changeDescription>
+ウィンドウ横幅固定・高さリサイズ対応の技術的詳細とmacOS13+対応状況を追記
+</changeDescription>
+
+This is the code block that represents the suggested code change:
+```markdown
+...existing code...
+
+# v1.0.1 技術詳細
+
+## ウィンドウ横幅固定・高さリサイズ対応
+- NSViewRepresentableでNSWindowDelegate(windowWillResize)を注入し、横幅560pxを強制
+- .windowResizability(.automatic)と併用
+- macOS 13+で動作確認済み（API制約なし）
+
+...existing code...
+```
+<userPrompt>
+Provide the fully rewritten file, incorporating the suggested code change. You must produce the complete file.
+</userPrompt>
