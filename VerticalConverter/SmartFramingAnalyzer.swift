@@ -224,8 +224,8 @@ struct SmartFramingAnalyzer {
         let centerOffsetX = minOffsetX / 2
         let centerOffsetY = minOffsetY / 2
 
-        // Step 1: 全フレームをスキャン（IOUトラッキング + 主役推定）
-        let (rawPositions, finalDetectionInterval) = try await detectAllPositions(
+        // Step 1: 全フレームをスキャン（IOUトラッキング + 主役推定 + ヒストグラム差分）
+        let scan = try await detectAllPositions(
             asset: asset,
             videoTrack: videoTrack,
             totalFrames: totalFrames,
@@ -234,16 +234,27 @@ struct SmartFramingAnalyzer {
         )
 
         // Step 2: X・Y を別々に補間
-        let rawX = rawPositions.map { $0.map { $0.x } }
-        let rawY = rawPositions.map { $0.map { $0.y } }
+        let rawX = scan.positions.map { $0.map { $0.x } }
+        let rawY = scan.positions.map { $0.map { $0.y } }
         // shortGapFrames を検出間隔に依存させる（安定化のため）
-        let shortGap = max(1, finalDetectionInterval * 2)
+        let shortGap = max(1, scan.detectionInterval * 2)
         let interpX = interpolate(rawX, fallback: 0.5, shortGapFrames: shortGap)
         let interpY = interpolate(rawY, fallback: 0.72, shortGapFrames: shortGap)
 
-        // Step 3: EMA（指数移動平均）スムージング
-        let smoothedX = emaSmooth(interpX, alpha: emaAlpha)
-        let smoothedY = emaSmooth(interpY, alpha: emaAlpha)
+        // Step 2.5: シーンカット検出（ヒストグラム AND 位置ジャンプの両方が一致した場合のみカット判定）
+        // 仮EMAで位置データを安定化してから位置ジャンプを評価
+        let prelimX = emaSmooth(interpX, alpha: emaAlpha)
+        let prelimY = emaSmooth(interpY, alpha: emaAlpha)
+        let cutFrames = detectCutFrames(
+            histogramDiffs: scan.histogramDiffs,
+            smoothedX: prelimX,
+            smoothedY: prelimY,
+            fps: Double(fps)
+        )
+
+        // Step 3: EMA（指数移動平均）スムージング — カットフレームでリセット
+        let smoothedX = emaSmooth(interpX, alpha: emaAlpha, cutFrames: cutFrames)
+        let smoothedY = emaSmooth(interpY, alpha: emaAlpha, cutFrames: cutFrames)
 
         // Step 4X: X方向 ホールド＆フォロー（3秒ホールド、25%デッドゾーン）
         let minHoldFrames = Int(3.0 * Double(fps))
@@ -256,7 +267,8 @@ struct SmartFramingAnalyzer {
             targetRatio: 0.5,
             deadZoneRatio: 0.25,
             minHoldFrames: minHoldFrames,
-            followFactor: followFactor
+            followFactor: followFactor,
+            cutFrames: cutFrames
         )
 
         // Step 4Y: Y方向 ホールド＆フォロー（0.5秒ホールド、ヘッドルーム優先）
@@ -269,7 +281,8 @@ struct SmartFramingAnalyzer {
             targetRatio: 0.80,
             deadZoneRatio: 0.08,
             minHoldFrames: max(1, Int(0.5 * Double(fps))),
-            followFactor: followFactor * 1.5
+            followFactor: followFactor * 1.5,
+            cutFrames: cutFrames
         )
 
         progressHandler(1.0)
@@ -278,14 +291,23 @@ struct SmartFramingAnalyzer {
 
     // MARK: - Step 1: IOUトラッキング付きフレームスキャン
 
+    /// 解析結果: 人物位置 + ヒストグラム差分（カット検出用）
+    private struct ScanResult {
+        var positions: [CGPoint?]
+        var detectionInterval: Int
+        /// フレーム間のヒストグラム差分 (chi-squared distance)。index i = フレーム i と i-1 の差。
+        var histogramDiffs: [CGFloat]
+    }
+
     private func detectAllPositions(
         asset: AVAsset,
         videoTrack: AVAssetTrack,
         totalFrames: Int,
         fps: Double,
         progressHandler: @escaping (Double) -> Void
-    ) async throws -> ([CGPoint?], Int) {
+    ) async throws -> ScanResult {
         var result = [CGPoint?](repeating: nil, count: totalFrames)
+        var histDiffs = [CGFloat](repeating: 0, count: totalFrames)
 
         let tracker = PersonTracker()
         tracker.lifespanTarget = CGFloat(fps * 1.5)     // 1.5秒で主役と判定
@@ -295,12 +317,17 @@ struct SmartFramingAnalyzer {
         var lastWeightedCenter: CGPoint? = nil
         var lastFilledIndex: Int = -1
 
+        // ヒストグラム用: 前フレームのヒストグラムを保持
+        var prevHistogram: [CGFloat]? = nil
+
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ])
         output.alwaysCopiesSampleData = false
-        guard reader.canAdd(output) else { return (result, detectionInterval) }
+        guard reader.canAdd(output) else {
+            return ScanResult(positions: result, detectionInterval: detectionInterval, histogramDiffs: histDiffs)
+        }
         reader.add(output)
         reader.startReading()
 
@@ -318,32 +345,40 @@ struct SmartFramingAnalyzer {
                     throw CancellationError()
                 }
 
-                if frameIndex % detectionInterval == 0,
-                   frameIndex < totalFrames,
+                if frameIndex < totalFrames,
                    let pixelBuffer = CMSampleBufferGetImageBuffer(sample) {
 
-                    let rawPersons = detectRawPersons(in: pixelBuffer)
-                    let center = tracker.update(with: rawPersons)
+                    // ヒストグラム差分: 毎フレーム計算（カット位置を正確に特定するため）
+                    let hist = Self.computeHistogram(pixelBuffer)
+                    if let prev = prevHistogram {
+                        histDiffs[frameIndex] = Self.chiSquaredDistance(prev, hist)
+                    }
+                    prevHistogram = hist
 
-                    // Fill any frames between lastFilledIndex and this sample with the
-                    // last known weighted center (hold behavior). This avoids creating
-                    // long linear interpolations across absent detections.
-                    if lastFilledIndex + 1 <= frameIndex - 1 {
-                        for fi in (lastFilledIndex + 1)..<frameIndex {
-                            result[fi] = lastWeightedCenter
+                    // 人物検出: detectionInterval毎
+                    if frameIndex % detectionInterval == 0 {
+                        let rawPersons = detectRawPersons(in: pixelBuffer)
+                        let center = tracker.update(with: rawPersons)
+
+                        // Fill any frames between lastFilledIndex and this sample with the
+                        // last known weighted center (hold behavior).
+                        if lastFilledIndex + 1 <= frameIndex - 1 {
+                            for fi in (lastFilledIndex + 1)..<frameIndex {
+                                result[fi] = lastWeightedCenter
+                            }
                         }
+
+                        result[frameIndex] = center
+
+                        // 適応的間隔: 前回中心との差が大きければ短縮
+                        if let c = center, let lc = lastWeightedCenter {
+                            let deviation = hypot(c.x - lc.x, c.y - lc.y)
+                            detectionInterval = deviation > 0.10 ? 4 : 8
+                        }
+
+                        if let c = center { lastWeightedCenter = c }
+                        lastFilledIndex = frameIndex
                     }
-
-                    result[frameIndex] = center
-
-                    // 適応的間隔: 前回中心との差が大きければ短縮
-                    if let c = center, let lc = lastWeightedCenter {
-                        let deviation = hypot(c.x - lc.x, c.y - lc.y)
-                        detectionInterval = deviation > 0.10 ? 4 : 8
-                    }
-
-                    if let c = center { lastWeightedCenter = c }
-                    lastFilledIndex = frameIndex
                 }
 
                 frameIndex += 1
@@ -362,39 +397,173 @@ struct SmartFramingAnalyzer {
             }
         }
 
-        return (result, detectionInterval)
+        return ScanResult(positions: result, detectionInterval: detectionInterval, histogramDiffs: histDiffs)
+    }
+
+    // MARK: - Histogram Helpers
+
+    /// BGRA ピクセルバッファから HSV ヒストグラム (H:32 × S:16 × V:16 = 64要素) を計算。
+    /// HSV空間は照明変化に頑健で、RGB空間よりカット検出の誤検出が少ない。
+    /// (参考: "Shot Boundary Detection Algorithm Based on HSV Histogram and HOG Feature")
+    /// 8ピクセル間隔でサンプリング → フルHDでも ~32000 サンプルで高速。
+    private static func computeHistogram(_ pixelBuffer: CVPixelBuffer) -> [CGFloat] {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let hBins = 32
+        let sBins = 16
+        let vBins = 16
+        let totalBins = hBins + sBins + vBins  // 64
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+            return [CGFloat](repeating: 0, count: totalBins)
+        }
+        let ptr = base.assumingMemoryBound(to: UInt8.self)
+
+        var hist = [CGFloat](repeating: 0, count: totalBins)
+        let step = 8
+        var count: CGFloat = 0
+
+        var y = 0
+        while y < height {
+            var x = 0
+            while x < width {
+                let offset = y * bytesPerRow + x * 4
+                let b = CGFloat(ptr[offset]) / 255.0
+                let g = CGFloat(ptr[offset + 1]) / 255.0
+                let r = CGFloat(ptr[offset + 2]) / 255.0
+
+                // RGB → HSV (整数化不使用、直接浮動小数点)
+                let cMax = max(r, max(g, b))
+                let cMin = min(r, min(g, b))
+                let delta = cMax - cMin
+
+                let h: CGFloat  // 0..360
+                if delta < 0.001 {
+                    h = 0
+                } else if cMax == r {
+                    h = 60.0 * (((g - b) / delta).truncatingRemainder(dividingBy: 6))
+                } else if cMax == g {
+                    h = 60.0 * ((b - r) / delta + 2)
+                } else {
+                    h = 60.0 * ((r - g) / delta + 4)
+                }
+                let hNorm = ((h < 0 ? h + 360 : h) / 360.0)  // 0..1
+                let s = cMax > 0 ? delta / cMax : 0            // 0..1
+                let v = cMax                                    // 0..1
+
+                let hIdx = min(hBins - 1, Int(hNorm * CGFloat(hBins)))
+                let sIdx = min(sBins - 1, Int(s * CGFloat(sBins)))
+                let vIdx = min(vBins - 1, Int(v * CGFloat(vBins)))
+
+                hist[hIdx] += 1
+                hist[hBins + sIdx] += 1
+                hist[hBins + sBins + vIdx] += 1
+                count += 1
+                x += step
+            }
+            y += step
+        }
+
+        // 正規化
+        if count > 0 {
+            for i in 0..<hist.count { hist[i] /= count }
+        }
+        return hist
+    }
+
+    /// 2つのヒストグラム間の chi-squared distance。
+    /// 値が大きいほど画像の色分布が異なる（= シーンカットの可能性が高い）。
+    private static func chiSquaredDistance(_ a: [CGFloat], _ b: [CGFloat]) -> CGFloat {
+        var sum: CGFloat = 0
+        for i in 0..<min(a.count, b.count) {
+            let diff = a[i] - b[i]
+            let denom = a[i] + b[i]
+            if denom > 0 {
+                sum += (diff * diff) / denom
+            }
+        }
+        return sum
     }
 
     /// 1フレームから全ての人物を検出して返す（トラッカーに渡す生データ）
     private func detectRawPersons(in pixelBuffer: CVPixelBuffer) -> [RawPerson] {
         let bodyRequest = VNDetectHumanBodyPoseRequest()
         let faceRequest = VNDetectFaceRectanglesRequest()
+        let bodyRectRequest = VNDetectHumanRectanglesRequest()
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
-        do { try handler.perform([bodyRequest, faceRequest]) } catch { return [] }
+        do { try handler.perform([bodyRequest, faceRequest, bodyRectRequest]) } catch { return [] }
 
         var persons: [RawPerson] = []
 
-        // 人体ポーズ（優先）: 上半身キーポイントから中心・バウンディングを算出
+        // 人体ポーズ（優先）: 上半身キーポイントから加重中心・バウンディングを算出
+        // 目・鼻は顔の正面方向を表すため重みを高く、耳・手首は補助的
         if let bodyResults = bodyRequest.results, !bodyResults.isEmpty {
             for obs in bodyResults {
                 guard let pts = try? obs.recognizedPoints(.all) else { continue }
-                let upper = [pts[.neck], pts[.leftShoulder], pts[.rightShoulder],
-                             pts[.nose], pts[.leftEar], pts[.rightEar],
-                             pts[.leftWrist], pts[.rightWrist]]
-                    .compactMap { $0 }.filter { $0.confidence > 0.25 }
-                guard !upper.isEmpty else { continue }
-                let xs = upper.map { $0.location.x }
-                let ys = upper.map { $0.location.y }
-                let cx = xs.reduce(0, +) / CGFloat(xs.count)
-                let cy = ys.reduce(0, +) / CGFloat(ys.count)
-                let bw = (xs.max()! - xs.min()!) + 0.05   // 少し余裕を持たせる
-                let bh = (ys.max()! - ys.min()!) + 0.05
-                let avgConf = upper.map { CGFloat($0.confidence) }.reduce(0, +) / CGFloat(upper.count)
+                let keyWeights: [(VNHumanBodyPoseObservation.JointName, CGFloat)] = [
+                    (.nose, 3.0),
+                    (.leftEye, 2.5), (.rightEye, 2.5),
+                    (.neck, 1.5),
+                    (.leftShoulder, 1.0), (.rightShoulder, 1.0),
+                    (.leftEar, 0), (.rightEar, 0),
+                    (.leftWrist, 0.3), (.rightWrist, 0.3),
+                ]
+                var weightedX: CGFloat = 0
+                var weightedY: CGFloat = 0
+                var totalWeight: CGFloat = 0
+                var allXs: [CGFloat] = []
+                var allYs: [CGFloat] = []
+                var confSum: CGFloat = 0
+                var confCount: CGFloat = 0
+
+                for (joint, weight) in keyWeights {
+                    guard let pt = pts[joint], pt.confidence > 0.25 else { continue }
+                    let loc = pt.location
+                    weightedX += loc.x * weight
+                    weightedY += loc.y * weight
+                    totalWeight += weight
+                    allXs.append(loc.x)
+                    allYs.append(loc.y)
+                    confSum += CGFloat(pt.confidence)
+                    confCount += 1
+                }
+                guard totalWeight > 0, !allXs.isEmpty else { continue }
+                let cx = weightedX / totalWeight
+                let cy = weightedY / totalWeight
+                let bw = (allXs.max()! - allXs.min()!) + 0.05
+                let bh = (allYs.max()! - allYs.min()!) + 0.05
+                let avgConf = confSum / confCount
                 persons.append(RawPerson(x: cx, y: cy, w: bw, h: bh, confidence: avgConf))
             }
         }
 
-        // 顔検出（ボディが1件も取れなかった場合のフォールバック）
+        // 人物矩形検出（BodyPoseが取れない後ろ姿・遠景のフォールバック）
+        // BodyPoseで既に検出された人物と重なる矩形はスキップ
+        if let rectResults = bodyRectRequest.results, !rectResults.isEmpty {
+            for obs in rectResults {
+                let bb = obs.boundingBox
+                let cx = bb.midX
+                let cy = bb.midY
+                // 既存のBodyPose検出と重複チェック（IOU簡易版）
+                let alreadyDetected = persons.contains { p in
+                    let overlapX = abs(p.x - cx) < (p.w + bb.width) / 2
+                    let overlapY = abs(p.y - cy) < (p.h + bb.height) / 2
+                    return overlapX && overlapY
+                }
+                if !alreadyDetected {
+                    persons.append(RawPerson(
+                        x: cx, y: cy,
+                        w: bb.width, h: bb.height,
+                        confidence: CGFloat(obs.confidence) * 0.8  // BodyPoseより少し低い信頼度
+                    ))
+                }
+            }
+        }
+
+        // 顔検出（ボディもシルエットも取れなかった場合のフォールバック）
         if persons.isEmpty, let faces = faceRequest.results, !faces.isEmpty {
             for face in faces {
                 let bb = face.boundingBox
@@ -474,6 +643,157 @@ struct SmartFramingAnalyzer {
         return result
     }
 
+    // MARK: - Step 2.5: シーンカット検出（ヒストグラム + 位置ジャンプ AND方式）
+
+    /// ヒストグラム差分と位置ジャンプの両方が検出されたフレームだけをカットと判定。
+    ///
+    /// 改善点（論文ベース）:
+    /// - HSVヒストグラム: 照明変化に頑健
+    /// - スライディングウィンドウ適応的閾値: 局所的な映像特性に追従
+    ///   (参考: "Video Shot Boundary Detection Using Relative Difference Between Frames")
+    /// - フラッシュ除去（2次微分）: カメラフラッシュの誤検出を排除
+    ///   (参考: "Shot Detection Using Pixel Difference and Color Histogram")
+    /// - 位置ジャンプAND条件: 人物移動のみの偽陽性を排除
+    private func detectCutFrames(
+        histogramDiffs: [CGFloat],
+        smoothedX: [CGFloat],
+        smoothedY: [CGFloat],
+        fps: Double
+    ) -> Set<Int> {
+        var cuts = Set<Int>()
+        let n = histogramDiffs.count
+        guard n > 1, smoothedX.count == n, smoothedY.count == n else { return cuts }
+
+        // --- ヒストグラム候補（スライディングウィンドウ適応的閾値） ---
+        // 局所的な統計量に基づく閾値で、映像の特性変化に追従する
+        let windowRadius = max(15, Int(fps * 1.0))  // ±1秒のウィンドウ
+        let multiplier: CGFloat = 4.0  // 局所平均の何倍でカット判定
+
+        // グローバル最低閾値（非常に静かな映像でもノイズを拾わない）
+        let sorted = histogramDiffs.filter { $0 > 0 }.sorted()
+        let globalFloor: CGFloat = sorted.isEmpty ? 0.3 : max(0.15, sorted[min(sorted.count - 1, sorted.count * 95 / 100)])
+
+        var histCandidates: [(index: Int, score: CGFloat)] = []
+        for i in 1..<n {
+            let diff = histogramDiffs[i]
+            // 局所ウィンドウの平均・標準偏差を計算
+            let wStart = max(0, i - windowRadius)
+            let wEnd = min(n, i + windowRadius + 1)
+            var sum: CGFloat = 0
+            var sumSq: CGFloat = 0
+            var wCount: CGFloat = 0
+            for j in wStart..<wEnd {
+                // 候補フレーム自身は局所統計から除外（自分でスパイクを作らない）
+                if j == i { continue }
+                sum += histogramDiffs[j]
+                sumSq += histogramDiffs[j] * histogramDiffs[j]
+                wCount += 1
+            }
+            guard wCount > 0 else { continue }
+            let localMean = sum / wCount
+            let localStd = sqrt(max(0, sumSq / wCount - localMean * localMean))
+            // 閾値: max(グローバル最低閾値, 局所平均 + multiplier × 局所標準偏差)
+            let adaptiveThreshold = max(globalFloor, localMean + multiplier * localStd)
+
+            if diff > adaptiveThreshold {
+                histCandidates.append((i, diff))
+            }
+        }
+
+        // --- フラッシュ除去（2次微分チェック） ---
+        // フラッシュ: フレーム i で急上昇し i+1 で急降下 → 2次微分が大きな負値
+        // 本物のカット: i で上昇しその後は安定 → 2次微分は小さい
+        var flashFiltered: [(index: Int, score: CGFloat)] = []
+        for candidate in histCandidates {
+            let i = candidate.index
+            if i + 1 < n {
+                let d2 = histogramDiffs[i + 1] - histogramDiffs[i]  // 差分の差分
+                // フラッシュ: 直後にほぼ同等の差分が出る（元に戻る）
+                if histogramDiffs[i + 1] > candidate.score * 0.5 && d2 < 0 {
+                    NSLog("SmartFramingAnalyzer: rejected flash at frame %d (diff=%.4f, next=%.4f)",
+                          i, candidate.score, histogramDiffs[i + 1])
+                    continue
+                }
+            }
+            flashFiltered.append(candidate)
+        }
+
+        let histSet = Set(flashFiltered.map { $0.index })
+        guard !histSet.isEmpty else { return cuts }
+        NSLog("SmartFramingAnalyzer: histogram candidates=%d (after flash filter, globalFloor=%.4f)",
+              histSet.count, globalFloor)
+
+        // --- 位置ジャンプ候補 ---
+        let w = max(6, Int(fps * 0.5))
+        var cumX = [CGFloat](repeating: 0, count: n + 1)
+        var cumY = [CGFloat](repeating: 0, count: n + 1)
+        for i in 0..<n {
+            cumX[i + 1] = cumX[i] + smoothedX[i]
+            cumY[i + 1] = cumY[i] + smoothedY[i]
+        }
+        func windowMean(_ cum: [CGFloat], _ start: Int, _ end: Int) -> CGFloat {
+            let len = CGFloat(end - start)
+            return len > 0 ? (cum[end] - cum[start]) / len : 0
+        }
+
+        let posThreshold: CGFloat = 0.15
+        var posCandidates = Set<Int>()
+        for i in w..<(n - w) {
+            let preX = windowMean(cumX, i - w, i)
+            let preY = windowMean(cumY, i - w, i)
+            let postX = windowMean(cumX, i, i + w)
+            let postY = windowMean(cumY, i, i + w)
+            let d = hypot(postX - preX, postY - preY)
+            if d > posThreshold {
+                posCandidates.insert(i)
+            }
+        }
+
+        // --- AND: ヒストグラム候補の近傍に位置候補がある場合のみ ---
+        let mergeRadius = max(4, Int(fps * 0.3))
+        var confirmed: [(index: Int, histScore: CGFloat)] = []
+        for item in flashFiltered {
+            var hasPosMatch = false
+            for offset in -mergeRadius...mergeRadius {
+                if posCandidates.contains(item.index + offset) {
+                    hasPosMatch = true
+                    break
+                }
+            }
+            if hasPosMatch {
+                confirmed.append((item.index, item.score))
+            } else {
+                NSLog("SmartFramingAnalyzer: rejected hist candidate frame %d (no position jump nearby)",
+                      item.index)
+            }
+        }
+
+        // 近接統合
+        let mergeWindow = max(4, Int(fps * 0.5))
+        var i = 0
+        while i < confirmed.count {
+            var bestIdx = i
+            var bestScore = confirmed[i].histScore
+            var j = i + 1
+            while j < confirmed.count && confirmed[j].index - confirmed[i].index < mergeWindow {
+                if confirmed[j].histScore > bestScore {
+                    bestScore = confirmed[j].histScore
+                    bestIdx = j
+                }
+                j += 1
+            }
+            cuts.insert(confirmed[bestIdx].index)
+            NSLog("SmartFramingAnalyzer: confirmed cut at frame %d (chi²=%.4f)",
+                  confirmed[bestIdx].index, bestScore)
+            i = j
+        }
+
+        if !cuts.isEmpty {
+            NSLog("SmartFramingAnalyzer: total %d confirmed scene cut(s)", cuts.count)
+        }
+        return cuts
+    }
+
     // MARK: - Step 3: EMA（指数移動平均）スムージング
     //
     // y[n] = α·x[n] + (1-α)·y[n-1]
@@ -487,7 +807,7 @@ struct SmartFramingAnalyzer {
     //  - O(n) で計算可能（FIR の O(n×radius) より高速）
     //  - 無限インパルス応答 → 窓の打ち切りによる境界アーティファクトなし
 
-    private func emaSmooth(_ values: [CGFloat], alpha: Double) -> [CGFloat] {
+    private func emaSmooth(_ values: [CGFloat], alpha: Double, cutFrames: Set<Int> = []) -> [CGFloat] {
         let n = values.count
         guard n > 1 else { return values }
 
@@ -496,7 +816,12 @@ struct SmartFramingAnalyzer {
 
         let a = CGFloat(alpha)
         for i in 1..<n {
-            result[i] = a * values[i] + (1.0 - a) * result[i - 1]
+            if cutFrames.contains(i) {
+                // カットフレームではEMAをリセット — 旧シーンの値を引きずらない
+                result[i] = values[i]
+            } else {
+                result[i] = a * values[i] + (1.0 - a) * result[i - 1]
+            }
         }
         return result
     }
@@ -513,7 +838,8 @@ struct SmartFramingAnalyzer {
         targetRatio: CGFloat,
         deadZoneRatio: CGFloat,
         minHoldFrames: Int,
-        followFactor: CGFloat
+        followFactor: CGFloat,
+        cutFrames: Set<Int> = []
     ) -> [CGFloat] {
         var offsets      = [CGFloat](repeating: centerOffset, count: positions.count)
         var cameraOffset = centerOffset
@@ -536,6 +862,16 @@ struct SmartFramingAnalyzer {
                 cameraOffset = targetOffset
                 initialized = true
                 settledFrame = i
+                offsets[i] = cameraOffset
+                continue
+            }
+
+            // シーンカット: 新シーンの被写体位置に即座にスナップ
+            // ホールドタイマー・フォロー状態もリセットし、新シーンを基準に再開
+            if cutFrames.contains(i) {
+                cameraOffset = targetOffset
+                settledFrame = i
+                isFollowing = false
                 offsets[i] = cameraOffset
                 continue
             }
