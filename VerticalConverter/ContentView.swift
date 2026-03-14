@@ -80,9 +80,9 @@ struct ContentView: View {
                 // Spacer removed to avoid large empty area below panels
             }
             .padding(.horizontal, 20)
-            .padding(.bottom, 20)
+            .padding(.bottom, 36)
         }
-        .frame(width: 560, height: 940)
+        .frame(width: 560, height: 960)
         .sheet(isPresented: $showingCropPreview) {
             VStack(spacing: 0) {
                 // ── ヘッダー ──
@@ -677,7 +677,7 @@ struct ContentView: View {
                 .frame(height: 36) // 固定高さを確保して UI のジャンプを防止
             } // end progress + status VStack
         }
-        .padding(EdgeInsets(top: 16, leading: 16, bottom: 4, trailing: 16))
+        .padding(EdgeInsets(top: 16, leading: 16, bottom: 16, trailing: 16))
         .background(.thinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 20))
         // TODO: Xcode 26 以降は下記に差し替え
