@@ -150,8 +150,10 @@ struct ContentView: View {
 
     #if EDITION_DEMO
     private var demoStatusLabel: some View {
+        #if EDITION_DEMO
         let tracker = DemoUsageTracker.shared
         let remaining = tracker.remainingFreeEncodes
+        #endif
         return Group {
             if remaining > 0 {
                 Text("Full quality: \(remaining) encodes remaining")
@@ -1196,7 +1198,9 @@ class ContentViewModel: ObservableObject {
 
                     // デモ版: エンコード成功をカウント
                     if BuildEdition.current == .demo {
+                        #if EDITION_DEMO
                         DemoUsageTracker.shared.recordEncode()
+                        #endif
                     }
 
                     if total == 1 {

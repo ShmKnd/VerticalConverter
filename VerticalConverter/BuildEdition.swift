@@ -31,7 +31,11 @@ enum BuildEdition {
     /// 起動後24時間以内かつ5回未満のエンコードならウォーターマークなし。
     var showsWatermark: Bool {
         guard self == .demo else { return false }
+        #if EDITION_DEMO
         return !DemoUsageTracker.shared.hasRemainingFreeEncodes
+        #else
+        return false
+        #endif
     }
 
     /// 表示用ラベル
@@ -48,6 +52,7 @@ enum BuildEdition {
 
 /// デモ版の使用回数と24時間制限を管理する。
 /// 24時間ごとにエンコード回数がリセットされ、各期間で5回までフル機能で利用可能。
+#if EDITION_DEMO
 final class DemoUsageTracker {
     static let shared = DemoUsageTracker()
 
@@ -100,3 +105,4 @@ final class DemoUsageTracker {
         UserDefaults.standard.set(current + 1, forKey: encodeCountKey)
     }
 }
+#endif
