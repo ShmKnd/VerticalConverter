@@ -1120,14 +1120,16 @@ actor VideoProcessor {
         }
 
         // エンコードモードごとのプロパティ調整
+        if codec != .prores422VT {
         switch encodingMode {
-        case .cbr:
-            compressionProps[AVVideoAllowFrameReorderingKey]  = false
-            compressionProps[AVVideoMaxKeyFrameIntervalKey]   = 1
-        case .abr:
-            compressionProps[AVVideoExpectedSourceFrameRateKey] = Int(outputFPS.rounded())
-        case .vbr:
+            case .cbr:
+                compressionProps[AVVideoAllowFrameReorderingKey]  = false
+                compressionProps[AVVideoMaxKeyFrameIntervalKey]   = 1
+            case .abr:
+                compressionProps[AVVideoExpectedSourceFrameRateKey] = Int(outputFPS.rounded())
+            case .vbr:
             break
+            }
         }
 
         // Note: Some compression properties (like AVVideoEncoderSpecificationKey) are not
@@ -1313,10 +1315,13 @@ actor VideoProcessor {
                                 }
                             }
 
-                            // Encoder specification: force software-only encoder
-                            let encoderSpec: CFDictionary = [
-                                kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String: kCFBooleanFalse,
-                                kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder as String: kCFBooleanFalse
+                            // Encoder specification: SW only for CBR, HW allowed for VBR/ABR
+                            let forceSwOnly = (encodingMode == .cbr)
+                                let encoderSpec: CFDictionary = [
+                                kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder:
+                                forceSwOnly ? kCFBooleanFalse : kCFBooleanTrue,
+                                kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder:
+                                forceSwOnly ? kCFBooleanFalse : kCFBooleanTrue
                             ] as CFDictionary
 
                             var session: VTCompressionSession? = nil
