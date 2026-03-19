@@ -66,6 +66,10 @@ class CustomVideoCompositionInstruction: NSObject, AVVideoCompositionInstruction
     var hdrConversionEnabled: Bool = false
     var toneMappingMode: ToneMappingMode = .natural
     var letterboxMode: LetterboxMode = .fitWidth
+    /// クロップ領域の水平位置 (0=左端, 0.5=中央, 1=右端)
+    var cropPositionX: CGFloat = 0.5
+    /// クロップ領域の垂直位置 (0=上端, 0.5=中央, 1=下端)
+    var cropPositionY: CGFloat = 0.5
     
     init(
         timeRange: CMTimeRange,

@@ -673,6 +673,8 @@ actor VideoProcessor {
         exportSettings: VideoExportSettings = VideoExportSettings(),
         smartFramingSettings: SmartFramingSettings,
         letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth,
+        cropPositionX: CGFloat = 0.5,
+        cropPositionY: CGFloat = 0.5,
         hdrConversionEnabled: Bool = false,
         toneMappingMode: CustomVideoCompositionInstruction.ToneMappingMode = .natural,
         progressHandler: @escaping (Double, String) -> Void  // (progress, phaseLabel)
@@ -823,7 +825,9 @@ actor VideoProcessor {
             frameDuration: resolvedFrameDuration,
             smartFramingSettings: smartFramingSettings,
             precomputedOffsets: precomputedOffsets,
-            letterboxMode: letterboxMode
+            letterboxMode: letterboxMode,
+            cropPositionX: cropPositionX,
+            cropPositionY: cropPositionY
             , hdrConversionEnabled: hdrConversionEnabled,
             toneMappingMode: toneMappingMode,
             codec: exportSettings.codec
@@ -855,7 +859,9 @@ actor VideoProcessor {
         frameDuration: CMTime,
         smartFramingSettings: SmartFramingSettings,
         precomputedOffsets: [CGPoint]? = nil,
-        letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth
+        letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth,
+        cropPositionX: CGFloat = 0.5,
+        cropPositionY: CGFloat = 0.5
         , hdrConversionEnabled: Bool = false,
         toneMappingMode: CustomVideoCompositionInstruction.ToneMappingMode = .natural,
         codec: VideoExportSettings.Codec = .h264
@@ -959,6 +965,8 @@ actor VideoProcessor {
             precomputedOffsets: precomputedOffsets
         )
         instruction.letterboxMode = letterboxMode
+        instruction.cropPositionX = cropPositionX
+        instruction.cropPositionY = cropPositionY
         instruction.hdrConversionEnabled = hdrConversionEnabled
         instruction.toneMappingMode = toneMappingMode
         

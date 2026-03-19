@@ -677,6 +677,55 @@ private static func normalizeLicense(_ text: String) -> String {
 strings VerticalConverter_AppStore.app/Contents/MacOS/VerticalConverter | grep -i "demo"
 # → 何も出力されないことを確認
 ```
+
+---
+---
+
+# v1.0.2 機能追加メモ
+
+**日付**: 2026-03-14
+
+---
+
+## セッション経緯
+
+### Phase 19: クロップ位置調整機能（03-14）
+
+Preview ウィンドウにクロップの横位置を調整するスライダーを追加。Fit H / Square / 4:3 / 3:4 モードでクロップ中心を左右にシフト可能。Fit W モードでは横シフトが意味をなさないため、スライダーは`.opacity(0.35)` + `.allowsHitTesting(false)` でグレーアウト表示。
+
+**変更ファイル**:
+
+| ファイル | 変更内容 |
+|---------|---------|
+| `CustomVideoCompositionInstruction.swift` | `cropPositionX: CGFloat = 0.5` / `cropPositionY: CGFloat = 0.5` プロパティ追加 |
+| `VerticalVideoCompositor.swift` | `cropPositionX` / `cropPositionY` インスタンス変数追加、`makeLetterboxImage()` でクロップ位置オフセットを適用 |
+| `VideoProcessor.swift` | `convertToVertical()` / `createComposition()` に `cropPositionX` / `cropPositionY` パラメータ追加 |
+| `ContentView.swift` | `ContentViewModel` に `cropPositionX` / `cropPositionY` 追加、Preview シートにスライダー UI、`CropPreviewView` / `CropPreviewThumbnail` にバインディング追加 |
+
+**技術的詳細**:
+
+- 縦位置（`cropPositionY`）は内部的に保持するが UI には露出しない（将来の拡張用）
+- `CropPreviewThumbnail.croppedImage()` は `AnyView` 型消去で fitWidth / fitHeight / center crop の 3 分岐を処理
+- 新規ファイル選択時に `cropPositionX = 0.5; cropPositionY = 0.5` にリセット
+
+### Phase 20: 設定の永続化（03-14）
+
+全変換設定を UserDefaults で保存し、次回起動時に自動復元する機能を追加。
+
+**変更ファイル**:
+
+| ファイル | 変更内容 |
+|---------|---------|
+| `ContentView.swift` | `SettingsKey` enum、`saveSettings()` / `restoreSettings()` メソッド、全 Published プロパティに `didSet { saveSettings() }` |
+| `ContentView.swift` | `saveOutputDirectoryBookmark()` / `restoreOutputDirectoryBookmark()` — Security-Scoped Bookmark による出力フォルダ永続化 |
+| `VerticalConverter_AppStore.entitlements` | `com.apple.security.files.bookmarks.app-scope = true` 追加 |
+| `PrivacyInfo.xcprivacy` | `NSPrivacyAccessedAPICategoryUserDefaults`（理由: CA92.1）を追加 |
+
+**技術的詳細**:
+
+- `isRestoringSettings` フラグで `restoreSettings()` 中の `didSet` による再帰的 `saveSettings()` 呼び出しを抑制
+- Security-Scoped Bookmark: `URL.bookmarkData(options: .withSecurityScope)` で作成、`URL(resolvingBookmarkDataWithOptions: .withSecurityScope)` で復元、`startAccessingSecurityScopedResource()` でアクセス権取得
+- Demo 版の `DemoWindowStartDate` / `DemoEncodeCount` とはキープレフィックスが異なる（`vc_` プレフィックス）ため干渉しない
 ````
 This is the description of what the code block changes:
 <changeDescription>

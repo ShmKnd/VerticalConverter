@@ -156,8 +156,43 @@ struct ContentView: View {
                 VStack(spacing: 12) {
                     CropPreviewView(
                         thumbnail: viewModel.thumbnail,
-                        selection: $viewModel.letterboxMode
+                        selection: $viewModel.letterboxMode,
+                        cropPositionX: $viewModel.cropPositionX,
+                        cropPositionY: $viewModel.cropPositionY
                     )
+
+                    // ── クロップ位置スライダー (水平のみ表示; 垂直は内部保持・UI非公開) ──
+                    // fitWidth はソース幅=出力幅なので水平クロップ不要 → グレーアウト
+                    VStack(spacing: 8) {
+                        Divider()
+                            .overlay(Color.primary.opacity(0.18))
+                        HStack(spacing: 8) {
+                            Label("Crop Position", systemImage: "crop")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(Color.primary.opacity(0.8))
+                            Spacer()
+                            Button("Reset") {
+                                withAnimation(.spring(response: 0.28, dampingFraction: 0.76)) {
+                                    viewModel.cropPositionX = 0.5
+                                    // cropPositionY は将来のUI再公開に備えて保持
+                                }
+                            }
+                            .font(.caption)
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.secondary)
+                        }
+                        HStack(spacing: 8) {
+                            Image(systemName: "arrow.left.and.right")
+                                .font(.caption)
+                                .foregroundStyle(Color.primary.opacity(0.6))
+                                .frame(width: 14)
+                            Slider(value: $viewModel.cropPositionX, in: 0...1)
+                                .tint(Color.primary.opacity(0.55))
+                        }
+                    }
+                    .padding(.bottom, 4)
+                    .opacity(viewModel.letterboxMode != .fitWidth ? 1.0 : 0.35)
+                    .allowsHitTesting(viewModel.letterboxMode != .fitWidth)
 
                     // ── サムネイル時刻指定シーク ──
                     if viewModel.videoDuration > 0 {
@@ -438,7 +473,12 @@ struct ContentView: View {
                 .background(.thinMaterial)
                 .clipShape(RoundedRectangle(cornerRadius: 20))
             } else {
-                CropPreviewView(thumbnail: viewModel.thumbnail, selection: $viewModel.letterboxMode)
+                CropPreviewView(
+                    thumbnail: viewModel.thumbnail,
+                    selection: $viewModel.letterboxMode,
+                    cropPositionX: $viewModel.cropPositionX,
+                    cropPositionY: $viewModel.cropPositionY
+                )
             }
         }
     }
@@ -827,6 +867,8 @@ private struct SlidingPicker<T: Hashable>: View {
 private struct CropPreviewView: View {
     let thumbnail: NSImage?
     @Binding var selection: CustomVideoCompositionInstruction.LetterboxMode
+    @Binding var cropPositionX: Double
+    @Binding var cropPositionY: Double
 
     /// 下段 3列の実アイテム幅を測定して上段 2列のサイズ合わせに使用
     @State private var itemWidth: CGFloat = 0
@@ -874,8 +916,14 @@ private struct CropPreviewView: View {
                 selection = mode
             }
         }) {
-            CropPreviewThumbnail(image: thumbnail, mode: mode, isSelected: selection == mode)
-                .contentShape(Rectangle())
+            CropPreviewThumbnail(
+                image: thumbnail,
+                mode: mode,
+                isSelected: selection == mode,
+                cropPositionX: selection == mode ? cropPositionX : 0.5,
+                cropPositionY: selection == mode ? cropPositionY : 0.5
+            )
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
@@ -885,6 +933,8 @@ private struct CropPreviewThumbnail: View {
     let image: NSImage?
     let mode: CustomVideoCompositionInstruction.LetterboxMode
     let isSelected: Bool
+    var cropPositionX: Double = 0.5
+    var cropPositionY: Double = 0.5
 
     var body: some View {
         ZStack {
@@ -902,7 +952,8 @@ private struct CropPreviewThumbnail: View {
                             .blur(radius: 18)
 
                         // 2) cropped sharp image according to selected mode
-                        croppedImage(img: img, canvasSize: canvasSize, mode: mode)
+                        croppedImage(img: img, canvasSize: canvasSize, mode: mode,
+                                     cropPositionX: cropPositionX, cropPositionY: cropPositionY)
                     }
                     .frame(width: canvasSize.width, height: canvasSize.height)
                 }
@@ -922,7 +973,10 @@ private struct CropPreviewThumbnail: View {
         .contentShape(Rectangle())
     }
     
-    private func croppedImage(img: NSImage, canvasSize: CGSize, mode: CustomVideoCompositionInstruction.LetterboxMode) -> some View {
+    private func croppedImage(img: NSImage, canvasSize: CGSize,
+                               mode: CustomVideoCompositionInstruction.LetterboxMode,
+                               cropPositionX: Double = 0.5,
+                               cropPositionY: Double = 0.5) -> some View {
         // Determine desired target aspect for cropping (width / height)
         let outputAspect: CGFloat = 9.0 / 16.0
         let targetAspect: CGFloat = {
@@ -939,41 +993,75 @@ private struct CropPreviewThumbnail: View {
             // Fit the source width to the canvas width (no horizontal crop).
             let scale = canvasSize.width / img.size.width
             let scaledHeight = img.size.height * scale
-
-            return Image(nsImage: img)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(width: canvasSize.width, height: scaledHeight)
-                .clipped()
-                .position(x: canvasSize.width * 0.5, y: canvasSize.height * 0.5)
+            let posY = scaledHeight * 0.5 + (canvasSize.height - scaledHeight) * CGFloat(cropPositionY)
+            return AnyView(
+                Image(nsImage: img)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: canvasSize.width, height: scaledHeight)
+                    .clipped()
+                    .position(x: canvasSize.width * 0.5, y: posY)
+            )
         } else if mode == .fitHeight {
             // Fit the source height to the canvas height (left/right crop).
             let scale = canvasSize.height / img.size.height
             let scaledWidth = img.size.width * scale
-
-            return Image(nsImage: img)
-                .resizable()
-                .aspectRatio(contentMode: .fill)
-                .frame(width: scaledWidth, height: canvasSize.height)
-                .clipped()
-                .position(x: canvasSize.width * 0.5, y: canvasSize.height * 0.5)
+            let posX = scaledWidth * 0.5 + (canvasSize.width - scaledWidth) * CGFloat(cropPositionX)
+            return AnyView(
+                Image(nsImage: img)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: scaledWidth, height: canvasSize.height)
+                    .clipped()
+                    .position(x: posX, y: canvasSize.height * 0.5)
+            )
         } else {
-            // For crop modes: create an image sized to canvas width and height matching targetAspect,
-            // then center it so it appears as the sharp crop area.
-            let croppedHeight = canvasSize.width / targetAspect
+            // For center crop modes: scale image so the crop region fills canvas width,
+            // then position to reflect the selected crop offset.
+            let sourceAspect = img.size.width / img.size.height
+            let cropW: CGFloat = sourceAspect > targetAspect ? img.size.height * targetAspect : img.size.width
+            let cropH: CGFloat = sourceAspect > targetAspect ? img.size.height : img.size.width / targetAspect
+            let scale = canvasSize.width / cropW
+            let scaledImgW = img.size.width * scale
+            let scaledImgH = img.size.height * scale
+            let croppedHeight = cropH * scale
 
-            return Image(nsImage: img)
-                .resizable()
-                .aspectRatio(contentMode: .fill)
-                .frame(width: canvasSize.width, height: croppedHeight)
-                .clipped()
-                .position(x: canvasSize.width * 0.5, y: canvasSize.height * 0.5)
+            // Canvas Y center of the cropped content (affected by cropPositionY)
+            let contentCenterY = (canvasSize.height - croppedHeight) * CGFloat(cropPositionY) + croppedHeight * 0.5
+
+            // Image center in canvas accounting for crop offset
+            let imageCenterX: CGFloat
+            let imageCenterY: CGFloat
+            if sourceAspect > targetAspect {
+                // Horizontal crop: shift image left/right
+                let cropX = (img.size.width - cropW) * CGFloat(cropPositionX)
+                imageCenterX = scaledImgW * 0.5 - cropX * scale
+                imageCenterY = contentCenterY
+            } else {
+                // Vertical crop: shift image up/down
+                let cropY = (img.size.height - cropH) * CGFloat(cropPositionY)
+                imageCenterX = canvasSize.width * 0.5
+                imageCenterY = scaledImgH * 0.5 - cropY * scale + (contentCenterY - croppedHeight * 0.5)
+            }
+
+            return AnyView(
+                Image(nsImage: img)
+                    .resizable()
+                    .frame(width: scaledImgW, height: scaledImgH)
+                    .position(x: imageCenterX, y: imageCenterY)
+            )
         }
     }
 }
 
 @MainActor
 class ContentViewModel: ObservableObject {
+
+    // MARK: - Init (restore persisted settings)
+
+    init() {
+        restoreSettings()
+    }
 
     // MARK: - ファイル選択（バッチ対応）
 
@@ -986,6 +1074,8 @@ class ContentViewModel: ObservableObject {
             } else {
                 self.hasConverted = false
                 self.thumbnailTime = 1.0
+                self.cropPositionX = 0.5
+                self.cropPositionY = 0.5
                 generateThumbnail()
                 loadVideoDuration()
             }
@@ -1000,23 +1090,183 @@ class ContentViewModel: ObservableObject {
     @Published var videoDuration: Double = 0.0
     /// プレビューでサムネイルを取得する時刻（秒）
     @Published var thumbnailTime: Double = 1.0
-    @Published var exportSettings = VideoExportSettings()
+    @Published var exportSettings = VideoExportSettings() {
+        didSet { saveSettings() }
+    }
     @Published var hasConverted: Bool = false
-    @Published var smartFramingEnabled: Bool = false
-    @Published var smartFramingSmoothness: SmartFramingSettings.Smoothness = .normal
-    @Published var letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth
-    @Published var hdrConversionEnabled: Bool = false
-    @Published var toneMappingMode: CustomVideoCompositionInstruction.ToneMappingMode = .natural
+    @Published var smartFramingEnabled: Bool = false {
+        didSet { saveSettings() }
+    }
+    @Published var smartFramingSmoothness: SmartFramingSettings.Smoothness = .normal {
+        didSet { saveSettings() }
+    }
+    @Published var letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth {
+        didSet { saveSettings() }
+    }
+    /// クロップ領域の水平位置 (0=左端, 0.5=中央, 1=右端).  fitWidth 以外で有効。
+    @Published var cropPositionX: Double = 0.5 {
+        didSet { saveSettings() }
+    }
+    /// クロップ領域の垂直位置 (0=上端, 0.5=中央, 1=下端).  fitHeight 以外で有効。
+    @Published var cropPositionY: Double = 0.5 {
+        didSet { saveSettings() }
+    }
+    @Published var hdrConversionEnabled: Bool = false {
+        didSet { saveSettings() }
+    }
+    @Published var toneMappingMode: CustomVideoCompositionInstruction.ToneMappingMode = .natural {
+        didSet { saveSettings() }
+    }
     @Published var isProcessing: Bool = false
     @Published var progress: Double = 0.0
     @Published var phaseLabel: String = ""
     @Published var statusMessage: String = ""
     @Published var hasError: Bool = false
     /// サンドボックス環境で使用する出力先ディレクトリ（ユーザーが明示的に選択）
-    @Published var outputDirectoryURL: URL? = nil
+    @Published var outputDirectoryURL: URL? = nil {
+        didSet { saveOutputDirectoryBookmark() }
+    }
 
     private let videoProcessor = VideoProcessor()
     private var conversionTask: Task<Void, Never>?
+    /// UserDefaults 復元中の無限ループを防止
+    private var isRestoringSettings = false
+
+    // MARK: - Settings Persistence (UserDefaults)
+
+    private enum SettingsKey {
+        static let resolution = "vc_resolution"
+        static let frameRate = "vc_frameRate"
+        static let codec = "vc_codec"
+        static let container = "vc_container"
+        static let bitrate = "vc_bitrate"
+        static let encodingMode = "vc_encodingMode"
+        static let cropMode = "vc_cropMode"
+        static let cropPositionX = "vc_cropPositionX"
+        static let smartFraming = "vc_smartFraming"
+        static let smartFramingSmoothness = "vc_smartFramingSmoothness"
+        static let hdrConversion = "vc_hdrConversion"
+        static let toneMappingMode = "vc_toneMappingMode"
+        static let outputDirBookmark = "vc_outputDirBookmark"
+    }
+
+    func restoreSettings() {
+        isRestoringSettings = true
+        defer { isRestoringSettings = false }
+        let d = UserDefaults.standard
+
+        // Export settings
+        if let raw = d.string(forKey: SettingsKey.resolution),
+           let val = VideoExportSettings.Resolution(rawValue: raw) {
+            exportSettings.resolution = val
+        }
+        if let raw = d.string(forKey: SettingsKey.frameRate),
+           let val = VideoExportSettings.FrameRate(rawValue: raw) {
+            exportSettings.frameRate = val
+        }
+        if let raw = d.string(forKey: SettingsKey.codec),
+           let val = VideoExportSettings.Codec(rawValue: raw) {
+            exportSettings.codec = val
+        }
+        if let raw = d.string(forKey: SettingsKey.container),
+           let val = VideoExportSettings.ContainerFormat(rawValue: raw) {
+            exportSettings.containerFormat = val
+        }
+        if d.object(forKey: SettingsKey.bitrate) != nil {
+            exportSettings.bitrate = d.integer(forKey: SettingsKey.bitrate)
+        }
+        if let raw = d.string(forKey: SettingsKey.encodingMode),
+           let val = VideoExportSettings.EncodingMode(rawValue: raw) {
+            exportSettings.encodingMode = val
+        }
+
+        // Crop
+        if d.object(forKey: SettingsKey.cropMode) != nil,
+           let val = CustomVideoCompositionInstruction.LetterboxMode(rawValue: d.integer(forKey: SettingsKey.cropMode)) {
+            letterboxMode = val
+        }
+        if d.object(forKey: SettingsKey.cropPositionX) != nil {
+            cropPositionX = d.double(forKey: SettingsKey.cropPositionX)
+        }
+
+        // Smart Framing
+        if d.object(forKey: SettingsKey.smartFraming) != nil {
+            smartFramingEnabled = d.bool(forKey: SettingsKey.smartFraming)
+        }
+        if let raw = d.string(forKey: SettingsKey.smartFramingSmoothness),
+           let val = SmartFramingSettings.Smoothness(rawValue: raw) {
+            smartFramingSmoothness = val
+        }
+
+        // HDR
+        if d.object(forKey: SettingsKey.hdrConversion) != nil {
+            hdrConversionEnabled = d.bool(forKey: SettingsKey.hdrConversion)
+        }
+        if d.object(forKey: SettingsKey.toneMappingMode) != nil,
+           let val = CustomVideoCompositionInstruction.ToneMappingMode(rawValue: d.integer(forKey: SettingsKey.toneMappingMode)) {
+            toneMappingMode = val
+        }
+
+        // Output directory (Security-Scoped Bookmark)
+        restoreOutputDirectoryBookmark()
+    }
+
+    private func saveSettings() {
+        guard !isRestoringSettings else { return }
+        let d = UserDefaults.standard
+        d.set(exportSettings.resolution.rawValue, forKey: SettingsKey.resolution)
+        d.set(exportSettings.frameRate.rawValue, forKey: SettingsKey.frameRate)
+        d.set(exportSettings.codec.rawValue, forKey: SettingsKey.codec)
+        d.set(exportSettings.containerFormat.rawValue, forKey: SettingsKey.container)
+        d.set(exportSettings.bitrate, forKey: SettingsKey.bitrate)
+        d.set(exportSettings.encodingMode.rawValue, forKey: SettingsKey.encodingMode)
+        d.set(letterboxMode.rawValue, forKey: SettingsKey.cropMode)
+        d.set(cropPositionX, forKey: SettingsKey.cropPositionX)
+        d.set(smartFramingEnabled, forKey: SettingsKey.smartFraming)
+        d.set(smartFramingSmoothness.rawValue, forKey: SettingsKey.smartFramingSmoothness)
+        d.set(hdrConversionEnabled, forKey: SettingsKey.hdrConversion)
+        d.set(toneMappingMode.rawValue, forKey: SettingsKey.toneMappingMode)
+    }
+
+    private func saveOutputDirectoryBookmark() {
+        guard !isRestoringSettings else { return }
+        let d = UserDefaults.standard
+        guard let url = outputDirectoryURL else {
+            d.removeObject(forKey: SettingsKey.outputDirBookmark)
+            return
+        }
+        do {
+            let bookmark = try url.bookmarkData(
+                options: .withSecurityScope,
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            )
+            d.set(bookmark, forKey: SettingsKey.outputDirBookmark)
+        } catch {
+            NSLog("ContentViewModel: failed to create bookmark for output dir: %@", error.localizedDescription)
+        }
+    }
+
+    private func restoreOutputDirectoryBookmark() {
+        guard let data = UserDefaults.standard.data(forKey: SettingsKey.outputDirBookmark) else { return }
+        do {
+            var isStale = false
+            let url = try URL(resolvingBookmarkData: data,
+                              options: .withSecurityScope,
+                              relativeTo: nil,
+                              bookmarkDataIsStale: &isStale)
+            if url.startAccessingSecurityScopedResource() {
+                outputDirectoryURL = url
+                // Re-save if bookmark was stale
+                if isStale {
+                    saveOutputDirectoryBookmark()
+                }
+            }
+        } catch {
+            NSLog("ContentViewModel: failed to restore output dir bookmark: %@", error.localizedDescription)
+            UserDefaults.standard.removeObject(forKey: SettingsKey.outputDirBookmark)
+        }
+    }
 
     // MARK: - ファイル選択パネル
 
@@ -1196,6 +1446,8 @@ class ContentViewModel: ObservableObject {
         let capturedExportSettings = exportSettings
         let smartSettings = SmartFramingSettings(enabled: smartFramingEnabled, smoothness: smartFramingSmoothness)
         let lboxMode = letterboxMode
+        let capturedCropPositionX = CGFloat(cropPositionX)
+        let capturedCropPositionY = CGFloat(cropPositionY)
         let hdrEnabled = hdrConversionEnabled
         let toneMode = toneMappingMode
         let total = urlsToProcess.count
@@ -1233,6 +1485,8 @@ class ContentViewModel: ObservableObject {
                         exportSettings: capturedExportSettings,
                         smartFramingSettings: smartSettings,
                         letterboxMode: lboxMode,
+                        cropPositionX: capturedCropPositionX,
+                        cropPositionY: capturedCropPositionY,
                         hdrConversionEnabled: hdrEnabled,
                         toneMappingMode: toneMode,
                         progressHandler: { prog, label in
