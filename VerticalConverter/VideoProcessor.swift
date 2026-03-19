@@ -667,6 +667,106 @@ actor VideoProcessor {
               writeStart - setupDone,
               remuxEnd - writeStart)
     }
+    
+    /// Generic container remux for MPEG-TS inputs (.mts/.m2ts/.ts).
+    /// Copies compressed samples into a .mov container without re-encoding.
+    private func remuxTSContainerToMov(
+        inputURL: URL,
+        outputURL: URL,
+        progressHandler: @escaping (Double) -> Void
+    ) async throws {
+        let asset = AVAsset(url: inputURL)
+        guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
+            throw VideoProcessorError.invalidInput
+        }
+
+        let origDesc = videoTrack.formatDescriptions.first as! CMFormatDescription
+
+        let reader = try AVAssetReader(asset: asset)
+        let videoOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
+        videoOutput.alwaysCopiesSampleData = false
+        guard reader.canAdd(videoOutput) else { throw VideoProcessorError.exportFailed }
+        reader.add(videoOutput)
+
+        let audioTrack = try? await asset.loadTracks(withMediaType: .audio).first
+        var audioOutput: AVAssetReaderTrackOutput? = nil
+        if let aTrack = audioTrack {
+            let aOut = AVAssetReaderTrackOutput(track: aTrack, outputSettings: nil)
+            aOut.alwaysCopiesSampleData = false
+            if reader.canAdd(aOut) { reader.add(aOut); audioOutput = aOut }
+        }
+
+        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
+
+        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: origDesc)
+        videoInput.expectsMediaDataInRealTime = false
+        guard writer.canAdd(videoInput) else { throw VideoProcessorError.exportFailed }
+        writer.add(videoInput)
+
+        var audioInput: AVAssetWriterInput? = nil
+        if let aOut = audioOutput, let aTrack = audioTrack {
+            if let firstDescAny = aTrack.formatDescriptions.first {
+                let aDesc = firstDescAny as! CMFormatDescription
+                let aIn = AVAssetWriterInput(mediaType: .audio, outputSettings: nil, sourceFormatHint: aDesc)
+                aIn.expectsMediaDataInRealTime = false
+                if writer.canAdd(aIn) { writer.add(aIn); audioInput = aIn }
+            }
+        }
+
+        writer.startWriting()
+        writer.startSession(atSourceTime: .zero)
+        reader.startReading()
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                    videoInput.requestMediaDataWhenReady(on: DispatchQueue(label: "remux.video")) {
+                        while videoInput.isReadyForMoreMediaData {
+                            autoreleasepool {
+                                guard let sample = videoOutput.copyNextSampleBuffer() else {
+                                    videoInput.markAsFinished()
+                                    cont.resume()
+                                    return
+                                }
+                                if CMSampleBufferGetNumSamples(sample) == 0 { return }
+                                if !videoInput.append(sample) {
+                                    videoInput.markAsFinished()
+                                    cont.resume(throwing: VideoProcessorError.exportFailed)
+                                    return
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let aOut = audioOutput, let aIn = audioInput {
+                group.addTask {
+                    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                        aIn.requestMediaDataWhenReady(on: DispatchQueue(label: "remux.audio")) {
+                            while aIn.isReadyForMoreMediaData {
+                                autoreleasepool {
+                                    guard let sample = aOut.copyNextSampleBuffer() else {
+                                        aIn.markAsFinished()
+                                        cont.resume()
+                                        return
+                                    }
+                                    aIn.append(sample)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            try await group.waitForAll()
+        }
+
+        await writer.finishWriting()
+        if writer.status == .failed {
+            throw writer.error ?? VideoProcessorError.exportFailed
+        }
+    }
     func convertToVertical(
         inputURL: URL,
         outputURL: URL,
@@ -746,7 +846,16 @@ actor VideoProcessor {
                 try? FileManager.default.removeItem(at: tmp)
             }
         }
-        
+        // ── Reject certain containers early: we only accept MP4/AVCHD inputs.
+        // MPEG-TS inputs (.mts/.m2ts/.ts) have produced unstable sample delivery
+        // in the past; rather than remuxing automatically, reject them here to
+        // minimize pipeline side-effects and keep behavior consistent.
+        let ext = inputURL.pathExtension.lowercased()
+        if ["mts", "m2ts", "ts"].contains(ext) {
+            NSLog("VideoProcessor: rejected input container (.%@) — only MP4/AVCHD is accepted.", ext)
+            throw VideoProcessorError.unsupportedFormat
+        }
+
         let asset = AVAsset(url: effectiveInputURL)
 
         // 動画トラックを取得
@@ -757,10 +866,27 @@ actor VideoProcessor {
         let naturalSize = try await videoTrack.load(.naturalSize)
         let preferredTransform = try await videoTrack.load(.preferredTransform)
         
-        // トランスフォームを適用してサイズを調整
-        let videoSize = naturalSize.applying(preferredTransform)
+        // PAR (Pixel Aspect Ratio) を考慮した表示寸法を取得。
+        // AVCHD 1440×1080 (PAR 4:3) → 表示 1920×1080 等の非正方形ピクセル入力に対応。
+        // naturalSize はピクセル寸法のみで PAR を反映しない。
+        let displaySize: CGSize
+        if let desc = videoTrack.formatDescriptions.first {
+            let fmtDesc = desc as! CMFormatDescription
+            displaySize = CMVideoFormatDescriptionGetPresentationDimensions(
+                fmtDesc, usePixelAspectRatio: true, useCleanAperture: false)
+        } else {
+            displaySize = naturalSize
+        }
+        
+        // トランスフォームを適用してサイズを調整（ローテーション対応）
+        let videoSize = displaySize.applying(preferredTransform)
         let width = abs(videoSize.width)
         let height = abs(videoSize.height)
+        if displaySize != naturalSize {
+            NSLog("VideoProcessor: PAR correction — pixel %@×%@ → display %@×%@",
+                  "\(Int(naturalSize.width))", "\(Int(naturalSize.height))",
+                  "\(Int(width))", "\(Int(height))")
+        }
         
         // 出力サイズを計算（9:16の縦型）
         let (resW, resH) = exportSettings.resolution.outputSize
@@ -1236,13 +1362,19 @@ actor VideoProcessor {
 
 
         // キャンセル用トークン（DispatchQueueで保護）
-        class CancelToken {
+        final class CancelToken: @unchecked Sendable {
             private let q = DispatchQueue(label: "cancel.token.lock")
             private var _cancelled: Bool = false
             func cancel() { q.sync { _cancelled = true } }
             func isCancelled() -> Bool { q.sync { _cancelled } }
         }
         let cancelToken = CancelToken()
+
+        // Capture immutable references for the cancellation handler so we
+        // don't capture mutable vars (which is forbidden in concurrently-
+        // executing contexts under Swift concurrency).
+        let cancelVideoInput = videoInput
+        let cancelAudioInput = audioInput
 
         reader.startReading()
         let readerStartErr = reader.error?.localizedDescription ?? "none"

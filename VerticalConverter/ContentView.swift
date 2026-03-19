@@ -98,14 +98,11 @@ struct ContentView: View {
                         Text("Convert 16:9 → 9:16")
                             .font(.subheadline)
                             .foregroundStyle(Color.primary.opacity(0.75))
-                        Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
                         #if EDITION_DEMO
                         demoStatusLabel
                         #endif
                     }
-                    .padding(.top, 22)
+                    .padding(.top, 14)
 
                     dropZone
                         .frame(maxWidth: .infinity)
@@ -161,23 +158,23 @@ struct ContentView: View {
                         cropPositionY: $viewModel.cropPositionY
                     )
 
-                    // ── クロップ位置スライダー (水平のみ表示; 垂直は内部保持・UI非公開) ──
-                    // fitWidth はソース幅=出力幅なので水平クロップ不要 → グレーアウト
+                    // ── クロップ位置スライダー (水平のみ表示、垂直は内部保持・UI非公開) ──
                     VStack(spacing: 8) {
                         Divider()
                             .overlay(Color.primary.opacity(0.18))
                         HStack(spacing: 8) {
-                            Label("Crop Position", systemImage: "crop")
+                            Label("Center Position", systemImage: "arrow.left.and.right")
                                 .font(.caption.weight(.medium))
                                 .foregroundStyle(Color.primary.opacity(0.8))
                             Spacer()
-                            Button("Reset") {
+                            Button {
                                 withAnimation(.spring(response: 0.28, dampingFraction: 0.76)) {
                                     viewModel.cropPositionX = 0.5
-                                    // cropPositionY は将来のUI再公開に備えて保持
                                 }
+                            } label: {
+                                Image(systemName: "arrow.counterclockwise")
+                                    .font(.caption)
                             }
-                            .font(.caption)
                             .buttonStyle(.plain)
                             .foregroundStyle(.secondary)
                         }
@@ -572,17 +569,32 @@ struct ContentView: View {
             .allowsHitTesting(!viewModel.smartFramingEnabled)
 
             panelDivider
-            HStack(spacing: 10) {
-                HStack(spacing: 8) {
-                    Image(systemName: "folder")
-                        .font(.system(size: 16))
-                        .frame(width: 20, alignment: .center)
-                    Text("Output")
-                        .font(.subheadline.weight(.medium))
-                }
-                .foregroundStyle(.primary)
-                .frame(width: 115, alignment: .leading)
 
+            // ── クロップ位置スライダー（Crop行直下）──
+            // fitWidth はソース幅＝出力幅なので水平クロップ不要 → グレーアウト
+            // Smart Framing ON 時も非適用なのでグレーアウト
+            settingRow(label: "Center Pos", icon: "arrow.left.and.right",
+                       tooltip: "Horizontal crop center position. Disabled for Fit W (no horizontal crop needed).") {
+                Slider(value: $viewModel.cropPositionX, in: 0...1)
+                    .tint(Color.primary.opacity(0.55))
+                Button {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.76)) {
+                        viewModel.cropPositionX = 0.5
+                    }
+                } label: {
+                    Image(systemName: "arrow.counterclockwise")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            .opacity((viewModel.letterboxMode != .fitWidth && !viewModel.smartFramingEnabled && !viewModel.selectedVideoURLs.isEmpty) ? 1.0 : 0.35)
+            .allowsHitTesting(viewModel.letterboxMode != .fitWidth && !viewModel.smartFramingEnabled && !viewModel.selectedVideoURLs.isEmpty)
+
+            panelDivider
+
+            settingRow(label: "Output", icon: "folder",
+                       tooltip: "Output folder for exported files. Defaults to same folder as input.") {
                 Button {
                     viewModel.selectOutputDirectory()
                 } label: {
@@ -801,6 +813,7 @@ struct ContentView: View {
 
             picker()
         }
+        .frame(minHeight: 30)
         .help(tooltip)
     }
 
