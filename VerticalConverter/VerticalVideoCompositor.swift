@@ -64,6 +64,9 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     private var currentPrecomputedOffsets: [CGPoint]? = nil    
     // レターボックスモード
     private var letterboxMode: CustomVideoCompositionInstruction.LetterboxMode = .fitWidth
+    // クロップ位置オフセット (0=左/上, 0.5=中央, 1=右/下)
+    private var cropPositionX: CGFloat = 0.5
+    private var cropPositionY: CGFloat = 0.5
     // HDR -> SDR
     private var hdrConversionEnabled: Bool = false
     private var toneMappingMode: CustomVideoCompositionInstruction.ToneMappingMode = .natural
@@ -522,6 +525,8 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             self.dampingFactor = instruction.dampingFactor
             self.currentPrecomputedOffsets = instruction.precomputedOffsets
             self.letterboxMode = instruction.letterboxMode
+            self.cropPositionX = instruction.cropPositionX
+            self.cropPositionY = instruction.cropPositionY
             // HDR settings
             let hdrEnabled = instruction.hdrConversionEnabled
             // store in local vars for composeFrame
@@ -773,7 +778,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             let scaledWidth = sourceSize.width * scale
             let scaledHeight = sourceSize.height * scale
             let mainX = (renderSize.width - scaledWidth) / 2
-            let mainY = (renderSize.height - scaledHeight) / 2
+            let mainY = (renderSize.height - scaledHeight) * cropPositionY  // 垂直位置オフセット適用
 
             let mainVideo = sourceImage
                 .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
@@ -797,7 +802,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         if mode == .fitHeight {
             let scale = renderSize.height / sourceSize.height
             let scaledWidth = sourceSize.width * scale
-            let mainX = (renderSize.width - scaledWidth) / 2  // 負値 → 左右が画面外へ
+            let mainX = (renderSize.width - scaledWidth) * cropPositionX  // 水平位置オフセット適用
 
             let mainVideo = sourceImage
                 .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
@@ -825,12 +830,12 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         if sourceAspect > targetAspect {
             // 元が横長 -> 横をトリミング
             let cropW = sourceSize.height * targetAspect
-            let cropX = (sourceSize.width - cropW) / 2
+            let cropX = (sourceSize.width - cropW) * cropPositionX  // 水平位置オフセット適用
             cropRect = CGRect(x: cropX, y: 0, width: cropW, height: sourceSize.height)
         } else {
             // 元が縦長または同等 -> 縦をトリミング
             let cropH = sourceSize.width / targetAspect
-            let cropY = (sourceSize.height - cropH) / 2
+            let cropY = (sourceSize.height - cropH) * cropPositionY  // 垂直位置オフセット適用
             cropRect = CGRect(x: 0, y: cropY, width: sourceSize.width, height: cropH)
         }
 
@@ -839,7 +844,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         // メイン映像は幅に合わせてスケール（左右を若干トリミングして中央を強調）
         let scale = renderSize.width / cropRect.width
         let scaledHeight = cropRect.height * scale
-        let mainY = (renderSize.height - scaledHeight) / 2
+        let mainY = (renderSize.height - scaledHeight) * cropPositionY  // 垂直位置オフセット適用
 
         // cropped の座標原点が cropRect.origin になるため、変換時に原点オフセットを打ち消す
         let translateX = -cropRect.origin.x * scale + (renderSize.width - cropRect.width * scale) / 2
