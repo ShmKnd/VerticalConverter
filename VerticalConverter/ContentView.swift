@@ -7,7 +7,13 @@
 
 import SwiftUI
 import UniformTypeIdentifiers
+#if os(macOS)
 import AppKit
+typealias PlatformImage = NSImage
+#else
+import UIKit
+typealias PlatformImage = UIImage
+#endif
 @preconcurrency import AVFoundation
 
 /// macOS 14+: `.symbolEffect(.pulse)` を適用し、macOS 13 では何もしない。
@@ -23,8 +29,52 @@ private struct PulseEffectModifier: ViewModifier {
     }
 }
 
-/// ウィンドウの横幅を固定しつつ縦方向のリサイズだけ許可する
+// Helper to build a SwiftUI Image from platform image (NSImage/UIImage)
+private extension Image {
+    init(platformImage: PlatformImage?) {
+        #if os(macOS)
+        if let img = platformImage { self.init(nsImage: img) }
+        else { self.init(systemName: "photo") }
+        #else
+        if let img = platformImage { self.init(uiImage: img) }
+        else { self.init(systemName: "photo") }
+        #endif
+    }
+
+}
+
+// MARK: - iOS Document Picker (top-level)
+#if os(iOS)
+struct DocumentPicker: UIViewControllerRepresentable {
+    let contentTypes: [UTType]
+    let allowsMultipleSelection: Bool
+    let onPick: ([URL]) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick) }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let vc = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes, asCopy: false)
+        vc.allowsMultipleSelection = allowsMultipleSelection
+        vc.delegate = context.coordinator
+        return vc
+    }
+
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+
+    class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let onPick: ([URL]) -> Void
+        init(onPick: @escaping ([URL]) -> Void) { self.onPick = onPick }
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            onPick(urls)
+        }
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {}
+    }
+}
+#endif
+
+#if os(macOS)
 private struct WindowWidthConstrainer: NSViewRepresentable {
+
     private class WindowDelegateProxy: NSObject, NSWindowDelegate {
         weak var originalDelegate: NSWindowDelegate?
 
@@ -66,6 +116,11 @@ private struct WindowWidthConstrainer: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSView, context: Context) {}
 }
+#else
+private struct WindowWidthConstrainer: View {
+    var body: some View { EmptyView() }
+}
+#endif
 
 struct ContentView: View {
     @StateObject private var viewModel = ContentViewModel()
@@ -75,8 +130,13 @@ struct ContentView: View {
     var body: some View {
         ZStack {
             // Liquid Glass が映える鮮やかなグラデーション背景
+#if os(macOS)
             Color(nsColor: NSColor.windowBackgroundColor)
-            .ignoresSafeArea()
+                .ignoresSafeArea()
+#else
+            Color(UIColor.systemBackground)
+                .ignoresSafeArea()
+#endif
 
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: 12) {
@@ -105,7 +165,11 @@ struct ContentView: View {
                         demoStatusLabel
                         #endif
                     }
+#if os(macOS)
                     .padding(.top, 22)
+#else
+                    .padding(.top, 12)
+#endif
 
                     dropZone
                         .frame(maxWidth: .infinity)
@@ -123,17 +187,27 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .padding(.horizontal, 20)
+#if os(macOS)
                 .padding(.bottom, 36)
+#else
+                .padding(.bottom, 12)
+#endif
+                #if os(macOS)
                 .frame(width: 560)
+                #endif
             }
         }
+        #if os(macOS)
         .background(WindowWidthConstrainer())
+        #endif
+    #if os(macOS)
         .frame(
             minWidth: 560, idealWidth: 560, maxWidth: 560,
             minHeight: 600,
             idealHeight: min(1040, (NSScreen.main?.visibleFrame.height ?? 960) - 28),
             maxHeight: min(1040, (NSScreen.main?.visibleFrame.height ?? 960) - 28)
         )
+    #endif
         .sheet(isPresented: $showingCropPreview) {
             VStack(spacing: 0) {
                 // ── ヘッダー ──
@@ -195,7 +269,33 @@ struct ContentView: View {
             .frame(width: 480)
             .fixedSize(horizontal: false, vertical: true)
         }
+        #if os(iOS)
+        .sheet(isPresented: $showingDocumentPicker) {
+            DocumentPicker(contentTypes: [UTType.movie], allowsMultipleSelection: true) { urls in
+                if !urls.isEmpty {
+                    viewModel.selectedVideoURLs = urls
+                }
+                showingDocumentPicker = false
+            }
+        }
+        .sheet(isPresented: $showingOutputPicker) {
+            DocumentPicker(contentTypes: [UTType.folder], allowsMultipleSelection: false) { urls in
+                if let url = urls.first {
+                    viewModel.outputDirectoryURL = url
+                    // iOS: 出力先を選択したら自動で変換を開始する（ユーザー操作フローの簡素化）
+                    viewModel.convertVideo()
+                }
+                showingOutputPicker = false
+            }
+        }
+        #endif
     }
+
+    // iOS: document picker state
+    #if os(iOS)
+    @State private var showingDocumentPicker: Bool = false
+    @State private var showingOutputPicker: Bool = false
+    #endif
 
     // MARK: - Demo Status Label
 
@@ -225,7 +325,7 @@ struct ContentView: View {
         ZStack {
             // ── サムネイル背景（単体ファイル読み込み時のみ、文字UIの後ろにうっすら表示）──
             if let thumb = viewModel.thumbnail, !isTargeted, viewModel.selectedVideoURLs.count == 1 {
-                Image(nsImage: thumb)
+                Image(platformImage: thumb)
                     .resizable()
                     .scaledToFill()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -250,7 +350,11 @@ struct ContentView: View {
                         .font(.caption)
                         .foregroundStyle(Color.primary.opacity(0.6))
                     Button("Select File") {
+                        #if os(macOS)
                         viewModel.selectFile()
+                        #else
+                        showingDocumentPicker = true
+                        #endif
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(Color.primary.opacity(0.2))
@@ -371,7 +475,11 @@ struct ContentView: View {
                         .font(.caption)
                         .foregroundStyle(Color.primary.opacity(0.6))
                     Button("Select File") {
+                        #if os(macOS)
                         viewModel.selectFile()
+                        #else
+                        showingDocumentPicker = true
+                        #endif
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(Color.primary.opacity(0.2))
@@ -544,7 +652,11 @@ struct ContentView: View {
                 .frame(width: 115, alignment: .leading)
 
                 Button {
+                    #if os(macOS)
                     viewModel.selectOutputDirectory()
+                    #else
+                    showingOutputPicker = true
+                    #endif
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: "folder.badge.plus")
@@ -671,7 +783,15 @@ struct ContentView: View {
                 .tint(.red.opacity(0.65))
             } else {
                 Button {
+                    #if os(iOS)
+                    if viewModel.outputDirectoryURL == nil {
+                        showingOutputPicker = true
+                    } else {
+                        viewModel.convertVideo()
+                    }
+                    #else
                     viewModel.convertVideo()
+                    #endif
                 } label: {
                     HStack {
                         Image(systemName: "arrow.triangle.2.circlepath")
@@ -825,7 +945,7 @@ private struct SlidingPicker<T: Hashable>: View {
 // MARK: - Crop Preview
 
 private struct CropPreviewView: View {
-    let thumbnail: NSImage?
+    let thumbnail: PlatformImage?
     @Binding var selection: CustomVideoCompositionInstruction.LetterboxMode
 
     /// 下段 3列の実アイテム幅を測定して上段 2列のサイズ合わせに使用
@@ -882,7 +1002,7 @@ private struct CropPreviewView: View {
 }
 
 private struct CropPreviewThumbnail: View {
-    let image: NSImage?
+    let image: PlatformImage?
     let mode: CustomVideoCompositionInstruction.LetterboxMode
     let isSelected: Bool
 
@@ -894,7 +1014,7 @@ private struct CropPreviewThumbnail: View {
 
                     ZStack {
                         // 1) blurred background fills the 9:16 canvas
-                        Image(nsImage: img)
+                        Image(platformImage: img)
                             .resizable()
                             .scaledToFill()
                             .frame(width: canvasSize.width, height: canvasSize.height)
@@ -922,7 +1042,7 @@ private struct CropPreviewThumbnail: View {
         .contentShape(Rectangle())
     }
     
-    private func croppedImage(img: NSImage, canvasSize: CGSize, mode: CustomVideoCompositionInstruction.LetterboxMode) -> some View {
+    private func croppedImage(img: PlatformImage, canvasSize: CGSize, mode: CustomVideoCompositionInstruction.LetterboxMode) -> some View {
         // Determine desired target aspect for cropping (width / height)
         let outputAspect: CGFloat = 9.0 / 16.0
         let targetAspect: CGFloat = {
@@ -935,12 +1055,12 @@ private struct CropPreviewThumbnail: View {
             }
         }()
 
-        if mode == .fitWidth {
+            if mode == .fitWidth {
             // Fit the source width to the canvas width (no horizontal crop).
             let scale = canvasSize.width / img.size.width
             let scaledHeight = img.size.height * scale
 
-            return Image(nsImage: img)
+            return Image(platformImage: img)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
                 .frame(width: canvasSize.width, height: scaledHeight)
@@ -951,7 +1071,7 @@ private struct CropPreviewThumbnail: View {
             let scale = canvasSize.height / img.size.height
             let scaledWidth = img.size.width * scale
 
-            return Image(nsImage: img)
+            return Image(platformImage: img)
                 .resizable()
                 .aspectRatio(contentMode: .fill)
                 .frame(width: scaledWidth, height: canvasSize.height)
@@ -962,7 +1082,7 @@ private struct CropPreviewThumbnail: View {
             // then center it so it appears as the sharp crop area.
             let croppedHeight = canvasSize.width / targetAspect
 
-            return Image(nsImage: img)
+            return Image(platformImage: img)
                 .resizable()
                 .aspectRatio(contentMode: .fill)
                 .frame(width: canvasSize.width, height: croppedHeight)
@@ -995,7 +1115,7 @@ class ContentViewModel: ObservableObject {
     /// 後方互換用: 先頭 URL（単体ファイルモードや UI 表示に使用）
     var selectedVideoURL: URL? { selectedVideoURLs.first }
 
-    @Published var thumbnail: NSImage? = nil
+    @Published var thumbnail: PlatformImage? = nil
     /// 動画の総デュレーション（秒）。0 はまだ取得できていないか不明。
     @Published var videoDuration: Double = 0.0
     /// プレビューでサムネイルを取得する時刻（秒）
@@ -1021,6 +1141,7 @@ class ContentViewModel: ObservableObject {
     // MARK: - ファイル選択パネル
 
     func selectFile() {
+        #if os(macOS)
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true   // 複数選択対応
         panel.canChooseDirectories = false
@@ -1031,10 +1152,14 @@ class ContentViewModel: ObservableObject {
             self.selectedVideoURLs = panel.urls
             self.hasConverted = false
         }
+        #else
+        // iOS: leave as a no-op; UI should provide alternative file-picker if needed.
+        #endif
     }
 
     /// 出力先ディレクトリをユーザーに選択させる（サンドボックス環境で書き込み権限を取得するため）
     func selectOutputDirectory() {
+        #if os(macOS)
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = true
@@ -1051,6 +1176,9 @@ class ContentViewModel: ObservableObject {
         if panel.runModal() == .OK, let url = panel.url {
             self.outputDirectoryURL = url
         }
+        #else
+        // iOS: no-op placeholder — implement UIDocumentPicker-based flow if needed.
+        #endif
     }
 
     // MARK: - D&D（複数ファイル対応）
@@ -1063,34 +1191,45 @@ class ContentViewModel: ObservableObject {
         var completedCount = 0
         var loadedURLs: [URL] = []
 
-        func finalize() {
-            // lock キューで呼ぶこと
-            completedCount += 1
-            if completedCount == total {
-                let urls = loadedURLs
-                DispatchQueue.main.async {
-                    if !urls.isEmpty {
-                        self.selectedVideoURLs = urls
-                        self.hasConverted = false
-                    }
-                }
-            }
-        }
+        // finalize のローカル関数は MainActor 隔離の警告を生むため、
+        // 呼び出し箇所でインライン化する（lock キュー内で実行される想定）。
 
         for provider in providers {
+            // Do not capture the provider inside @Sendable closures to avoid Sendable warnings.
+
             if provider.canLoadObject(ofClass: NSURL.self) {
                 provider.loadObject(ofClass: NSURL.self) { (obj, _) in
+                    // handle loaded NSURL from provider
                     lock.async {
                         if let nsurl = obj as? NSURL { loadedURLs.append(nsurl as URL) }
-                        finalize()
+                        completedCount += 1
+                        if completedCount == total {
+                            let urls = loadedURLs
+                            DispatchQueue.main.async {
+                                if !urls.isEmpty {
+                                    self.selectedVideoURLs = urls
+                                    self.hasConverted = false
+                                }
+                            }
+                        }
                     }
                 }
             } else {
                 provider.loadFileRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { (tempURL, _) in
+                    // handle temp file URL from provider
                     if let temp = tempURL {
                         lock.async {
                             loadedURLs.append(temp)
-                            finalize()
+                            completedCount += 1
+                            if completedCount == total {
+                                let urls = loadedURLs
+                                DispatchQueue.main.async {
+                                    if !urls.isEmpty {
+                                        self.selectedVideoURLs = urls
+                                        self.hasConverted = false
+                                    }
+                                }
+                            }
                         }
                     } else {
                         // フォールバック: loadItem で再試行
@@ -1103,7 +1242,16 @@ class ContentViewModel: ObservableObject {
                                 } else if let nsurl = item as? NSURL {
                                     loadedURLs.append(nsurl as URL)
                                 }
-                                finalize()
+                                completedCount += 1
+                                if completedCount == total {
+                                    let urls = loadedURLs
+                                    DispatchQueue.main.async {
+                                        if !urls.isEmpty {
+                                            self.selectedVideoURLs = urls
+                                            self.hasConverted = false
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1134,15 +1282,23 @@ class ContentViewModel: ObservableObject {
             do {
                 var actual = CMTime.zero
                 let cgImage = try generator.copyCGImage(at: seekTime, actualTime: &actual)
-                let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-                DispatchQueue.main.async { self.thumbnail = nsImage }
+                #if os(macOS)
+                let platformImg = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+                #else
+                let platformImg = UIImage(cgImage: cgImage)
+                #endif
+                DispatchQueue.main.async { self.thumbnail = platformImg }
             } catch {
                 // フォールバック: 先頭フレームを取得
                 do {
                     var actual = CMTime.zero
                     let cgImage = try generator.copyCGImage(at: .zero, actualTime: &actual)
-                    let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-                    DispatchQueue.main.async { self.thumbnail = nsImage }
+                    #if os(macOS)
+                    let platformImg = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+                    #else
+                    let platformImg = UIImage(cgImage: cgImage)
+                    #endif
+                    DispatchQueue.main.async { self.thumbnail = platformImg }
                 } catch {
                     // サムネイル取得不可
                 }
@@ -1200,9 +1356,13 @@ class ContentViewModel: ObservableObject {
         let toneMode = toneMappingMode
         let total = urlsToProcess.count
 
-        // サンドボックス環境では出力ディレクトリのセキュリティスコープを取得
+        // サンドボックス環境では出力ディレクトリのセキュリティスコープを取得（macOSのみ）
         let outputDir = self.outputDirectoryURL
+        #if os(macOS)
         let isAccessingOutputDir = outputDir?.startAccessingSecurityScopedResource() ?? false
+        #else
+        let isAccessingOutputDir = false
+        #endif
 
         conversionTask = Task {
             defer { if isAccessingOutputDir, let dir = outputDir { dir.stopAccessingSecurityScopedResource() } }
@@ -1213,8 +1373,12 @@ class ContentViewModel: ObservableObject {
                 if Task.isCancelled { break }
 
                 let filePrefix = total > 1 ? "[\(index + 1)/\(total)] " : ""
+                #if os(macOS)
                 let isAccessing = inputURL.startAccessingSecurityScopedResource()
                 defer { if isAccessing { inputURL.stopAccessingSecurityScopedResource() } }
+                #else
+                let isAccessing = false
+                #endif
 
                 let outExt = capturedExportSettings.resolvedFileExtension
                 let inputFilename = inputURL.deletingPathExtension().lastPathComponent
@@ -1257,8 +1421,10 @@ class ContentViewModel: ObservableObject {
                     if total == 1 {
                         self.statusMessage = "Conversion complete!\nSaved to: \(outputURL.path)"
                         self.hasConverted = true
+                        #if os(macOS)
                         NSWorkspace.shared.activateFileViewerSelecting([outputURL])
                         NSSound(named: .init("Glass"))?.play()
+                        #endif
                     } else {
                         self.statusMessage = "[\(completedCount)/\(total)] Converted: \(inputURL.lastPathComponent)"
                         self.progress = Double(completedCount) / Double(total)
@@ -1278,15 +1444,17 @@ class ContentViewModel: ObservableObject {
             }
 
             // バッチ完了サマリー
-            if total > 1, completedCount > 0, !Task.isCancelled {
+                if total > 1, completedCount > 0, !Task.isCancelled {
                 let failed = total - completedCount
                 let failSuffix = failed > 0 ? " (\(failed) failed)" : ""
                 self.statusMessage = "Batch complete: \(completedCount)/\(total) files converted\(failSuffix)"
                 self.hasConverted = (completedCount == total)
-                if let lastURL = lastOutputURL {
-                    NSWorkspace.shared.activateFileViewerSelecting([lastURL])
-                }
-                NSSound(named: .init("Glass"))?.play()
+                    #if os(macOS)
+                    if let lastURL = lastOutputURL {
+                        NSWorkspace.shared.activateFileViewerSelecting([lastURL])
+                    }
+                    NSSound(named: .init("Glass"))?.play()
+                    #endif
             }
 
             self.phaseLabel = ""

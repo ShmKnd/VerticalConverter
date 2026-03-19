@@ -5,6 +5,7 @@
 //  Dockアイコンに処理中インジケータとプログレスバーを表示する
 //
 
+#if canImport(AppKit)
 import AppKit
 
 @MainActor
@@ -77,3 +78,12 @@ private class DockProgressView: NSView {
 
     }
 }
+
+#else
+@MainActor
+enum DockProgress {
+    static func start() {}
+    static func update(_ value: Double) {}
+    static func stop() {}
+}
+#endif

@@ -6,7 +6,9 @@
 //
 
 @preconcurrency import AVFoundation
+#if os(macOS)
 import AppKit
+#endif
 import CoreImage
 import CoreText
 import CoreVideo
@@ -991,6 +993,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
 
     /// デモ版用：斜めに繰り返す半透明ウォーターマークを合成する
     private static func overlayWatermark(on image: CIImage, renderSize: CGSize) -> CIImage {
+        #if os(macOS)
         let text = "DEMO"
         let fontSize: CGFloat = renderSize.height * 0.06
         let attrs: [NSAttributedString.Key: Any] = [
@@ -1033,6 +1036,11 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         let outputRect = CGRect(origin: .zero, size: renderSize)
         let croppedTile = tiled.cropped(to: outputRect)
         return croppedTile.composited(over: image)
+        #else
+        // iOS / other platforms: watermark drawing uses AppKit types unavailable
+        // at build-time. Return the original image as a safe no-op fallback.
+        return image
+        #endif
     }
 
     func cancelAllPendingVideoCompositionRequests() {

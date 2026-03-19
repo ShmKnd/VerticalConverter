@@ -6,7 +6,9 @@
 //
 
 import SwiftUI
+#if os(macOS)
 import AppKit
+#endif
 
 @main
 struct VerticalConverterApp: App {
@@ -16,6 +18,7 @@ struct VerticalConverterApp: App {
         WindowGroup {
             ContentView()
         }
+#if os(macOS)
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.automatic)
         .commands {
@@ -25,11 +28,12 @@ struct VerticalConverterApp: App {
                 }
             }
         }
+#endif
     }
 }
 
 // MARK: - Custom About Window
-
+#if os(macOS)
 private final class AboutWindowController {
     static let shared = AboutWindowController()
     private var window: NSWindow?
@@ -186,4 +190,8 @@ private static func normalizeLicense(_ text: String) -> String {
                   .replacingOccurrences(of: "\n", with: " ") }
         .joined(separator: "\n\n")
 }
+
 }
+
+#endif
+

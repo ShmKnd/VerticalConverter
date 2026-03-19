@@ -1,0 +1,24 @@
+Command line invocation:
+    /Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild -project VerticalConverter.xcodeproj -scheme "VerticalConverter (Direct)" -configuration Debug -sdk macosx build
+
+User defaults from command line:
+    IDEPackageSupportUseBuiltinSCM = YES
+
+Build settings from command line:
+    SDKROOT = macosx15.2
+
+--- xcodebuild: WARNING: Using the first of multiple matching destinations:
+{ platform:macOS, arch:arm64, id:00008122-001E21362600001C, name:My Mac }
+{ platform:macOS, arch:x86_64, id:00008122-001E21362600001C, name:My Mac }
+{ platform:macOS, name:Any Mac }
+{ platform:iOS, id:dvtdevice-DVTiPhonePlaceholder-iphoneos:placeholder, name:Any iOS Device }
+{ platform:iOS Simulator, id:dvtdevice-DVTiOSDeviceSimulatorPlaceholder-iphonesimulator:placeholder, name:Any iOS Simulator Device }
+{ platform:iOS, arch:arm64, id:00008110-00011CD80C60201E, name:SK iPhone  }
+Prepare packages
+
+ComputeTargetDependencyGraph
+note: Building targets in dependency order
+note: Target dependency graph (1 target)
+    Target 'VerticalConverter' in project 'VerticalConverter' (no dependencies)
+
+GatherProvisioningInputs
