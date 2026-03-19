@@ -726,25 +726,178 @@ Preview ウィンドウにクロップの横位置を調整するスライダー
 - `isRestoringSettings` フラグで `restoreSettings()` 中の `didSet` による再帰的 `saveSettings()` 呼び出しを抑制
 - Security-Scoped Bookmark: `URL.bookmarkData(options: .withSecurityScope)` で作成、`URL(resolvingBookmarkDataWithOptions: .withSecurityScope)` で復元、`startAccessingSecurityScopedResource()` でアクセス権取得
 - Demo 版の `DemoWindowStartDate` / `DemoEncodeCount` とはキープレフィックスが異なる（`vc_` プレフィックス）ため干渉しない
-````
-This is the description of what the code block changes:
-<changeDescription>
-ウィンドウ横幅固定・高さリサイズ対応の技術的詳細とmacOS13+対応状況を追記
-</changeDescription>
 
-This is the code block that represents the suggested code change:
-```markdown
-...existing code...
+---
+---
 
-# v1.0.1 技術詳細
+# v1.0.2 Smart Framing 改善・MPEG-TS 調査メモ
 
-## ウィンドウ横幅固定・高さリサイズ対応
-- NSViewRepresentableでNSWindowDelegate(windowWillResize)を注入し、横幅560pxを強制
-- .windowResizability(.automatic)と併用
-- macOS 13+で動作確認済み（API制約なし）
+**日付**: 2026-03-19 〜 2026-03-20
 
-...existing code...
+---
+
+## セッション経緯
+
+### Phase 21: Vision 解析の大入力問題 — 縮小処理追加（03-19）
+
+4K や 1440×1080 AVCHD など大きな入力に対して Vision の人物検出リクエストが不安定・低速になる問題を確認。
+
+**修正**:
+- `SmartFramingAnalyzer.swift`: `analysisMaxDimension = 960` を導入。入力の長辺が960pxを超える場合は `CIImage → CGImage` 経由でリサイズしてから Vision に渡す。スケール係数を `analysisScale` として記録し、検出座標を元のスケールに戻す。
+- `VerticalVideoCompositor.swift`（リアルタイムフォールバック）: `detectPersonNormalizedX()` にも同様の縮小パスを追加（既存 CIContext を使用）。
+
+**技術的ポイント**:
+```swift
+// SmartFramingAnalyzer.swift
+private let analysisMaxDimension: CGFloat = 960.0
+// detectRawPersons() 内
+let longSide = max(CGFloat(width), CGFloat(height))
+let analysisScale: CGFloat = longSide > analysisMaxDimension
+    ? analysisMaxDimension / longSide : 1.0
+// CIImage → CGImage downscale → VNImageRequestHandler
 ```
-<userPrompt>
-Provide the fully rewritten file, incorporating the suggested code change. You must produce the complete file.
-</userPrompt>
+
+---
+
+### Phase 22: PAR（非正方形ピクセル）対応（03-19）
+
+AVCHD 1440×1080（PAR 4:3 → DAR 16:9）を入力したとき、`naturalSize` がピクセル寸法（1440×1080）を返し正しい表示比率にならない問題を修正。
+
+**修正**:
+
+| ファイル | 変更内容 |
+|---------|---------|
+| `VideoProcessor.swift` | `inputSize` の計算を `CMVideoFormatDescriptionGetPresentationDimensions(usePixelAspectRatio: true)` に変更 |
+| `VerticalVideoCompositor.swift` | `composeFrame()` で `staticInputSize`（表示寸法）と `sourceImage.extent`（ピクセル寸法）が異なる場合にアフィン拡大変換を適用して PAR 補正 |
+
+**ログ出力**（PAR補正が働いた場合）:
+```
+VideoProcessor: PAR correction — pixel 1440×1080 → display 1920×1080
+```
+
+```swift
+// VerticalVideoCompositor.swift — composeFrame()
+let bufferSize = CGSize(width: sourceImage.extent.width, height: sourceImage.extent.height)
+let displaySize = VerticalVideoCompositor.staticInputSize
+if abs(bufferSize.width - displaySize.width) > 1 || abs(bufferSize.height - displaySize.height) > 1 {
+    let sx = displaySize.width  / bufferSize.width
+    let sy = displaySize.height / bufferSize.height
+    sourceImage = sourceImage.transformed(by: CGAffineTransform(scaleX: sx, y: sy))
+}
+```
+
+---
+
+### Phase 23: MPEG-TS 入力（.mts）調査と remux 試み（03-19〜20）
+
+AVCHD と同じ映像（AVC High@L4.1 + MBAFF インターレース）を MPEG-TS に格納した `.mts` ファイルで Smart Framing が動作しない問題を調査。同内容の mp4 では正常動作。
+
+**症状**:
+```
+VerticalVideoCompositor: FAILED - sourceFrame is nil for trackID=1
+VideoProcessor: reader failed: sourceFrame nil for trackID=1
+```
+
+**remux 試み**: `.mts` を一度 `.mov` に passthrough remux してから `AVAsset` を作成するパイプラインを実装（`remuxTSContainerToMov()`）。しかし合成時の `sourceFrame` nil は解消せず。
+
+**原因候補**（調査中の仮説）:
+- MBAFF（インターレース）デコーダが最初のフレームを `AVVideoCompositing` のタイムライン上で利用可能にするまでバッファが存在しない
+- trackID 不一致：remux 後の trackID と `AVVideoCompositionLayerInstruction.trackID` が一致しない可能性
+- `alwaysCopiesSampleData = false`（passthrough）でバッファが内部的に早期解放される
+
+**安定化対処（暫定）**: `VerticalVideoCompositor.composeFrame()` で `sourceFrame(byTrackID:)` を最大3回リトライする処理を追加。根本解決には至らなかった。
+
+---
+
+### Phase 24: MPEG-TS 入力を早期リジェクトに方針変更（03-20）
+
+remux パイプラインを維持しても安定しないことが確認できず、パイプライン全体のリスクを高めるとの判断から、`.mts/.m2ts/.ts` のリジェクトに切り替え。
+
+**修正** (`VideoProcessor.swift`):
+```swift
+// 入力バリデーション冒頭
+let ext = inputURL.pathExtension.lowercased()
+if ["mts", "m2ts", "ts"].contains(ext) {
+    NSLog("VideoProcessor: rejected input container (.%@) — only MP4/AVCHD is accepted.", ext)
+    throw VideoProcessorError.unsupportedFormat
+}
+```
+
+**理由**:
+- 同内容を mp4 に変換済みであれば通常の AVCHD パスで正常動作する
+- MPEG-TS の AVFoundation 読み出しの不安定さは Apple の既知の制約事項
+- remux 目的で `AVAssetReader/Writer` を追加することで Swift concurrency / `CancelToken` Sendable 問題が副次的に発生した（→下記 Phase 25 で修正）
+
+---
+
+### Phase 25: Swift concurrency コンパイルエラー修正（03-20）
+
+remux 関連コードを追加した際、並列クロージャ内でのミュータブル変数キャプチャが Swift 6 の並行性ルールに違反してコンパイルエラーになった。
+
+**修正**:
+
+| 修正内容 | 変更箇所 |
+|---------|---------|
+| `CancelToken` を `@unchecked Sendable` に昇格 | `VideoProcessor.swift` |
+| `videoInput` / `audioInput` を不変ローカルで明示キャプチャ | `VideoProcessor.swift` |
+| `CMFormatDescription` への条件付きキャストが常に成功する警告を除去 | `VideoProcessor.swift` |
+
+```swift
+// CancelToken に Sendable を付与
+final class CancelToken: @unchecked Sendable { ... }
+
+// キャンセルハンドラ用に不変キャプチャ
+let cancelVideoInput = videoInput
+let cancelAudioInput = audioInput
+```
+
+---
+
+### Phase 26: リサーチ結果（03-20）
+
+#### App Sandbox / mutex パイプラインの App Store ガイドライン適合性
+
+- **プロセス内同期**（`DispatchQueue` / `NSLock` / `pthread_mutex` 等）は App Sandbox 内でも問題なし。
+- **禁止事項**: 名前付き POSIX セマフォ（`sem_open`）・名前付き共有メモリ・ヘルパー外部プロセス起動・権限昇格・プライベートAPI使用。
+- **ファイルアクセス**: ファイルロック（`flock` / `fcntl`）はアプリコンテナ内かユーザーが選択した Security-Scoped Bookmark のパスのみ許可。コンテナ外の任意パスへの書き込みは失敗する。
+- **本プロジェクトの remux パイプラインで使用している DispatchQueue / NSLock は問題なし**。remux の出力先として `FileManager.default.temporaryDirectory` を使っているが、App Sandbox ではこれはコンテナ内 tmp に向くため可。
+
+#### VarFPS（可変フレームレート）入力時の挙動
+
+- AVFoundation は PTS + duration ベースのため VarFPS は扱えるが、`AVVideoComposition.frameDuration` を設定すると出力は固定FPSになる。
+- カスタムコンポジタは `frameDuration` 間隔で呼ばれるため、VarFPS 入力では最近傍フレームが選ばれる（フレームリピートまたはドロップ）。
+- `VTCompressionSessionEncodeFrame` に正確な PTS と duration を渡すことで圧縮側は対応可能。
+- **現状のパイプラインに VarFPS の特別対応はない**。入力 FPS を `nominalFrameRate` で読むため、大きな FPS 変動があるコンテンツは先頭付近の FPS を出力 FPS として固定することになる。必要なら入力にフレームスタンプを走査して平均/最頻 FPS を計算するプリパス追加が有効。
+
+---
+
+## 未解決事項・今後の検討
+
+| 課題 | 状況 | 優先度 |
+|------|------|--------|
+| `.mts` 入力サポート | 早期リジェクト（`unsupportedFormat`）で対処。根本原因調査は保留 | 低 |
+| VarFPS 入力の精度向上 | 現状は `nominalFrameRate` ベースの固定FPS処理 | 低 |
+| MPEG-TS の `sourceFrame is nil` 根本原因 | trackID不一致・インターレースバッファ遅延・passthrough解放の3候補 | 保留 |
+| 合成時の3回リトライ処理 | `.mts` 拒否後も残存。改修機会に削除を検討 | 低 |
+
+---
+
+### Phase 27: UI改善・クロップ位置スライダー再設計（03-20）
+
+#### 変更概要
+
+| 変更内容 | 詳細 |
+|---------|------|
+| クロップ位置スライダーをメインパネルに移動 | バッチモードでもアクセス可能に。動画未読み込み時・Fit W・Smart Framing ON 時はグレーアウト |
+| リセットボタンをアイコン化 | `Button("Reset")` → `arrow.counterclockwise` アイコン。スライダー右端へ移動（Output 行の `xmark.circle.fill` と位置を統一） |
+| メインパネルラベルを "Center Pos" に短縮 | 1行に収まりHStackが折り返さないようにした |
+| Preview パネルラベルを "Center Position" + `arrow.left.and.right` アイコンに統一 | リセットボタンも `arrow.counterclockwise` アイコンに統一 |
+| Center Pos・Output 行を `settingRow` ヘルパー経由に統一 | それまで手書き複製していたHStack構造を排除 |
+| 全行に `.frame(minHeight: 30)` を追加 | Resolution〜Output の全行高さを統一 |
+| ヘッダーのバージョン文字列を削除 | `Text("v\(Bundle.main...)")` を除去。上部 padding を 22→14pt に調整 |
+
+#### 設計判断
+
+- Preview シートのスライダーは残したまま（プレビュー確認しながら微調整できるため）
+- メインパネルのスライダーはバッチモード時の唯一の調整手段
+- `settingRow` への統一により将来の行追加・スタイル変更が一箇所で済む

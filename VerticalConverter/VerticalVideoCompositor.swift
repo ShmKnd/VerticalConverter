@@ -533,9 +533,24 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
             self.hdrConversionEnabled = hdrEnabled
             self.toneMappingMode = instruction.toneMappingMode
 
-            guard let sourcePixelBuffer = asyncVideoCompositionRequest.sourceFrame(byTrackID: layerInstruction.trackID) else {
-                NSLog("VerticalVideoCompositor: FAILED - sourceFrame is nil for trackID=%d, requiredSourceTrackIDs=%@, sourceTrackIDs=%@",
-                      layerInstruction.trackID,
+            // Attempt to fetch the source frame; occasionally the first call
+            // can return nil due to a timing/race condition in the composition
+            // pipeline. Retry a few times with a short sleep to reduce transient
+            // failures. If still nil, fail as before.
+            var sourcePixelBufferOpt: CVPixelBuffer? = nil
+            let maxAttempts = 3
+            for attempt in 0..<maxAttempts {
+                sourcePixelBufferOpt = asyncVideoCompositionRequest.sourceFrame(byTrackID: layerInstruction.trackID)
+                if sourcePixelBufferOpt != nil { break }
+                NSLog("VerticalVideoCompositor: sourceFrame nil (attempt %d/%d) for trackID=%d; requiredSourceTrackIDs=%@ sourceTrackIDs=%@",
+                      attempt + 1, maxAttempts, layerInstruction.trackID,
+                      String(describing: asyncVideoCompositionRequest.videoCompositionInstruction.requiredSourceTrackIDs),
+                      String(describing: asyncVideoCompositionRequest.sourceTrackIDs))
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            guard let sourcePixelBuffer = sourcePixelBufferOpt else {
+                NSLog("VerticalVideoCompositor: FAILED - sourceFrame is nil after %d attempts for trackID=%d, requiredSourceTrackIDs=%@, sourceTrackIDs=%@",
+                      maxAttempts, layerInstruction.trackID,
                       String(describing: asyncVideoCompositionRequest.videoCompositionInstruction.requiredSourceTrackIDs),
                       String(describing: asyncVideoCompositionRequest.sourceTrackIDs))
                 asyncVideoCompositionRequest.finish(with: NSError(
@@ -546,6 +561,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
                 removePending()
                 return
             }
+            
 
             // 出力バッファを作成
             guard let renderContext = self.renderContext,
@@ -586,7 +602,7 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
         // Rec.709/nil, frame 1+ gets BT.2020) is the root cause of the
         // "first frame gamma mismatch" bug.
         let sourceColorSpace: CGColorSpace?
-        let sourceImage: CIImage
+        var sourceImage: CIImage
         let isHDRPassthrough = VerticalVideoCompositor.staticSourceIsHDR
             && !hdrConversionEnabled
 
@@ -617,6 +633,20 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
                                   options: [.colorSpace: cs])
             sourceColorSpace = cs
         }
+        // ── PAR (Pixel Aspect Ratio) 補正 ──
+        // 非正方形ピクセル入力 (e.g. AVCHD 1440×1080, PAR 4:3) では、ピクセルバッファの
+        // 実寸法が staticInputSize（表示寸法）と異なる。CIAffineTransform で補正し、
+        // 後段の全処理が表示アスペクト比で動作するようにする。
+        let displaySize = VerticalVideoCompositor.staticInputSize
+        if displaySize.width > 0 && displaySize.height > 0 {
+            let bufW = sourceImage.extent.width
+            let bufH = sourceImage.extent.height
+            if abs(displaySize.width - bufW) > 1 || abs(displaySize.height - bufH) > 1 {
+                sourceImage = sourceImage.transformed(by: CGAffineTransform(
+                    scaleX: displaySize.width / bufW, y: displaySize.height / bufH))
+            }
+        }
+
         let sourceSize = sourceImage.extent.size
         let outputRect = CGRect(origin: .zero, size: renderSize)
 
@@ -934,9 +964,26 @@ class VerticalVideoCompositor: NSObject, AVVideoCompositing {
     // MARK: - 人物検出（Visionは間引いて実行）
 
     private func detectPersonNormalizedX(in pixelBuffer: CVPixelBuffer) {
+        // 高解像度入力（4K等）をダウンスケールしてから Vision に渡す。
+        // Vision の結果は正規化座標 (0–1) なので変換不要。
+        let bufW = CGFloat(CVPixelBufferGetWidth(pixelBuffer))
+        let bufH = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
+        let maxDim = max(bufW, bufH)
+        let analysisMax: CGFloat = 960
+
         let bodyRequest = VNDetectHumanBodyPoseRequest()
         let faceRequest = VNDetectFaceRectanglesRequest()
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+
+        let handler: VNImageRequestHandler
+        if maxDim > analysisMax {
+            let scale = analysisMax / maxDim
+            let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+                .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else { return }
+            handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        } else {
+            handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+        }
         do { try handler.perform([bodyRequest, faceRequest]) } catch { return }
 
         var allPersonsX: [CGFloat] = []

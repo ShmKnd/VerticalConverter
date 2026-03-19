@@ -1,4 +1,4 @@
-//
+    //
 //  SmartFramingAnalyzer.swift
 //  VerticalConverter
 //
@@ -7,6 +7,7 @@
 //
 
 @preconcurrency import AVFoundation
+import CoreImage
 import Vision
 
 // MARK: - Data Types
@@ -191,6 +192,11 @@ struct SmartFramingAnalyzer {
     /// Y方向パン余白確保のための均一ズーム倍率（10%ズームイン）
     static let yZoomFactor: CGFloat = 1.1
 
+    /// Vision 解析用の最大寸法（長辺）。4K 入力などで不要に重い推論を回避するため、
+    /// この値以下にダウンスケールしてから VNImageRequestHandler に渡す。
+    /// Vision の検出結果は正規化座標 (0.0–1.0) のため解像度に依存しない。
+    private static let analysisMaxDimension: CGFloat = 960
+
     // MARK: - Public
 
     /// 動画全体を解析し、フレームごとの (offsetX, offsetY) を CGPoint 配列で返す。
@@ -290,6 +296,23 @@ struct SmartFramingAnalyzer {
         let tracker = PersonTracker()
         tracker.lifespanTarget = CGFloat(fps * 1.5)     // 1.5秒で主役と判定
 
+        // ── Vision 解析用ダウンスケール ──
+        // 4K (3840×2160) などの高解像度入力から analysisMaxDimension 以下にスケールしてから
+        // Vision に渡す。Body Pose / Face Detection の結果は正規化座標なので解像度非依存。
+        let trackSize = try await videoTrack.load(.naturalSize)
+        let maxDim = max(trackSize.width, trackSize.height)
+        let analysisScale: CGFloat = maxDim > Self.analysisMaxDimension
+            ? Self.analysisMaxDimension / maxDim
+            : 1.0
+        // CIContext は CIImage→CGImage レンダリングに必要（ダウンスケール時のみ使用）
+        let analysisCIContext: CIContext? = analysisScale < 1.0
+            ? CIContext(options: [.useSoftwareRenderer: false])
+            : nil
+        if analysisScale < 1.0 {
+            NSLog("SmartFramingAnalyzer: input %.0f×%.0f → analysis scale %.2f (target ≤%.0fpx)",
+                  trackSize.width, trackSize.height, analysisScale, Self.analysisMaxDimension)
+        }
+
         // ③ 適応的検出間隔: 動き大 → 4フレーム毎、安定 → 8フレーム毎
         var detectionInterval = 8
         var lastWeightedCenter: CGPoint? = nil
@@ -322,7 +345,11 @@ struct SmartFramingAnalyzer {
                    frameIndex < totalFrames,
                    let pixelBuffer = CMSampleBufferGetImageBuffer(sample) {
 
-                    let rawPersons = detectRawPersons(in: pixelBuffer)
+                    let rawPersons = detectRawPersons(
+                        in: pixelBuffer,
+                        analysisScale: analysisScale,
+                        ciContext: analysisCIContext
+                    )
                     let center = tracker.update(with: rawPersons)
 
                     // Fill any frames between lastFilledIndex and this sample with the
@@ -366,10 +393,31 @@ struct SmartFramingAnalyzer {
     }
 
     /// 1フレームから全ての人物を検出して返す（トラッカーに渡す生データ）
-    private func detectRawPersons(in pixelBuffer: CVPixelBuffer) -> [RawPerson] {
+    /// - Parameters:
+    ///   - pixelBuffer: ソースフレーム（フル解像度）
+    ///   - analysisScale: 1.0 未満なら CIImage でダウンスケールしてから Vision に渡す
+    ///   - ciContext: ダウンスケール時の CIImage→CGImage レンダリング用
+    private func detectRawPersons(
+        in pixelBuffer: CVPixelBuffer,
+        analysisScale: CGFloat = 1.0,
+        ciContext: CIContext? = nil
+    ) -> [RawPerson] {
         let bodyRequest = VNDetectHumanBodyPoseRequest()
         let faceRequest = VNDetectFaceRectanglesRequest()
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+
+        let handler: VNImageRequestHandler
+        if analysisScale < 1.0, let ctx = ciContext {
+            // 4K 等の高解像度入力をダウンスケールしてから Vision に渡す。
+            // Vision の結果は正規化座標 (0–1) なので変換不要。
+            let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+                .transformed(by: CGAffineTransform(scaleX: analysisScale, y: analysisScale))
+            guard let cgImage = ctx.createCGImage(ciImage, from: ciImage.extent) else {
+                return []
+            }
+            handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        } else {
+            handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+        }
         do { try handler.perform([bodyRequest, faceRequest]) } catch { return [] }
 
         var persons: [RawPerson] = []
